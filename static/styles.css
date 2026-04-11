@@ -265,6 +265,16 @@ video {
   justify-content: space-between;
 }
 
+.statusGrid .healthCard {
+  grid-column: span 2;
+  min-height: 112px;
+}
+
+.healthCard small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 span {
   color: var(--muted);
   font-size: .86rem;
@@ -351,7 +361,7 @@ h3 {
   background: rgba(199, 166, 255, .08);
 }
 
-.feed, .logFeed, .segmentFeed {
+.feed, .logFeed, .segmentFeed, .errorFeed {
   display: grid;
   gap: 8px;
   max-height: 300px;
@@ -366,7 +376,16 @@ h3 {
   border-radius: 6px;
 }
 
-.logLine, .segmentLine {
+.feedItem.bad,
+.feedItem.error {
+  border-left-color: var(--red);
+}
+
+.feedItem.warn {
+  border-left-color: var(--amber);
+}
+
+.logLine, .segmentLine, .errorLine, .emptyLine {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: #d9d2e9;
   font-size: .83rem;
@@ -374,6 +393,21 @@ h3 {
   background: rgba(0, 0, 0, .22);
   border-radius: 6px;
   overflow-wrap: anywhere;
+}
+
+.logLine.error,
+.errorLine {
+  color: #ffc2cf;
+  border-left: 2px solid var(--red);
+}
+
+.logLine.warn {
+  color: #ffe0a8;
+}
+
+.emptyLine {
+  color: var(--muted);
+  font-style: italic;
 }
 
 .segmentLine {
@@ -395,6 +429,7 @@ h3 {
 @media (max-width: 560px) {
   .shell { width: min(100% - 20px, 1480px); padding-top: 16px; }
   .loginForm, .addLink, .linkItem, .statusGrid, .metrics { grid-template-columns: 1fr; }
+  .statusGrid .healthCard { grid-column: auto; }
   .stageHead, .playerBar { padding: 12px; }
   .videoSurface { aspect-ratio: 16 / 10; }
   .buttonLink, button { width: 100%; }

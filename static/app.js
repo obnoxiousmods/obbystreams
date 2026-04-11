@@ -118,7 +118,7 @@ function renderEvents(events) {
   $("events").innerHTML = "";
   events.slice(-16).reverse().forEach((event) => {
     const item = document.createElement("div");
-    item.className = "feedItem";
+    item.className = `feedItem ${event.level || "info"}`;
     item.innerHTML = `<strong>${event.level}</strong> <span>${new Date(event.ts).toLocaleTimeString()}</span><br>${event.message}`;
     $("events").append(item);
   });
@@ -128,10 +128,26 @@ function renderLogs(logs) {
   $("logs").innerHTML = "";
   logs.slice(-24).reverse().forEach((log) => {
     const item = document.createElement("div");
-    item.className = "logLine";
+    item.className = `logLine ${log.level || ""}`;
     item.textContent = log.line || JSON.stringify(log);
     $("logs").append(item);
   });
+}
+
+function renderErrors(errors) {
+  $("errors").innerHTML = "";
+  (errors || []).slice(-10).reverse().forEach((error) => {
+    const item = document.createElement("div");
+    item.className = "errorLine";
+    item.textContent = `${new Date(error.ts).toLocaleTimeString()} ${error.line || JSON.stringify(error)}`;
+    $("errors").append(item);
+  });
+  if (!errors || errors.length === 0) {
+    const item = document.createElement("div");
+    item.className = "emptyLine";
+    item.textContent = "No ffmpeg errors captured yet.";
+    $("errors").append(item);
+  }
 }
 
 function renderSegments(segments) {
@@ -155,6 +171,17 @@ function setVideo(url, playerUrl = url) {
   state.hlsUrl = url;
   state.playerUrl = playerUrl;
   initPlayer(playerUrl);
+}
+
+function clearVideo(url, message) {
+  $("previewUrl").textContent = url || "Waiting for HLS output";
+  $("openHlsBtn").href = absoluteUrl(url) || "#";
+  setPlayerState(message || "waiting for stream");
+  if (state.player && state.playerUrl) {
+    state.player.pause();
+    state.player.reset();
+  }
+  state.playerUrl = "";
 }
 
 function ensureVideoElement() {
@@ -222,8 +249,9 @@ async function refresh() {
     const stream = data.config.stream || {};
     const proc = data.managed_process || {};
     const hls = data.hls || {};
+    const health = data.health || {};
 
-    $("runState").textContent = proc.managed ? "Running" : "Stopped";
+    $("runState").textContent = health.state || (proc.managed ? "Running" : "Stopped");
     $("encoder").textContent = stream.encoder || "auto";
     $("segments").textContent = hls.segments ?? 0;
     $("playlistAge").textContent = fmtAge(hls.playlist_age);
@@ -240,11 +268,18 @@ async function refresh() {
     $("firstSegment").textContent = hls.first_segment || "n/a";
     $("lastSegment").textContent = hls.last_segment || "n/a";
     $("lastSegmentSize").textContent = hls.last_segment_size ? fmtBytes(hls.last_segment_size) : "n/a";
+    $("healthState").textContent = health.level ? `${health.level}: ${health.state}` : "checking";
+    $("healthMessage").textContent = health.message || "Waiting for status.";
     $("updated").textContent = new Date(data.server_time).toLocaleTimeString();
-    setVideo(hls.public_hls_url, hls.dashboard_hls_url || hls.public_hls_url);
+    if (hls.playlist_exists) {
+      setVideo(hls.public_hls_url, hls.dashboard_hls_url || hls.public_hls_url);
+    } else {
+      clearVideo(hls.dashboard_hls_url || hls.public_hls_url, health.message);
+    }
     renderLinks(stream.links || []);
     renderEvents(data.events || []);
     renderLogs(data.logs || []);
+    renderErrors(data.errors || health.recent_errors || []);
     renderSegments(hls.playlist_segments || []);
 
     const arango = await api("/api/arango").catch((err) => ({ connected: false, error: err.message }));

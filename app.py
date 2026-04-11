@@ -26,6 +26,7 @@ STATIC_DIR = APP_DIR / "static"
 
 EVENTS: deque[dict] = deque(maxlen=300)
 LOGS: deque[dict] = deque(maxlen=600)
+ERRORS: deque[dict] = deque(maxlen=200)
 PROCESS = None
 STARTED_AT = None
 READER_TASK = None
@@ -130,12 +131,21 @@ async def arango_status(request):
 def stream_processes():
     found = []
     current_pid = os.getpid()
+    excluded = {current_pid}
+    if PROCESS and PROCESS.poll() is None:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            managed = psutil.Process(PROCESS.pid)
+            excluded.add(managed.pid)
+            excluded.update(child.pid for child in managed.children(recursive=True))
     for proc in psutil.process_iter(["pid", "cmdline", "create_time", "name"]):
         try:
-            if proc.info["pid"] == current_pid:
+            if proc.info["pid"] in excluded:
                 continue
             cmdline = proc.info.get("cmdline") or []
             cmd = " ".join(cmdline)
+            base = os.path.basename(cmdline[0]) if cmdline else ""
+            if base in {"bwrap", "zsh", "bash", "sh", "timeout", "rg", "grep", "curl"}:
+                continue
             if (
                 "/usr/bin/obbystreams" in cmdline
                 or "/usr/bin/obbystreams" in cmd
@@ -170,12 +180,30 @@ def kill_existing_streams():
     return killed
 
 
+def safe_stat_size(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def classify_stream_log(line):
+    lowered = line.lower()
+    if "ffmpeg:" in lowered or any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")):
+        return "error"
+    if "ffmpeg exited" in lowered or "restart" in lowered or "weak stream" in lowered or "every link failed" in lowered:
+        return "warn"
+    if "starting" in lowered or "stream commander" in lowered or "status:" in lowered:
+        return "info"
+    return "debug"
+
+
 def hls_metrics(config):
     stream = config.get("stream", {})
     output_dir = Path(stream.get("output_dir", "/var/www/live.obnoxious.lol/stream"))
     playlist = output_dir / "ufc.m3u8"
     segments = [Path(p) for p in glob.glob(str(output_dir / "ufc*.ts"))]
-    total_bytes = sum(p.stat().st_size for p in segments if p.exists())
+    total_bytes = sum(safe_stat_size(p) for p in segments)
     playlist_age = None
     playlist_mtime = None
     playlist_lines = []
@@ -215,7 +243,7 @@ def hls_metrics(config):
         "playlist_segments": playlist_segment_names[-12:],
         "first_segment": playlist_segment_names[0] if playlist_segment_names else None,
         "last_segment": playlist_segment_names[-1] if playlist_segment_names else None,
-        "last_segment_size": (output_dir / playlist_segment_names[-1]).stat().st_size if playlist_segment_names and (output_dir / playlist_segment_names[-1]).exists() else None,
+        "last_segment_size": safe_stat_size(output_dir / playlist_segment_names[-1]) if playlist_segment_names else None,
         "public_hls_url": stream.get("public_hls_url"),
         "dashboard_hls_url": "/hls/ufc.m3u8",
     }
@@ -224,11 +252,12 @@ def hls_metrics(config):
 def process_metrics():
     global PROCESS, STARTED_AT
     pid = PROCESS.pid if PROCESS and PROCESS.poll() is None else None
-    data = {"managed": bool(pid), "pid": pid, "started_at": STARTED_AT, "cpu": None, "rss": None, "children": []}
+    data = {"managed": bool(pid), "pid": pid, "started_at": STARTED_AT, "age": None, "cpu": None, "rss": None, "children": []}
     if not pid:
         return data
     try:
         proc = psutil.Process(pid)
+        data["age"] = max(0, time.time() - proc.create_time())
         data["cpu"] = proc.cpu_percent(interval=0.0)
         data["rss"] = proc.memory_info().rss
         data["cmd"] = " ".join(proc.cmdline())
@@ -241,16 +270,56 @@ def process_metrics():
     return data
 
 
+def stream_health(proc, hls):
+    recent_errors = list(ERRORS)[-5:]
+    if not proc.get("managed"):
+        return {"state": "stopped", "level": "warn", "message": "No managed stream process is running.", "recent_errors": recent_errors}
+    if not proc.get("children"):
+        return {
+            "state": "starting",
+            "level": "warn",
+            "message": "Runner is alive, but no ffmpeg child is active yet.",
+            "recent_errors": recent_errors,
+        }
+    if not hls.get("playlist_exists"):
+        return {
+            "state": "starting",
+            "level": "warn",
+            "message": "ffmpeg is running, but no HLS playlist has been written yet.",
+            "recent_errors": recent_errors,
+        }
+    age = hls.get("playlist_age")
+    if age is not None and age > 20:
+        return {
+            "state": "stale",
+            "level": "bad",
+            "message": f"HLS playlist is stale ({age:.1f}s old).",
+            "recent_errors": recent_errors,
+        }
+    if recent_errors and time.time() - (recent_errors[-1]["ts"] / 1000) < 30:
+        return {
+            "state": "degraded",
+            "level": "warn",
+            "message": "Recent ffmpeg errors were reported; playback may be recovering.",
+            "recent_errors": recent_errors,
+        }
+    return {"state": "healthy", "level": "ok", "message": "Stream is producing fresh HLS output.", "recent_errors": recent_errors}
+
+
 def status_payload():
     config = load_config()
+    proc = process_metrics()
+    hls = hls_metrics(config)
     payload = {
         "ok": True,
         "config": public_config(config),
-        "managed_process": process_metrics(),
+        "managed_process": proc,
         "existing_processes": stream_processes(),
-        "hls": hls_metrics(config),
+        "hls": hls,
+        "health": stream_health(proc, hls),
         "events": list(EVENTS)[-80:],
         "logs": list(LOGS)[-140:],
+        "errors": list(ERRORS)[-80:],
         "server_time": now_ms(),
     }
     asyncio.create_task(arango_insert("metrics", {"ts": now_ms(), "payload": payload}))
@@ -277,6 +346,24 @@ async def put_config(request):
     save_config(config)
     event("configuration updated", "ok", {"keys": list(body.keys())})
     await arango_insert("configs", {"ts": now_ms(), "config": public_config(config)})
+    stream_restart_keys = {
+        "links",
+        "encoder",
+        "bitrate",
+        "audio_bitrate",
+        "output_dir",
+        "public_hls_url",
+        "restart_delay",
+        "max_restart_delay",
+        "backoff_multiplier",
+        "backoff_jitter",
+        "rate_limit_delay",
+        "quick_fail",
+        "stop_after_failed_rounds",
+    }
+    restarted = await restart_managed_with_config("configuration changed") if stream_restart_keys.intersection(body) else False
+    if restarted:
+        event("running stream picked up updated configuration", "ok")
     return JSONResponse({"ok": True, "config": public_config(config)})
 
 
@@ -292,6 +379,9 @@ async def add_link(request):
     save_config(config)
     event("link added", "ok", {"url": url})
     await arango_insert("links", {"ts": now_ms(), "action": "add", "url": url})
+    restarted = await restart_managed_with_config("link added")
+    if restarted:
+        event("running stream picked up updated links", "ok")
     return JSONResponse({"ok": True, "links": links})
 
 
@@ -304,6 +394,9 @@ async def remove_link(request):
     save_config(config)
     event("link removed", "warn", {"url": url})
     await arango_insert("links", {"ts": now_ms(), "action": "remove", "url": url})
+    restarted = await restart_managed_with_config("link removed")
+    if restarted:
+        event("running stream picked up updated links", "ok")
     return JSONResponse({"ok": True, "links": config["stream"]["links"]})
 
 
@@ -315,9 +408,13 @@ async def read_process_output(proc):
             break
         line = line.rstrip()
         if line:
-            LOGS.append({"ts": now_ms(), "line": line})
-            if "ffmpeg exited" in line or "starting" in line or "restart" in line:
-                event(line, "info")
+            level = classify_stream_log(line)
+            item = {"ts": now_ms(), "level": level, "line": line}
+            LOGS.append(item)
+            if level == "error":
+                ERRORS.append(item)
+            if level in ("error", "warn", "info"):
+                event(line, "bad" if level == "error" else level)
 
 
 def build_command(config, links=None):
@@ -333,41 +430,95 @@ def build_command(config, links=None):
         cmd += ["--bitrate", str(stream["bitrate"])]
     if stream.get("audio_bitrate"):
         cmd += ["--audio-bitrate", str(stream["audio_bitrate"])]
+    option_flags = {
+        "restart_delay": "--restart-delay",
+        "max_restart_delay": "--max-restart-delay",
+        "backoff_multiplier": "--backoff-multiplier",
+        "backoff_jitter": "--backoff-jitter",
+        "rate_limit_delay": "--rate-limit-delay",
+        "quick_fail": "--quick-fail",
+        "stop_after_failed_rounds": "--stop-after-failed-rounds",
+    }
+    for key, flag in option_flags.items():
+        if stream.get(key) is not None:
+            cmd += [flag, str(stream[key])]
     if links:
         cmd += ["--links", *links]
     return cmd
 
 
-async def start_stream(request):
+def terminate_process_tree(proc, timeout=5):
+    if not proc or proc.poll() is not None:
+        return False
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=timeout)
+    return True
+
+
+def start_managed_process(config, links, kill_existing=True):
     global PROCESS, STARTED_AT, READER_TASK
+    if not links:
+        raise ValueError("no links configured")
+    if kill_existing:
+        killed = kill_existing_streams()
+        if killed:
+            event("killed existing stream instance(s)", "warn", {"processes": killed})
+    cmd = build_command(config, links)
+    try:
+        PROCESS = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+    except OSError as exc:
+        ERRORS.append({"ts": now_ms(), "level": "error", "line": str(exc)})
+        raise
+    STARTED_AT = now_ms()
+    READER_TASK = asyncio.create_task(read_process_output(PROCESS))
+    event("stream started", "ok", {"cmd": cmd, "pid": PROCESS.pid})
+    return PROCESS.pid, cmd
+
+
+async def restart_managed_with_config(reason):
+    global PROCESS
+    if not PROCESS or PROCESS.poll() is not None:
+        return False
+    terminate_process_tree(PROCESS)
+    event(f"restarting stream: {reason}", "warn")
+    config = load_config()
+    links = config.get("stream", {}).get("links", [])
+    try:
+        start_managed_process(config, links, kill_existing=True)
+    except (OSError, ValueError) as exc:
+        event(f"stream restart failed: {exc}", "bad")
+        ERRORS.append({"ts": now_ms(), "level": "error", "line": f"stream restart failed: {exc}"})
+        return False
+    return True
+
+
+async def start_stream(request):
+    global PROCESS
     if PROCESS and PROCESS.poll() is None:
         return JSONResponse({"ok": False, "error": "managed stream already running"}, status_code=409)
     body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
     config = load_config()
     links = body.get("links") or config.get("stream", {}).get("links", [])
-    if not links:
-        return JSONResponse({"ok": False, "error": "no links configured"}, status_code=400)
-    if body.get("kill_existing", True):
-        killed = kill_existing_streams()
-        if killed:
-            event("killed existing stream instance(s)", "warn", {"processes": killed})
-    cmd = build_command(config, links)
-    PROCESS = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    STARTED_AT = now_ms()
-    READER_TASK = asyncio.create_task(read_process_output(PROCESS))
-    event("stream started", "ok", {"cmd": cmd, "pid": PROCESS.pid})
-    return JSONResponse({"ok": True, "pid": PROCESS.pid, "cmd": cmd})
+    try:
+        pid, cmd = start_managed_process(config, links, kill_existing=body.get("kill_existing", True))
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "pid": pid, "cmd": cmd})
 
 
 async def stop_stream(request):
     global PROCESS
     if not PROCESS or PROCESS.poll() is not None:
         return JSONResponse({"ok": True, "stopped": False})
-    PROCESS.terminate()
-    try:
-        await asyncio.wait_for(asyncio.to_thread(PROCESS.wait), timeout=5)
-    except TimeoutError:
-        PROCESS.kill()
+    await asyncio.to_thread(terminate_process_tree, PROCESS)
     event("stream stopped", "warn")
     return JSONResponse({"ok": True, "stopped": True})
 

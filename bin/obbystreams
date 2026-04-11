@@ -1,3 +1,1032 @@
-#!/usr/bin/env bash
-set -euo pipefail
-exec /usr/bin/ufc "$@"
+#!/usr/bin/env python3
+"""obbystreams - resilient stream transcoder to HLS."""
+
+import argparse
+import glob
+import os
+import random
+import re
+import select
+import signal
+import shutil
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from collections import deque
+from dataclasses import dataclass, field
+
+DEFAULT_STREAM_DIR = "/var/www/live.obnoxious.lol/stream"
+APP_NAME = "obbystreams"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+SPINNER = ["|", "/", "-", "\\"]
+
+
+def want_color(args=None):
+    if args and getattr(args, "no_color", False):
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def ansi(text, code, args=None):
+    if not want_color(args):
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def icon(text, args=None):
+    return ansi(text, "38;5;45;1", args)
+
+
+def label(text, args=None):
+    return ansi(text, "38;5;111;1", args)
+
+
+def ok(text, args=None):
+    return ansi(text, "38;5;82;1", args)
+
+
+def warn(text, args=None):
+    return ansi(text, "38;5;214;1", args)
+
+
+def bad(text, args=None):
+    return ansi(text, "38;5;203;1", args)
+
+
+def visible_len(text):
+    return len(ANSI_RE.sub("", str(text)))
+
+
+def fit(text, width):
+    text = str(text)
+    if width <= 0:
+        return ""
+    clean = ANSI_RE.sub("", text)
+    if len(clean) <= width:
+        return text
+    if width <= 1:
+        return "…"
+    return clean[: width - 1] + "…"
+
+
+def term_width():
+    return max(36, shutil.get_terminal_size((100, 24)).columns)
+
+
+def panel_width():
+    return max(36, min(term_width(), 96))
+
+
+def progress_bar(ratio, width, args=None):
+    width = max(3, width)
+    ratio = max(0.0, min(1.0, ratio))
+    fill = int(width * ratio)
+    bar = "━" * fill + "─" * (width - fill)
+    return ansi(bar, "38;5;45", args)
+
+
+def with_lock(state):
+    return state.get("lock") or threading.Lock()
+
+
+def add_event(state, text, level="info"):
+    with with_lock(state):
+        state["events"].append((time.time(), level, text))
+
+
+def emit(state, args, text, level="info"):
+    if state.get("live_ui"):
+        add_event(state, text, level)
+    else:
+        prefix = {"info": icon(APP_NAME, args), "ok": ok(APP_NAME, args), "warn": warn(APP_NAME, args), "bad": bad(APP_NAME, args)}.get(level, icon(APP_NAME, args))
+        print(f"{prefix} {text}", flush=True)
+
+
+def render_kv(key, value, width, args=None):
+    left = f"  {label(key, args)}"
+    gap = " " * max(1, 14 - visible_len(key))
+    return fit(left + gap + str(value), width)
+
+
+@dataclass
+class EncoderProfile:
+    key: str
+    title: str
+    codec: str
+    score: int
+    device: str | None = None
+    global_args: list[str] = field(default_factory=list)
+    video_args: list[str] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
+class StreamHealth:
+    index: int
+    url: str
+    attempts: int = 0
+    failures: int = 0
+    quick_failures: int = 0
+    total_runtime: float = 0.0
+    best_runtime: float = 0.0
+    last_runtime: float = 0.0
+    last_failure_at: float = 0.0
+    last_started_at: float = 0.0
+    backoff_until: float = 0.0
+    consecutive_failures: int = 0
+    last_error: str = ""
+    tried_this_round: bool = False
+    failed_this_round: bool = False
+
+    @property
+    def average_runtime(self):
+        if not self.attempts:
+            return 0.0
+        return self.total_runtime / self.attempts
+
+    def record_start(self):
+        self.attempts += 1
+        self.last_started_at = time.monotonic()
+        self.tried_this_round = True
+
+    def record_exit(self, elapsed, quick_fail, failed=True):
+        if failed:
+            self.failures += 1
+            self.failed_this_round = True
+            self.consecutive_failures += 1
+        else:
+            self.consecutive_failures = 0
+        self.last_runtime = elapsed
+        self.total_runtime += elapsed
+        self.best_runtime = max(self.best_runtime, elapsed)
+        self.last_failure_at = time.monotonic()
+        if failed and elapsed < quick_fail:
+            self.quick_failures += 1
+            return True
+        self.quick_failures = 0
+        return False
+
+    def score(self, now, current_index, explore_bias=20.0):
+        if self.backoff_until > now:
+            return -1_000_000.0 - (self.backoff_until - now)
+        freshness_penalty = max(0.0, 12.0 - (now - self.last_failure_at)) if self.last_failure_at else 0.0
+        current_penalty = 8.0 if self.index == current_index else 0.0
+        quick_penalty = min(60.0, self.quick_failures * 18.0)
+        explore_bonus = explore_bias if self.attempts == 0 else 0.0
+        return self.best_runtime * 1.8 + self.average_runtime + explore_bonus - quick_penalty - freshness_penalty - current_penalty
+
+
+def short_url(url, width=88):
+    if len(url) <= width:
+        return url
+    return url[: max(0, width - 3)] + "..."
+
+
+def find_running_instances():
+    my_pid = os.getpid()
+    try:
+        result = subprocess.run(["pgrep", "-a", "-f", r"ufc"], capture_output=True, text=True)
+        procs = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            cmd = parts[1] if len(parts) > 1 else ""
+            if pid == my_pid or "pgrep" in cmd or "grep" in cmd:
+                continue
+            base = os.path.basename(cmd.split()[0]) if cmd.split() else ""
+            if base in {"bwrap", "zsh", "bash", "sh", "timeout"}:
+                continue
+            cmd_parts = cmd.split()
+            if (
+                cmd.startswith("/usr/bin/ufc")
+                or "/usr/bin/ufc" in cmd_parts
+                or "/home/joey/ufc_tool.py" in cmd_parts
+                or "streamUFC" in cmd
+            ):
+                procs.append((pid, cmd))
+        return procs
+    except Exception:
+        return []
+
+
+def kill_instances(procs):
+    for pid, _ in procs:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    time.sleep(1)
+    for pid, _ in procs:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def cleanup(stream_dir):
+    for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.tmp"):
+        for f in glob.glob(os.path.join(stream_dir, pattern)):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def ensure_output_dir(path):
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, ".ufc-write-test")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+        os.remove(probe)
+    except OSError as exc:
+        raise SystemExit(
+            f"ufc cannot write to {path}: {exc}\n"
+            "Fix the directory owner/group/ACL once; runtime should not need sudo."
+        ) from exc
+
+
+def ffmpeg_encoders():
+    try:
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=8)
+        return result.stdout + result.stderr
+    except Exception:
+        return ""
+
+
+def readable(path):
+    return path and os.path.exists(path) and os.access(path, os.R_OK | os.W_OK)
+
+
+def render_nodes():
+    return [p for p in sorted(glob.glob("/dev/dri/renderD*")) if readable(p)]
+
+
+def render_vendor(path):
+    name = os.path.basename(path)
+    sys_path = f"/sys/class/drm/{name}/device/vendor"
+    try:
+        with open(sys_path, encoding="utf-8") as f:
+            return f.read().strip().lower()
+    except OSError:
+        return ""
+
+
+def preferred_render_node(vendors):
+    nodes = render_nodes()
+    for vendor in vendors:
+        for node in nodes:
+            if render_vendor(node) == vendor:
+                return node
+    return nodes[0] if nodes else None
+
+
+def has_nvidia_device():
+    return readable("/dev/nvidiactl") and any(readable(p) for p in glob.glob("/dev/nvidia[0-9]*"))
+
+
+def encoder_available(encoders, codec):
+    return codec in encoders
+
+
+def discover_encoders():
+    encoders = ffmpeg_encoders()
+    profiles = []
+
+    if encoder_available(encoders, "h264_nvenc") and has_nvidia_device():
+        profiles.append(EncoderProfile(
+            key="nvenc",
+            title="NVIDIA GPU transcode",
+            codec="h264_nvenc",
+            score=400,
+            video_args=["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll", "-rc", "vbr"],
+        ))
+
+    intel_node = preferred_render_node(["0x8086"])
+    if encoder_available(encoders, "h264_qsv") and intel_node:
+        profiles.append(EncoderProfile(
+            key="qsv",
+            title="Intel GPU transcode",
+            codec="h264_qsv",
+            score=360,
+            device=intel_node,
+            global_args=["-init_hw_device", f"qsv=hw:{intel_node}", "-filter_hw_device", "hw"],
+            video_args=["-vf", "format=nv12,hwupload=extra_hw_frames=64", "-c:v", "h264_qsv", "-preset", "veryfast"],
+        ))
+
+    amd_node = preferred_render_node(["0x1002"])
+    if encoder_available(encoders, "h264_amf") and amd_node:
+        profiles.append(EncoderProfile(
+            key="amf",
+            title="AMD GPU transcode",
+            codec="h264_amf",
+            score=340,
+            device=amd_node,
+            video_args=["-c:v", "h264_amf", "-quality", "speed"],
+        ))
+
+    vaapi_node = preferred_render_node(["0x8086", "0x1002"])
+    if encoder_available(encoders, "h264_vaapi") and vaapi_node:
+        profiles.append(EncoderProfile(
+            key="vaapi",
+            title="VAAPI GPU transcode",
+            codec="h264_vaapi",
+            score=300,
+            device=vaapi_node,
+            global_args=["-vaapi_device", vaapi_node],
+            video_args=["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi"],
+        ))
+
+    profiles.append(EncoderProfile(
+        key="cpu",
+        title="CPU transcode",
+        codec="libx264",
+        score=0,
+        reason="no accessible GPU encoder/device found",
+    ))
+    return profiles
+
+
+def choose_encoder(args):
+    profiles = discover_encoders()
+    by_key = {p.key: p for p in profiles}
+    aliases = {
+        "auto": None,
+        "gpu": None,
+        "gpu-trans": None,
+        "nv": "nvenc",
+        "nvidia": "nvenc",
+        "nvenc": "nvenc",
+        "nv-gpu-trans": "nvenc",
+        "intel": "qsv",
+        "qsv": "qsv",
+        "intel-gpu-trans": "qsv",
+        "amd": "amf",
+        "amf": "amf",
+        "amd-gpu-trans": "amf",
+        "vaapi": "vaapi",
+        "cpu": "cpu",
+    }
+    wanted = aliases[args.encoder]
+
+    if wanted:
+        if wanted in by_key:
+            return by_key[wanted], profiles
+        if args.encoder != "cpu":
+            print(warn(f"ufc: requested {args.encoder} is not available to this user; falling back to CPU.", args))
+        return by_key["cpu"], profiles
+
+    return max(profiles, key=lambda p: p.score), profiles
+
+
+def build_ffmpeg_cmd(args, url, encoder):
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
+    network_input = url.startswith(("http://", "https://", "rtmp://", "rtmps://"))
+
+    if not args.verbose:
+        cmd += ["-loglevel", "warning"]
+    cmd += ["-stats_period", "1", "-progress", "pipe:1"]
+
+    cmd += encoder.global_args
+    if network_input:
+        cmd += [
+            "-user_agent", USER_AGENT,
+            "-timeout", str(args.timeout * 1_000_000),
+            "-rw_timeout", str(args.timeout * 1_000_000),
+        ]
+
+    fflags = "+genpts+discardcorrupt+nobuffer" if network_input else "+genpts+discardcorrupt"
+    cmd += [
+        "-fflags", fflags,
+        "-err_detect", "ignore_err",
+        "-analyzeduration", str(args.analyzeduration),
+        "-probesize", str(args.probesize),
+        "-thread_queue_size", str(args.thread_queue_size),
+    ]
+
+    if args.reconnect and network_input:
+        cmd += [
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_delay_max", str(args.reconnect_delay),
+        ]
+
+    cmd += ["-i", url]
+
+    if encoder.key == "cpu":
+        cmd += ["-c:v", "libx264", "-preset", args.preset]
+    else:
+        cmd += encoder.video_args
+
+    cmd += [
+        "-b:v", args.video_bitrate,
+        "-maxrate", args.maxrate,
+        "-bufsize", args.bufsize,
+        "-g", str(args.gop),
+        "-keyint_min", str(args.gop),
+        "-force_key_frames", f"expr:gte(t,n_forced*{args.hls_time})",
+    ]
+
+    if encoder.key in ("cpu", "nvenc"):
+        cmd += ["-profile:v", "high", "-level", "4.1"]
+
+    cmd += [
+        "-c:a", "aac",
+        "-b:a", args.audio_bitrate,
+        "-ac", "2",
+        "-af", "aresample=async=1:first_pts=0",
+        "-max_muxing_queue_size", "9999",
+        "-f", "hls",
+        "-hls_time", str(args.hls_time),
+        "-hls_list_size", str(args.hls_size),
+        "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
+        "-hls_delete_threshold", str(args.hls_delete_threshold),
+        "-hls_segment_type", "mpegts",
+        "-hls_segment_filename", os.path.join(args.output_dir, "ufc_%06d.ts"),
+        "-start_number", "1",
+        os.path.join(args.output_dir, "ufc.m3u8"),
+    ]
+
+    return cmd
+
+
+def interruptible_sleep(seconds, stop_flag):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if stop_flag():
+            return
+        time.sleep(0.1)
+
+
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    return f"{m}m{s:02d}s"
+
+
+def proc_stats(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            fields = f.read().split()
+        total_ticks = int(fields[13]) + int(fields[14])
+        ticks = os.sysconf("SC_CLK_TCK")
+        cpu_s = total_ticks / ticks
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return cpu_s, int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return None, None
+
+
+def update_progress(state, line):
+    line = line.strip()
+    if "=" not in line:
+        return
+    key, value = line.split("=", 1)
+    if key:
+        with with_lock(state):
+            state["ffmpeg"][key] = value
+
+
+def remember_ffmpeg_log(state, line, args):
+    line = line.rstrip()
+    if not line:
+        return
+    with with_lock(state):
+        state["ffmpeg_logs"].append(line)
+        state["last_ffmpeg_log_at"] = time.monotonic()
+        if is_ffmpeg_error_line(line):
+            state["ffmpeg_errors"].append(line)
+    if args.verbose and not state.get("live_ui"):
+        print(line, flush=True)
+
+
+def is_ffmpeg_error_line(line):
+    lowered = line.lower()
+    noise = (
+        "opening '",
+        "frame i:",
+        "frame p:",
+        "frame b:",
+        "weighted p-frames",
+        "kb/s:",
+        "qavg:",
+        "consecutive b-frames",
+        "mb i",
+        "mb p",
+        "mb b",
+        "8x8 transform",
+        "coded y,",
+        "i16 v,",
+        "i8 v,",
+        "i4 v,",
+        "i8c dc,",
+    )
+    if any(token in lowered for token in noise):
+        return False
+    return any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500", "connection"))
+
+
+def stream_reader(stream, state, args, kind):
+    try:
+        for line in iter(stream.readline, ""):
+            if kind == "progress":
+                update_progress(state, line)
+            else:
+                remember_ffmpeg_log(state, line, args)
+    except Exception as exc:
+        add_event(state, f"ffmpeg {kind} reader stopped: {exc}", "warn")
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def ffmpeg_snapshot(state):
+    with with_lock(state):
+        progress = dict(state["ffmpeg"])
+        logs = list(state["ffmpeg_logs"])
+        events = list(state["events"])
+    return progress, logs, events
+
+
+def ffmpeg_error_summary(state, limit=3):
+    with with_lock(state):
+        errors = list(state["ffmpeg_errors"])[-limit:]
+        logs = list(state["ffmpeg_logs"])[-limit:]
+    chosen = errors or logs
+    if not chosen:
+        return ""
+    return " | ".join(fit(line, 180) for line in chosen)
+
+
+def render_live_panel(state, args, health, encoder, frame):
+    width = panel_width()
+    now = time.monotonic()
+    progress, logs, events = ffmpeg_snapshot(state)
+    current = health[state["url_index"]]
+    pid = state["proc_pid"]
+    cpu_s, rss_mb = proc_stats(pid) if pid else (None, None)
+
+    seg_files = glob.glob(os.path.join(args.output_dir, "ufc*.ts"))
+    seg_bytes = sum(os.path.getsize(f) for f in seg_files if os.path.exists(f))
+    m3u8 = os.path.join(args.output_dir, "ufc.m3u8")
+    age = "waiting"
+    if os.path.exists(m3u8):
+        age = f"{time.time() - os.path.getmtime(m3u8):.1f}s ago"
+
+    body_width = width
+    rule = ansi("─" * max(0, body_width - 10), "38;5;240", args)
+    spin = ansi(SPINNER[frame % len(SPINNER)], "38;5;45;1", args)
+    title = fit(f"{spin} {ansi(APP_NAME, '38;5;45;1', args)} {ansi('stream commander', '38;5;111;1', args)} {rule}", body_width)
+
+    stream_elapsed = fmt_duration(now - state["stream_start"]) if state["stream_start"] else "waiting"
+    best = max(health, key=lambda h: h.best_runtime)
+    speed = progress.get("speed", "n/a")
+    fps = progress.get("fps", "n/a")
+    bitrate = progress.get("bitrate", "n/a")
+    frame_no = progress.get("frame", "n/a")
+    out_time = progress.get("out_time", progress.get("out_time_ms", "n/a"))
+    total_size = progress.get("total_size", "n/a")
+
+    ratio = 0.0
+    if current.attempts:
+        ratio = min(1.0, current.best_runtime / max(args.quick_fail, 1.0))
+
+    lines = [
+        title,
+        render_kv("encoder", f"{encoder.title} ({encoder.codec})", body_width, args),
+        render_kv("link", f"[{current.index + 1}/{len(health)}] {short_url(current.url, max(18, body_width - 24))}", body_width, args),
+        render_kv("runtime", f"tool {fmt_duration(now - state['tool_start'])} | stream {stream_elapsed} | restarts {state['restarts']}", body_width, args),
+        render_kv("hls", f"{len(seg_files)} segments | {seg_bytes / (1024 * 1024):.1f} MB | playlist {age}", body_width, args),
+        render_kv("ffmpeg", f"frame {frame_no} | fps {fps} | bitrate {bitrate} | speed {speed} | out {out_time}", body_width, args),
+        render_kv("process", f"pid {pid or 'waiting'} | cpu {f'{cpu_s:.1f}s' if cpu_s is not None else 'n/a'} | rss {f'{rss_mb:.0f} MB' if rss_mb is not None else 'n/a'}", body_width, args),
+        render_kv("best", f"link {best.index + 1} | best run {fmt_duration(best.best_runtime)} | average {fmt_duration(best.average_runtime)}", body_width, args),
+        "  " + progress_bar(ratio, max(10, body_width - 4), args),
+    ]
+
+    if events:
+        lines.append(ansi("  events", "38;5;111;1", args))
+        for _, level, text in events[-4:]:
+            marker = {"info": "·", "ok": "+", "warn": "!", "bad": "x"}.get(level, "·")
+            colored_marker = {"info": label(marker, args), "ok": ok(marker, args), "warn": warn(marker, args), "bad": bad(marker, args)}.get(level, label(marker, args))
+            lines.append(f"  {colored_marker} {fit(text, body_width - 4)}")
+
+    if logs:
+        lines.append(ansi("  ffmpeg", "38;5;111;1", args))
+        for line in logs[-4:]:
+            color = "38;5;203" if is_ffmpeg_error_line(line) else "38;5;250"
+            lines.append("  " + ansi(fit(line, body_width - 4), color, args))
+
+    footer = fit("  keys: n/right-arrow next link | q quit | Ctrl-C stop", body_width)
+    lines.append(ansi(footer, "38;5;245", args))
+    return "\n".join(lines)
+
+
+def status_thread(state, args, health, encoder, interval=10):
+    tool_start = state["tool_start"]
+
+    def run():
+        if state.get("live_ui"):
+            frame = 0
+            try:
+                print("\033[?25l\033[2J\033[3J\033[H", end="", flush=True)
+                while not state["interrupted"]:
+                    print("\033[H\033[2J" + render_live_panel(state, args, health, encoder, frame), end="", flush=True)
+                    frame += 1
+                    interruptible_sleep(0.16, lambda: state["interrupted"])
+            finally:
+                print("\033[?25h\033[0m", end="", flush=True)
+            return
+
+        while not state["interrupted"]:
+            interruptible_sleep(interval, lambda: state["interrupted"])
+            if state["interrupted"]:
+                break
+            now = time.monotonic()
+            current = health[state["url_index"]]
+            progress, logs, _ = ffmpeg_snapshot(state)
+            msg = (
+                f"status: link {current.index + 1}/{len(health)}, "
+                f"stream {fmt_duration(now - state['stream_start']) if state['stream_start'] else 'waiting'}, "
+                f"speed {progress.get('speed', 'n/a')}, fps {progress.get('fps', 'n/a')}, "
+                f"last ffmpeg: {logs[-1] if logs else 'none'}"
+            )
+            print(f"{icon(APP_NAME, args)} {fit(msg, term_width())}", flush=True)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def next_stream_index(health, current_index):
+    if len(health) <= 1:
+        return current_index, False
+    now = time.monotonic()
+    available = [h for h in health if h.backoff_until <= now]
+    if not available:
+        return min(health, key=lambda h: h.backoff_until).index, True
+    if all(h.tried_this_round for h in health):
+        all_failed = all(h.failed_this_round for h in health)
+        for h in health:
+            h.tried_this_round = False
+            h.failed_this_round = False
+        if all_failed:
+            available = [h for h in health if h.backoff_until <= now]
+            if available:
+                return max(available, key=lambda h: h.score(now, current_index, explore_bias=0.0)).index, True
+            return min(health, key=lambda h: h.backoff_until).index, True
+        return max(available, key=lambda h: h.score(now, current_index, explore_bias=0.0)).index, False
+    candidates = [h for h in health if not h.tried_this_round and h.backoff_until <= now]
+    if not candidates:
+        candidates = available
+    return max(candidates, key=lambda h: h.score(now, current_index)).index, False
+
+
+def manual_next_index(health, current_index):
+    if len(health) <= 1:
+        return current_index
+    return (current_index + 1) % len(health)
+
+
+def keyboard_thread(state, health, args):
+    if not sys.stdin.isatty():
+        return None
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def stop_proc():
+        p = state.get("proc_obj")
+        if p and p.poll() is None:
+            p.terminate()
+
+    def run():
+        try:
+            tty.setraw(fd)
+            while not state["interrupted"]:
+                r, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if not r:
+                    continue
+                ch = sys.stdin.read(1)
+
+                if ch == "\x03" or ch == "q":
+                    emit(state, args, "quit requested", "bad")
+                    state["interrupted"] = True
+                    stop_proc()
+                    break
+
+                if ch == "n" or ch == "\x1b":
+                    if ch == "\x1b":
+                        r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if not r2:
+                            continue
+                        if sys.stdin.read(2) != "[C":
+                            continue
+
+                    next_idx = manual_next_index(health, state["url_index"])
+                    state["url_index"] = next_idx
+                    state["manual_rotate"] = True
+                    emit(state, args, f"manual switch -> [{next_idx + 1}/{len(health)}] {short_url(health[next_idx].url)}")
+                    stop_proc()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def parser_for_args():
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Obbystreams transcoder - resilient HLS output with smart GPU and URL fallback.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("url", nargs="*", help="Stream URL(s) (positional)")
+    parser.add_argument("--link", "-l", dest="link", metavar="URL", action="append",
+                        help="Stream URL; repeat like --link URL1 --link URL2")
+    parser.add_argument("--links", dest="links", metavar="URL", nargs="+",
+                        help="One or more stream URLs after a single --links flag")
+
+    enc = parser.add_mutually_exclusive_group()
+    enc.add_argument("--encoder", default="auto",
+                     choices=["auto", "gpu", "gpu-trans", "nv", "nvidia", "nvenc", "nv-gpu-trans",
+                              "intel", "qsv", "intel-gpu-trans", "amd", "amf", "amd-gpu-trans", "vaapi", "cpu"],
+                     help="Transcode backend. auto tries GPU first and falls back to CPU.")
+    enc.add_argument("--gpu", dest="encoder", action="store_const", const="gpu-trans",
+                     help="Alias for --encoder gpu-trans")
+    enc.add_argument("--gpu-trans", dest="encoder", action="store_const", const="gpu-trans",
+                     help="Auto-select the best available GPU transcoder")
+    enc.add_argument("--nv-gpu-trans", dest="encoder", action="store_const", const="nv-gpu-trans",
+                     help="Require NVIDIA NVENC, then fall back to CPU if unavailable")
+    enc.add_argument("--intel-gpu-trans", dest="encoder", action="store_const", const="intel-gpu-trans",
+                     help="Require Intel Quick Sync, then fall back to CPU if unavailable")
+    enc.add_argument("--amd-gpu-trans", dest="encoder", action="store_const", const="amd-gpu-trans",
+                     help="Require AMD AMF, then fall back to CPU if unavailable")
+    enc.add_argument("--vaapi", dest="encoder", action="store_const", const="vaapi",
+                     help="Require VAAPI, then fall back to CPU if unavailable")
+    enc.add_argument("--cpu", dest="encoder", action="store_const", const="cpu",
+                     help="Use CPU libx264 encoding")
+
+    parser.add_argument("--preset", default="veryfast",
+                        choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
+                        help="x264 preset (CPU only)")
+    parser.add_argument("--bitrate", "-b", default="6M", dest="video_bitrate", help="Video bitrate")
+    parser.add_argument("--maxrate", default="8M", help="Max video bitrate")
+    parser.add_argument("--bufsize", default="16M", help="Video buffer size")
+    parser.add_argument("--audio-bitrate", "-ab", default="192k", dest="audio_bitrate", help="Audio bitrate")
+    parser.add_argument("--hls-time", default=4, type=int, help="HLS segment duration in seconds")
+    parser.add_argument("--hls-size", default=10, type=int, help="HLS playlist size in segments")
+    parser.add_argument("--hls-delete-threshold", default=4, type=int, help="Extra old HLS segments to keep")
+    parser.add_argument("--gop", default=60, type=int, help="GOP / keyframe interval")
+    parser.add_argument("--output-dir", default=DEFAULT_STREAM_DIR, dest="output_dir", help="HLS output directory")
+    parser.add_argument("--no-restart", action="store_true", help="Disable auto-restart on ffmpeg exit")
+    parser.add_argument("--restart-delay", default=2.0, type=float, help="Seconds between auto-restarts")
+    parser.add_argument("--max-restart-delay", default=120.0, type=float, help="Maximum exponential retry backoff in seconds")
+    parser.add_argument("--backoff-multiplier", default=2.0, type=float, help="Retry backoff multiplier after consecutive failures")
+    parser.add_argument("--backoff-jitter", default=0.25, type=float, help="Retry backoff jitter ratio")
+    parser.add_argument("--rate-limit-delay", default=180.0, type=float,
+                        help="Minimum cooldown when ffmpeg reports HTTP 429 / rate limiting")
+    parser.add_argument("--no-reconnect", action="store_true", help="Disable ffmpeg-level reconnect flags")
+    parser.add_argument("--reconnect-delay", default=5, type=int, dest="reconnect_delay", help="Max ffmpeg reconnect delay")
+    parser.add_argument("--timeout", default=10, type=int, help="HTTP read/connect timeout in seconds")
+    parser.add_argument("--thread-queue-size", default=8192, type=int, dest="thread_queue_size", help="ffmpeg input queue size")
+    parser.add_argument("--analyzeduration", default=2_000_000, type=int, help="ffmpeg analyze duration in microseconds")
+    parser.add_argument("--probesize", default=2_000_000, type=int, help="ffmpeg probe size in bytes")
+    parser.add_argument("--quick-fail", default=30.0, type=float, dest="quick_fail",
+                        help="A stream run shorter than this is treated as weak")
+    parser.add_argument("--stop-after-failed-rounds", default=2, type=int,
+                        help="Stop after every link quick-fails this many full rounds in a row")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg output")
+    parser.add_argument("--print-cmd", action="store_true", help="Print the ffmpeg command and exit")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
+    return parser
+
+
+def retry_backoff_delay(stream, args, error_summary, return_code):
+    if return_code == 0:
+        stream.backoff_until = 0.0
+        return args.restart_delay
+
+    lowered = (error_summary or "").lower()
+    rate_limited = "429" in lowered or "too many requests" in lowered or "rate limit" in lowered
+    if rate_limited:
+        base = max(args.rate_limit_delay, args.restart_delay)
+    else:
+        exponent = max(0, stream.consecutive_failures - 1)
+        base = args.restart_delay * (args.backoff_multiplier ** exponent)
+    delay = min(args.max_restart_delay, base)
+    jitter_ratio = max(0.0, args.backoff_jitter)
+    if jitter_ratio:
+        delay += random.uniform(0, delay * jitter_ratio)
+    stream.backoff_until = time.monotonic() + delay
+    return delay
+
+
+def main():
+    os.umask(0o002)
+    parser = parser_for_args()
+    args = parser.parse_args()
+    args.reconnect = not args.no_reconnect
+
+    urls = list(args.url or []) + list(args.link or []) + list(args.links or [])
+    if not urls:
+        parser.error(f"At least one URL required: {APP_NAME} <URL>, {APP_NAME} --link <URL>, or {APP_NAME} --links <URL> <URL>")
+
+    encoder, profiles = choose_encoder(args)
+
+    if args.print_cmd:
+        print(" \\\n+  ".join(build_ffmpeg_cmd(args, urls[0], encoder)).replace("\\\n+  ", "\\\n  "))
+        return
+
+    ensure_output_dir(args.output_dir)
+
+    running = find_running_instances()
+    if running:
+        print(f"\n{warn('ufc', args)} {len(running)} ufc/streamUFC instance(s) already running:")
+        for pid, cmd in running:
+            print(f"  {label(str(pid), args)} {cmd[:96]}")
+        try:
+            answer = input("\nKill existing instance(s) and start a new one? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(1)
+        if answer in ("y", "yes"):
+            kill_instances(running)
+            print(ok("Killed.\n", args))
+        else:
+            print("Existing instance left running. Exiting.")
+            sys.exit(0)
+
+    cleanup(args.output_dir)
+
+    health = [StreamHealth(i, u) for i, u in enumerate(urls)]
+    state = {
+        "interrupted": False,
+        "tool_start": time.monotonic(),
+        "stream_start": None,
+        "proc_pid": None,
+        "proc_obj": None,
+        "url_index": 0,
+        "restarts": 0,
+        "failed_rounds": 0,
+        "manual_rotate": False,
+        "lock": threading.Lock(),
+        "events": deque(maxlen=8),
+        "ffmpeg": {},
+        "ffmpeg_logs": deque(maxlen=8),
+        "ffmpeg_errors": deque(maxlen=24),
+        "last_ffmpeg_log_at": None,
+        "live_ui": sys.stdout.isatty() and not args.verbose,
+    }
+    proc = None
+
+    def stop(sig=None, frame=None):
+        state["interrupted"] = True
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    if not state["live_ui"]:
+        available = ", ".join(p.key for p in sorted(profiles, key=lambda p: p.score, reverse=True) if p.key != "cpu") or "none"
+        print(icon(APP_NAME, args) + " " + ansi("stream commander", "38;5;111;1", args))
+        print(render_kv("encoder", f"{encoder.title} ({encoder.codec})", term_width(), args))
+        if encoder.key == "cpu" and available == "none":
+            print(render_kv("gpu", warn("none accessible; CPU selected without sudo", args), term_width(), args))
+        else:
+            print(render_kv("gpu", f"available: {available}", term_width(), args))
+        print(render_kv("output", os.path.join(args.output_dir, "ufc.m3u8"), term_width(), args))
+        print(render_kv("fallback", f"smart health scoring across {len(urls)} link(s)", term_width(), args))
+        print(render_kv("reconnect", "off" if not args.reconnect else f"on, max {args.reconnect_delay}s", term_width(), args))
+        print(render_kv("backoff", f"{args.restart_delay:.1f}s base, {args.max_restart_delay:.0f}s max, {args.rate_limit_delay:.0f}s on 429", term_width(), args))
+        print(render_kv("keys", "n/right-arrow next link, q quit", term_width(), args))
+        for h in health:
+            print(render_kv(f"link {h.index + 1}", short_url(h.url, max(20, term_width() - 20)), term_width(), args))
+        print()
+
+    status_thread(state, args, health, encoder, interval=10)
+    keyboard_thread(state, health, args)
+
+    try:
+        while not state["interrupted"]:
+            current = health[state["url_index"]]
+            current.record_start()
+            cmd = build_ffmpeg_cmd(args, current.url, encoder)
+
+            cleanup(args.output_dir)
+            action = "restart" if state["restarts"] else "starting"
+            with with_lock(state):
+                state["ffmpeg"] = {}
+                state["ffmpeg_logs"].clear()
+                state["ffmpeg_errors"].clear()
+                state["last_ffmpeg_log_at"] = None
+            emit(state, args, f"{action} -> link [{current.index + 1}/{len(health)}] {short_url(current.url)}")
+
+            stream_start = time.monotonic()
+            state["stream_start"] = stream_start
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            state["proc_obj"] = proc
+            state["proc_pid"] = proc.pid
+            stdout_thread = threading.Thread(target=stream_reader, args=(proc.stdout, state, args, "progress"), daemon=True)
+            stderr_thread = threading.Thread(target=stream_reader, args=(proc.stderr, state, args, "stderr"), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+            proc.wait()
+            state["proc_pid"] = None
+
+            if state["interrupted"]:
+                break
+
+            elapsed = time.monotonic() - stream_start
+            rc = proc.returncode
+            quick = False if state["manual_rotate"] else current.record_exit(elapsed, args.quick_fail, failed=(rc != 0))
+            msg = f"ffmpeg exited code {rc}, ran {fmt_duration(elapsed)}"
+            error_summary = ffmpeg_error_summary(state)
+            if error_summary:
+                current.last_error = error_summary
+                msg += f" | ffmpeg: {error_summary}"
+
+            if args.no_restart:
+                emit(state, args, msg + " - no-restart set, exiting.", "warn" if rc else "ok")
+                break
+
+            state["restarts"] += 1
+            all_failed = False
+
+            if state["manual_rotate"]:
+                state["manual_rotate"] = False
+                msg += " - manual switch requested"
+            elif quick and len(health) > 1:
+                previous = state["url_index"]
+                state["url_index"], all_failed = next_stream_index(health, previous)
+                if all_failed:
+                    msg += " - every link failed this round; returning to link 1"
+                else:
+                    msg += f" - weak stream, switching to link {state['url_index'] + 1}"
+            elif quick and len(health) == 1:
+                all_failed = True
+                msg += " - only link failed quickly"
+            elif len(health) > 1:
+                # Long-lived streams earn priority, but still rotate after death so alternatives get sampled.
+                state["url_index"], all_failed = next_stream_index(health, state["url_index"])
+                if all_failed:
+                    msg += " - every link failed this round; returning to link 1"
+                else:
+                    msg += f" - stream ended, trying link {state['url_index'] + 1}"
+
+            current_backoff_delay = retry_backoff_delay(current, args, error_summary, rc)
+            if quick and all_failed:
+                state["failed_rounds"] += 1
+            elif not quick:
+                state["failed_rounds"] = 0
+            if args.stop_after_failed_rounds > 0 and state["failed_rounds"] >= args.stop_after_failed_rounds:
+                emit(
+                    state,
+                    args,
+                    f"{msg} - all links quick-failed {state['failed_rounds']} rounds in a row; stopping to avoid rate limits.",
+                    "bad",
+                )
+                break
+            selected = health[state["url_index"]]
+            selected_backoff = max(0.0, selected.backoff_until - time.monotonic())
+            retry_delay = current_backoff_delay if selected.index == current.index else max(args.restart_delay, selected_backoff)
+            emit(state, args, f"{msg} - retrying in {retry_delay:.1f}s", "warn" if rc else "ok")
+            interruptible_sleep(retry_delay, lambda: state["interrupted"])
+
+    finally:
+        state["interrupted"] = True
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        cleanup(args.output_dir)
+        print(f"\n{icon(APP_NAME, args)} stopped. cleaned up.")
+
+
+if __name__ == "__main__":
+    main()

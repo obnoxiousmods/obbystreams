@@ -14,6 +14,10 @@ stream:
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
   bitrate: 6M
   audio_bitrate: 192k
+  restart_delay: 2
+  max_restart_delay: 120
+  rate_limit_delay: 180
+  stop_after_failed_rounds: 2
   links:
     - https://example.com/primary/live.m3u8
     - https://example.com/backup/live.m3u8
