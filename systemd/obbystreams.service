@@ -1,0 +1,22 @@
+[Unit]
+Description=Obbystreams dashboard and stream manager
+After=network-online.target arangodb3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=joey
+Group=nobody
+WorkingDirectory=/opt/obbystreams
+Environment=OBBYSTREAMS_CONFIG=/etc/obbystreams/obbystreams.yaml
+ExecStart=/opt/obbystreams/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8767 --proxy-headers
+Restart=on-failure
+RestartSec=3
+UMask=0002
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/obbystreams /var/www/live.obnoxious.lol/stream /tmp
+
+[Install]
+WantedBy=multi-user.target

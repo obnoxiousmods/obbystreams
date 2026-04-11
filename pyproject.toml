@@ -1,0 +1,62 @@
+[project]
+name = "obbystreams"
+version = "0.1.0"
+description = "Modern Starlette dashboard for managing resilient HLS stream transcoding."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Joey" }]
+keywords = ["hls", "streaming", "starlette", "arangodb", "ffmpeg"]
+dependencies = [
+  "aiofiles>=24.1.0",
+  "httpx>=0.27.0",
+  "psutil>=6.0.0",
+  "pyyaml>=6.0.2",
+  "starlette>=0.37.0",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[project.urls]
+Homepage = "https://s.obby.ca"
+Repository = "https://github.com/obnoxiousmods/obbystreams"
+Issues = "https://github.com/obnoxiousmods/obbystreams/issues"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.8.0",
+  "pytest>=8.3.0",
+  "mypy>=1.13.0",
+  "types-PyYAML>=6.0.12",
+]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.uv]
+package = false
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+  "app.py",
+  "static",
+  "tools",
+  "examples",
+  "systemd",
+  "nginx",
+  "bin",
+]

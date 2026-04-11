@@ -1,0 +1,26 @@
+server:
+  host: 127.0.0.1
+  port: 8767
+  workers: 1
+
+dashboard:
+  password: "change-me"
+  session_token: "change-me-to-a-long-random-token"
+
+stream:
+  command: /usr/bin/obbystreams
+  encoder: auto
+  output_dir: /var/www/live.obnoxious.lol/stream
+  public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
+  bitrate: 6M
+  audio_bitrate: 192k
+  links:
+    - https://example.com/primary/live.m3u8
+    - https://example.com/backup/live.m3u8
+
+arangodb:
+  enabled: true
+  url: http://127.0.0.1:8529
+  database: obbystreams
+  username: obbystreams_app
+  password: "change-me"

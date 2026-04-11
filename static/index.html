@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Obbystreams</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section id="login" class="login">
+      <div>
+        <p class="eyebrow">Obbystreams</p>
+        <h1>Stream control</h1>
+        <p class="muted">Enter the dashboard password.</p>
+      </div>
+      <form id="loginForm" class="loginForm">
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password" />
+        <button type="submit">Unlock</button>
+      </form>
+      <p id="loginError" class="error"></p>
+    </section>
+
+    <section id="app" class="app hidden">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Obbystreams</p>
+          <h1>Live stream cockpit</h1>
+        </div>
+        <div class="actions">
+          <button id="startBtn">Start</button>
+          <button id="restartBtn" class="secondary">Restart</button>
+          <button id="stopBtn" class="danger">Stop</button>
+        </div>
+      </header>
+
+      <section class="hero">
+        <div class="videoSurface">
+          <video id="preview" controls autoplay muted playsinline></video>
+          <div class="videoFallback">
+            <span>Preview</span>
+            <small id="previewUrl">Waiting for HLS output</small>
+          </div>
+        </div>
+        <div class="statusGrid">
+          <article><span>Status</span><strong id="runState">Unknown</strong></article>
+          <article><span>Encoder</span><strong id="encoder">auto</strong></article>
+          <article><span>Segments</span><strong id="segments">0</strong></article>
+          <article><span>Playlist age</span><strong id="playlistAge">waiting</strong></article>
+          <article><span>RSS</span><strong id="rss">n/a</strong></article>
+          <article><span>ArangoDB</span><strong id="arango">checking</strong></article>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <div class="panel linksPanel">
+          <div class="panelHead">
+            <h2>Links</h2>
+            <button id="saveLinksBtn" class="secondary">Save order</button>
+          </div>
+          <form id="addLinkForm" class="addLink">
+            <input id="newLink" type="url" placeholder="https://example.com/live.m3u8" />
+            <button type="submit">Add link</button>
+          </form>
+          <div id="links" class="links"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panelHead">
+            <h2>Metrics</h2>
+            <span id="updated" class="pill">syncing</span>
+          </div>
+          <div class="metrics">
+            <div><span>PID</span><strong id="pid">n/a</strong></div>
+            <div><span>CPU</span><strong id="cpu">n/a</strong></div>
+            <div><span>HLS size</span><strong id="hlsBytes">0 MB</strong></div>
+            <div><span>Existing procs</span><strong id="externalProcs">0</strong></div>
+          </div>
+          <h3>Events</h3>
+          <div id="events" class="feed"></div>
+          <h3>Logs</h3>
+          <div id="logs" class="logFeed"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
