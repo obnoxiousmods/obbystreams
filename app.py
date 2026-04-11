@@ -232,6 +232,7 @@ def hls_metrics(config):
         "output_dir": str(output_dir),
         "playlist": str(playlist),
         "playlist_exists": playlist.exists(),
+        "playlist_ready": bool(playlist_segment_names),
         "playlist_age": playlist_age,
         "playlist_modified_at": int(playlist_mtime * 1000) if playlist_mtime else None,
         "playlist_line_count": len(playlist_lines),
@@ -281,11 +282,11 @@ def stream_health(proc, hls):
             "message": "Runner is alive, but no ffmpeg child is active yet.",
             "recent_errors": recent_errors,
         }
-    if not hls.get("playlist_exists"):
+    if not hls.get("playlist_ready"):
         return {
             "state": "starting",
             "level": "warn",
-            "message": "ffmpeg is running, but no HLS playlist has been written yet.",
+            "message": "ffmpeg is running, but no playable HLS playlist has been written yet.",
             "recent_errors": recent_errors,
         }
     age = hls.get("playlist_age")
@@ -585,6 +586,8 @@ async def hls_proxy(request):
                 text = local_path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            if not any(line and not line.startswith("#") for line in text.splitlines()):
+                return JSONResponse({"ok": False, "error": "HLS playlist is not ready"}, status_code=404)
             return Response(
                 rewrite_playlist(text),
                 media_type=hls_content_type(path),

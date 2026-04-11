@@ -271,7 +271,7 @@ async function refresh() {
     $("healthState").textContent = health.level ? `${health.level}: ${health.state}` : "checking";
     $("healthMessage").textContent = health.message || "Waiting for status.";
     $("updated").textContent = new Date(data.server_time).toLocaleTimeString();
-    if (hls.playlist_exists) {
+    if (proc.managed && hls.playlist_ready) {
       setVideo(hls.public_hls_url, hls.dashboard_hls_url || hls.public_hls_url);
     } else {
       clearVideo(hls.dashboard_hls_url || hls.public_hls_url, health.message);
