@@ -4,7 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Obbystreams</title>
+  <link href="https://vjs.zencdn.net/8.16.1/video-js.css" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://vjs.zencdn.net/8.16.1/video.min.js"></script>
 </head>
 <body>
   <main class="shell">
@@ -25,7 +27,7 @@
       <header class="topbar">
         <div>
           <p class="eyebrow">Obbystreams</p>
-          <h1>Live stream cockpit</h1>
+          <h1>Stream operations</h1>
         </div>
         <div class="actions">
           <button id="startBtn">Start</button>
@@ -35,13 +37,25 @@
       </header>
 
       <section class="hero">
-        <div class="videoSurface">
-          <video id="preview" controls autoplay muted playsinline></video>
-          <div class="videoFallback">
-            <span>Preview</span>
-            <small id="previewUrl">Waiting for HLS output</small>
+        <article class="stage panel">
+          <div class="stageHead">
+            <div>
+              <h2>Live preview</h2>
+              <p id="previewUrl">Waiting for HLS output</p>
+            </div>
+            <span id="playerState" class="pill">player idle</span>
           </div>
-        </div>
+          <div id="videoMount" class="videoSurface">
+            <video id="preview" class="video-js vjs-theme-obby vjs-big-play-centered" controls preload="auto" playsinline></video>
+          </div>
+          <div class="playerBar">
+            <button id="reloadPlayerBtn" class="secondary">Reload player</button>
+            <button id="copyHlsBtn" class="secondary">Copy HLS</button>
+            <a id="openHlsBtn" class="buttonLink" target="_blank" rel="noreferrer">Open HLS</a>
+            <span class="miniStat">Window <strong id="windowSeconds">n/a</strong></span>
+            <span class="miniStat">Updated <strong id="playlistModified">n/a</strong></span>
+          </div>
+        </article>
         <div class="statusGrid">
           <article><span>Status</span><strong id="runState">Unknown</strong></article>
           <article><span>Encoder</span><strong id="encoder">auto</strong></article>
@@ -75,7 +89,15 @@
             <div><span>CPU</span><strong id="cpu">n/a</strong></div>
             <div><span>HLS size</span><strong id="hlsBytes">0 MB</strong></div>
             <div><span>Existing procs</span><strong id="externalProcs">0</strong></div>
+            <div><span>Media sequence</span><strong id="mediaSequence">n/a</strong></div>
+            <div><span>Target duration</span><strong id="targetDuration">n/a</strong></div>
+            <div><span>Playlist lines</span><strong id="playlistLineCount">n/a</strong></div>
+            <div><span>First segment</span><strong id="firstSegment">n/a</strong></div>
+            <div><span>Last segment</span><strong id="lastSegment">n/a</strong></div>
+            <div><span>Last segment size</span><strong id="lastSegmentSize">n/a</strong></div>
           </div>
+          <h3>Playlist tail</h3>
+          <div id="playlistSegments" class="segmentFeed"></div>
           <h3>Events</h3>
           <div id="events" class="feed"></div>
           <h3>Logs</h3>

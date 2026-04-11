@@ -2,6 +2,9 @@ const state = {
   token: localStorage.getItem("obbystreams_token") || "",
   config: null,
   links: [],
+  player: null,
+  hlsUrl: "",
+  playerUrl: "",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -23,6 +26,16 @@ function fmtAge(seconds) {
   if (seconds < 1) return "now";
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
   return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
+}
+
+function fmtClock(ms) {
+  if (!ms) return "n/a";
+  return new Date(ms).toLocaleTimeString();
+}
+
+function absoluteUrl(url) {
+  if (!url) return "";
+  return new URL(url, window.location.origin).toString();
 }
 
 async function api(path, options = {}) {
@@ -121,12 +134,85 @@ function renderLogs(logs) {
   });
 }
 
-function setVideo(url) {
+function renderSegments(segments) {
+  $("playlistSegments").innerHTML = "";
+  (segments || []).slice(-12).reverse().forEach((name) => {
+    const item = document.createElement("div");
+    item.className = "segmentLine";
+    item.textContent = name;
+    $("playlistSegments").append(item);
+  });
+}
+
+function setPlayerState(text) {
+  $("playerState").textContent = text;
+}
+
+function setVideo(url, playerUrl = url) {
   $("previewUrl").textContent = url || "Waiting for HLS output";
-  if (!url || $("preview").src === url) return;
-  $("preview").src = url;
-  $("preview").load();
-  $("preview").play().catch(() => {});
+  $("openHlsBtn").href = absoluteUrl(playerUrl || url) || "#";
+  if (!playerUrl || state.playerUrl === playerUrl) return;
+  state.hlsUrl = url;
+  state.playerUrl = playerUrl;
+  initPlayer(playerUrl);
+}
+
+function ensureVideoElement() {
+  if ($("preview")) return $("preview");
+  const video = document.createElement("video");
+  video.id = "preview";
+  video.className = "video-js vjs-theme-obby vjs-big-play-centered";
+  video.setAttribute("controls", "");
+  video.setAttribute("preload", "auto");
+  video.setAttribute("playsinline", "");
+  $("videoMount").replaceChildren(video);
+  return video;
+}
+
+function initPlayer(url = state.playerUrl) {
+  if (!url || !window.videojs) {
+    if (!window.videojs) setPlayerState("Video.js unavailable");
+    return;
+  }
+  ensureVideoElement();
+  if (!state.player || state.player.isDisposed()) {
+    state.player = videojs("preview", {
+      fluid: true,
+      liveui: true,
+      controls: true,
+      autoplay: true,
+      muted: true,
+      preload: "auto",
+      playsinline: true,
+      html5: {
+        vhs: {
+          overrideNative: true,
+          limitRenditionByPlayerDimensions: true,
+        },
+        nativeAudioTracks: false,
+        nativeVideoTracks: false,
+      },
+    });
+
+    state.player.on("loadedmetadata", () => setPlayerState("metadata loaded"));
+    state.player.on("playing", () => setPlayerState("playing"));
+    state.player.on("waiting", () => setPlayerState("buffering"));
+    state.player.on("stalled", () => setPlayerState("stalled"));
+    state.player.on("error", () => {
+      const err = state.player.error();
+      setPlayerState(`error ${err?.code || ""}`.trim());
+      console.error("Video.js error", err);
+    });
+  }
+
+  state.player.ready(() => {
+    setPlayerState("loading");
+    state.player.pause();
+    state.player.reset();
+    state.player.src({ src: url, type: "application/x-mpegURL" });
+    state.player.load();
+    state.player.play().catch(() => setPlayerState("click play to start"));
+  });
 }
 
 async function refresh() {
@@ -146,11 +232,20 @@ async function refresh() {
     $("cpu").textContent = proc.cpu == null ? "n/a" : `${proc.cpu.toFixed(1)}%`;
     $("hlsBytes").textContent = fmtBytes(hls.bytes);
     $("externalProcs").textContent = (data.existing_processes || []).length;
+    $("mediaSequence").textContent = hls.media_sequence || "n/a";
+    $("targetDuration").textContent = hls.target_duration ? `${hls.target_duration}s` : "n/a";
+    $("playlistLineCount").textContent = hls.playlist_line_count ?? "n/a";
+    $("windowSeconds").textContent = hls.segment_window_seconds ? `${hls.segment_window_seconds.toFixed(1)}s` : "n/a";
+    $("playlistModified").textContent = fmtClock(hls.playlist_modified_at);
+    $("firstSegment").textContent = hls.first_segment || "n/a";
+    $("lastSegment").textContent = hls.last_segment || "n/a";
+    $("lastSegmentSize").textContent = hls.last_segment_size ? fmtBytes(hls.last_segment_size) : "n/a";
     $("updated").textContent = new Date(data.server_time).toLocaleTimeString();
-    setVideo(hls.public_hls_url);
+    setVideo(hls.public_hls_url, hls.dashboard_hls_url || hls.public_hls_url);
     renderLinks(stream.links || []);
     renderEvents(data.events || []);
     renderLogs(data.logs || []);
+    renderSegments(hls.playlist_segments || []);
 
     const arango = await api("/api/arango").catch((err) => ({ connected: false, error: err.message }));
     $("arango").textContent = arango.connected ? "Connected" : "Offline";
@@ -184,6 +279,17 @@ $("saveLinksBtn").addEventListener("click", saveLinks);
 $("startBtn").addEventListener("click", () => streamAction("start"));
 $("restartBtn").addEventListener("click", () => streamAction("restart"));
 $("stopBtn").addEventListener("click", () => streamAction("stop"));
+$("reloadPlayerBtn").addEventListener("click", () => initPlayer());
+$("copyHlsBtn").addEventListener("click", async () => {
+  const url = absoluteUrl(state.playerUrl || state.hlsUrl);
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    setPlayerState("HLS URL copied");
+  } catch (_) {
+    window.prompt("Copy HLS URL:", url);
+  }
+});
 
 if (state.token) {
   showApp();

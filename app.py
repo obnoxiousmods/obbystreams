@@ -16,7 +16,7 @@ import httpx
 import psutil
 import yaml
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -177,16 +177,47 @@ def hls_metrics(config):
     segments = [Path(p) for p in glob.glob(str(output_dir / "ufc*.ts"))]
     total_bytes = sum(p.stat().st_size for p in segments if p.exists())
     playlist_age = None
+    playlist_mtime = None
+    playlist_lines = []
+    target_duration = None
+    media_sequence = None
+    playlist_segment_names = []
+    segment_durations = []
     if playlist.exists():
-        playlist_age = max(0, time.time() - playlist.stat().st_mtime)
+        playlist_mtime = playlist.stat().st_mtime
+        playlist_age = max(0, time.time() - playlist_mtime)
+        try:
+            playlist_lines = playlist.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            playlist_lines = []
+    for line in playlist_lines:
+        if line.startswith("#EXT-X-TARGETDURATION:"):
+            target_duration = line.split(":", 1)[1]
+        elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            media_sequence = line.split(":", 1)[1]
+        elif line.startswith("#EXTINF:"):
+            with contextlib.suppress(ValueError):
+                segment_durations.append(float(line.split(":", 1)[1].split(",", 1)[0]))
+        elif line and not line.startswith("#"):
+            playlist_segment_names.append(line)
     return {
         "output_dir": str(output_dir),
         "playlist": str(playlist),
         "playlist_exists": playlist.exists(),
         "playlist_age": playlist_age,
+        "playlist_modified_at": int(playlist_mtime * 1000) if playlist_mtime else None,
+        "playlist_line_count": len(playlist_lines),
         "segments": len(segments),
         "bytes": total_bytes,
+        "target_duration": target_duration,
+        "media_sequence": media_sequence,
+        "segment_window_seconds": round(sum(segment_durations), 3),
+        "playlist_segments": playlist_segment_names[-12:],
+        "first_segment": playlist_segment_names[0] if playlist_segment_names else None,
+        "last_segment": playlist_segment_names[-1] if playlist_segment_names else None,
+        "last_segment_size": (output_dir / playlist_segment_names[-1]).stat().st_size if playlist_segment_names and (output_dir / playlist_segment_names[-1]).exists() else None,
         "public_hls_url": stream.get("public_hls_url"),
+        "dashboard_hls_url": "/hls/ufc.m3u8",
     }
 
 
@@ -346,6 +377,102 @@ async def restart_stream(request):
     return await start_stream(request)
 
 
+def hls_content_type(path):
+    if path.endswith(".m3u8"):
+        return "application/vnd.apple.mpegurl"
+    if path.endswith(".ts"):
+        return "video/mp2t"
+    if path.endswith(".m4s"):
+        return "video/iso.segment"
+    if path.endswith(".mp4"):
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def safe_hls_path(value):
+    path = str(value or "ufc.m3u8").lstrip("/")
+    if not path or ".." in Path(path).parts:
+        return None
+    return path
+
+
+def rewrite_playlist(text):
+    rewritten = []
+    for line in text.splitlines():
+        if line and not line.startswith("#") and not line.startswith(("http://", "https://")):
+            rewritten.append(f"/hls/{line.lstrip('/')}")
+        else:
+            rewritten.append(line)
+    return "\n".join(rewritten) + "\n"
+
+
+def hls_upstream_urls(config, path):
+    stream = config.get("stream", {})
+    public_hls_url = stream.get("public_hls_url", "")
+    candidates = []
+    if public_hls_url:
+        remote_base = public_hls_url.rsplit("/", 1)[0]
+        candidates.append(public_hls_url if path.endswith(".m3u8") else f"{remote_base}/{path}")
+    fight_url = f"https://fight.nswfiles.com/stream/{path}"
+    if fight_url not in candidates:
+        candidates.append(fight_url)
+    return candidates
+
+
+async def hls_proxy(request):
+    path = safe_hls_path(request.path_params.get("path", "ufc.m3u8"))
+    if not path:
+        return JSONResponse({"ok": False, "error": "bad hls path"}, status_code=400)
+
+    config = load_config()
+    stream = config.get("stream", {})
+    output_dir = Path(stream.get("output_dir", "/var/www/live.obnoxious.lol/stream")).resolve()
+    local_path = (output_dir / path).resolve()
+    if (output_dir in local_path.parents or local_path == output_dir) and local_path.exists():
+        if local_path.suffix == ".m3u8":
+            try:
+                text = local_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return Response(
+                rewrite_playlist(text),
+                media_type=hls_content_type(path),
+                headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+            )
+        return FileResponse(
+            local_path,
+            media_type=hls_content_type(path),
+            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+        )
+
+    upstream_urls = hls_upstream_urls(config, path)
+    if not upstream_urls:
+        return JSONResponse({"ok": False, "error": "public_hls_url is not configured"}, status_code=404)
+    last_response = None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True, headers={"User-Agent": "curl/8.0"}) as client:
+            for remote_url in upstream_urls:
+                response = await client.get(remote_url)
+                last_response = response
+                if response.status_code < 400:
+                    break
+            else:
+                assert last_response is not None
+                return Response(
+                    last_response.content,
+                    status_code=last_response.status_code,
+                    media_type=last_response.headers.get("content-type"),
+                )
+        body = rewrite_playlist(response.text).encode() if path.endswith(".m3u8") else response.content
+        return Response(
+            body,
+            media_type=hls_content_type(path),
+            headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
 async def index(request):
     return FileResponse(STATIC_DIR / "index.html")
 
@@ -372,6 +499,7 @@ routes = [
     Route("/api/stream/stop", guarded(stop_stream), methods=["POST"]),
     Route("/api/stream/restart", guarded(restart_stream), methods=["POST"]),
     Route("/api/arango", guarded(arango_status)),
+    Route("/hls/{path:path}", hls_proxy),
     Mount("/static", StaticFiles(directory=STATIC_DIR), name="static"),
 ]
 
