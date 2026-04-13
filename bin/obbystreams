@@ -2,13 +2,14 @@
 """obbystreams - resilient stream transcoder to HLS."""
 
 import argparse
+import contextlib
 import glob
 import os
 import random
 import re
 import select
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import termios
@@ -77,6 +78,10 @@ def fit(text, width):
 
 def term_width():
     return max(36, shutil.get_terminal_size((100, 24)).columns)
+
+
+def term_height():
+    return max(12, shutil.get_terminal_size((100, 24)).lines)
 
 
 def panel_width():
@@ -191,7 +196,11 @@ def short_url(url, width=88):
 def find_running_instances():
     my_pid = os.getpid()
     try:
-        result = subprocess.run(["pgrep", "-a", "-f", r"ufc"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["pgrep", "-a", "-f", r"/usr/bin/obbystreams|/opt/obbystreams/bin/obbystreams|/usr/bin/ufc|ufc_tool.py|streamUFC"],
+            capture_output=True,
+            text=True,
+        )
         procs = []
         for line in result.stdout.strip().splitlines():
             parts = line.split(None, 1)
@@ -209,7 +218,10 @@ def find_running_instances():
                 continue
             cmd_parts = cmd.split()
             if (
-                cmd.startswith("/usr/bin/ufc")
+                cmd.startswith("/usr/bin/obbystreams")
+                or "/usr/bin/obbystreams" in cmd_parts
+                or "/home/joey/obbystreams/bin/obbystreams" in cmd_parts
+                or cmd.startswith("/usr/bin/ufc")
                 or "/usr/bin/ufc" in cmd_parts
                 or "/home/joey/ufc_tool.py" in cmd_parts
                 or "streamUFC" in cmd
@@ -222,25 +234,19 @@ def find_running_instances():
 
 def kill_instances(procs):
     for pid, _ in procs:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
     time.sleep(1)
     for pid, _ in procs:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
 
 
 def cleanup(stream_dir):
     for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.tmp"):
         for f in glob.glob(os.path.join(stream_dir, pattern)):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(f)
-            except OSError:
-                pass
 
 
 def ensure_output_dir(path):
@@ -555,10 +561,8 @@ def stream_reader(stream, state, args, kind):
     except Exception as exc:
         add_event(state, f"ffmpeg {kind} reader stopped: {exc}", "warn")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             stream.close()
-        except Exception:
-            pass
 
 
 def ffmpeg_snapshot(state):
@@ -606,7 +610,6 @@ def render_live_panel(state, args, health, encoder, frame):
     bitrate = progress.get("bitrate", "n/a")
     frame_no = progress.get("frame", "n/a")
     out_time = progress.get("out_time", progress.get("out_time_ms", "n/a"))
-    total_size = progress.get("total_size", "n/a")
 
     ratio = 0.0
     if current.attempts:
@@ -639,19 +642,22 @@ def render_live_panel(state, args, health, encoder, frame):
 
     footer = fit("  keys: n/right-arrow next link | q quit | Ctrl-C stop", body_width)
     lines.append(ansi(footer, "38;5;245", args))
+    max_rows = max(8, term_height() - 1)
+    if len(lines) > max_rows:
+        lines = lines[: max_rows - 1] + [ansi("  …", "38;5;245", args)]
+    else:
+        lines.extend([""] * (max_rows - len(lines)))
     return "\n".join(lines)
 
 
 def status_thread(state, args, health, encoder, interval=10):
-    tool_start = state["tool_start"]
-
     def run():
         if state.get("live_ui"):
             frame = 0
             try:
                 print("\033[?25l\033[2J\033[3J\033[H", end="", flush=True)
                 while not state["interrupted"]:
-                    print("\033[H\033[2J" + render_live_panel(state, args, health, encoder, frame), end="", flush=True)
+                    print("\033[H\033[J" + render_live_panel(state, args, health, encoder, frame), end="", flush=True)
                     frame += 1
                     interruptible_sleep(0.16, lambda: state["interrupted"])
             finally:
@@ -864,7 +870,7 @@ def main():
 
     running = find_running_instances()
     if running:
-        print(f"\n{warn('ufc', args)} {len(running)} ufc/streamUFC instance(s) already running:")
+        print(f"\n{warn(APP_NAME, args)} {len(running)} streaming instance(s) already running:")
         for pid, cmd in running:
             print(f"  {label(str(pid), args)} {cmd[:96]}")
         try:
@@ -983,6 +989,7 @@ def main():
                 previous = state["url_index"]
                 state["url_index"], all_failed = next_stream_index(health, previous)
                 if all_failed:
+                    state["url_index"] = 0
                     msg += " - every link failed this round; returning to link 1"
                 else:
                     msg += f" - weak stream, switching to link {state['url_index'] + 1}"
@@ -993,6 +1000,7 @@ def main():
                 # Long-lived streams earn priority, but still rotate after death so alternatives get sampled.
                 state["url_index"], all_failed = next_stream_index(health, state["url_index"])
                 if all_failed:
+                    state["url_index"] = 0
                     msg += " - every link failed this round; returning to link 1"
                 else:
                     msg += f" - stream ended, trying link {state['url_index'] + 1}"

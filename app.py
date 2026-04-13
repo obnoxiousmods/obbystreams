@@ -5,12 +5,14 @@ import contextlib
 import glob
 import json
 import os
+import secrets
 import signal
 import subprocess
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import psutil
@@ -23,6 +25,7 @@ from starlette.staticfiles import StaticFiles
 CONFIG_PATH = Path(os.environ.get("OBBYSTREAMS_CONFIG", "/etc/obbystreams/obbystreams.yaml"))
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+APP_STARTED_AT = None
 
 EVENTS: deque[dict] = deque(maxlen=300)
 LOGS: deque[dict] = deque(maxlen=600)
@@ -30,21 +33,141 @@ ERRORS: deque[dict] = deque(maxlen=200)
 PROCESS = None
 STARTED_AT = None
 READER_TASK = None
+PROCESS_LOCK = asyncio.Lock()
+WATCHDOG_TASK = None
+WATCHDOG_LAST_ACTION = 0.0
+ARANGO_WORKER_TASK = None
+ARANGO_QUEUE_MAX = 1200
+ARANGO_QUEUE: asyncio.Queue | None = None
+ARANGO_RETRY_MAX_ATTEMPTS = 3
+RUNTIME = {
+    "stream_starts": 0,
+    "stream_restarts": 0,
+    "watchdog_restarts": 0,
+    "start_failures": 0,
+    "last_exit_code": None,
+    "arango_dropped_writes": 0,
+    "arango_write_failures": 0,
+}
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
+APP_STARTED_AT = now_ms()
+
+
+DEFAULT_CONFIG = {
+    "server": {"host": "127.0.0.1", "port": 8767, "workers": 1},
+    "dashboard": {"password": "", "session_token": ""},
+    "stream": {
+        "command": "/usr/bin/obbystreams",
+        "encoder": "auto",
+        "output_dir": "/var/www/live.obnoxious.lol/stream",
+        "public_hls_url": "",
+        "bitrate": "6M",
+        "audio_bitrate": "192k",
+        "auto_recover": True,
+        "auto_restart_on_exit": True,
+        "watchdog_restart_cooldown": 20,
+        "startup_grace_seconds": 25,
+        "playlist_stale_seconds": 25,
+        "links": [],
+    },
+    "arangodb": {
+        "enabled": True,
+        "url": "http://127.0.0.1:8529",
+        "database": "obbystreams",
+        "username": "obbystreams_app",
+        "password": "",
+    },
+}
+
+
+def safe_number(value, fallback, minimum=None):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        n = float(fallback)
+    if minimum is not None:
+        n = max(float(minimum), n)
+    return n
+
+
+def valid_stream_url(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    parsed = urlparse(text)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def normalize_links(raw_links):
+    links = []
+    seen = set()
+    for item in raw_links or []:
+        candidate = str(item).strip()
+        if not valid_stream_url(candidate):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        links.append(candidate)
+    return links
+
+
+def normalize_config(config):
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    if not isinstance(config, dict):
+        return merged
+    for section in ("server", "dashboard", "stream", "arangodb"):
+        raw_section = config.get(section, {})
+        if not isinstance(raw_section, dict):
+            continue
+        merged[section].update(raw_section)
+    stream = merged["stream"]
+    stream["links"] = normalize_links(stream.get("links", []))
+    stream["output_dir"] = str(stream.get("output_dir") or DEFAULT_CONFIG["stream"]["output_dir"])
+    stream["command"] = str(stream.get("command") or DEFAULT_CONFIG["stream"]["command"])
+    stream["encoder"] = str(stream.get("encoder") or DEFAULT_CONFIG["stream"]["encoder"])
+    stream["bitrate"] = str(stream.get("bitrate") or DEFAULT_CONFIG["stream"]["bitrate"])
+    stream["audio_bitrate"] = str(stream.get("audio_bitrate") or DEFAULT_CONFIG["stream"]["audio_bitrate"])
+    stream["public_hls_url"] = str(stream.get("public_hls_url") or "")
+    stream["auto_recover"] = bool(stream.get("auto_recover", True))
+    stream["auto_restart_on_exit"] = bool(stream.get("auto_restart_on_exit", True))
+    stream["watchdog_restart_cooldown"] = safe_number(stream.get("watchdog_restart_cooldown"), 20, minimum=5)
+    stream["startup_grace_seconds"] = safe_number(stream.get("startup_grace_seconds"), 25, minimum=5)
+    stream["playlist_stale_seconds"] = safe_number(stream.get("playlist_stale_seconds"), 25, minimum=10)
+    arango = merged["arangodb"]
+    arango["enabled"] = bool(arango.get("enabled", True))
+    arango["url"] = str(arango.get("url") or DEFAULT_CONFIG["arangodb"]["url"])
+    arango["database"] = str(arango.get("database") or DEFAULT_CONFIG["arangodb"]["database"])
+    arango["username"] = str(arango.get("username") or DEFAULT_CONFIG["arangodb"]["username"])
+    arango["password"] = str(arango.get("password") or "")
+    dashboard = merged["dashboard"]
+    dashboard["password"] = str(dashboard.get("password") or "")
+    dashboard["session_token"] = str(dashboard.get("session_token") or "")
+    return merged
+
+
 def load_config():
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            return normalize_config(yaml.safe_load(f) or {})
+    except FileNotFoundError:
+        ERRORS.append({"ts": now_ms(), "level": "error", "line": f"config missing: {CONFIG_PATH}"})
+        return normalize_config({})
+    except (yaml.YAMLError, OSError) as exc:
+        ERRORS.append({"ts": now_ms(), "level": "error", "line": f"config load failed: {exc}"})
+        return normalize_config({})
 
 
 def save_config(config):
     tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
+    normalized = normalize_config(config)
     with tmp.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
+        yaml.safe_dump(normalized, f, sort_keys=False)
     os.replace(tmp, CONFIG_PATH)
 
 
@@ -59,7 +182,7 @@ def public_config(config):
 def event(message, level="info", extra=None):
     item = {"ts": now_ms(), "level": level, "message": message, "extra": extra or {}}
     EVENTS.append(item)
-    asyncio.create_task(arango_insert("events", item))
+    queue_arango_insert("events", item)
     return item
 
 
@@ -69,7 +192,9 @@ def require_auth(request):
     if not token:
         return True
     supplied = request.headers.get("x-obbystreams-token", "") or request.cookies.get("obbystreams_token", "")
-    return supplied == token
+    if not supplied:
+        return False
+    return secrets.compare_digest(supplied, token)
 
 
 def guarded(handler):
@@ -80,14 +205,32 @@ def guarded(handler):
     return wrapped
 
 
+async def parse_json_body(request):
+    if request.headers.get("content-length", "0") == "0":
+        return {}
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON body") from exc
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
+
+
 async def login(request):
     config = load_config()
-    body = await request.json()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     if body.get("password") != config.get("dashboard", {}).get("password"):
         return JSONResponse({"ok": False, "error": "bad password"}, status_code=401)
     token = config.get("dashboard", {}).get("session_token", "")
     response = JSONResponse({"ok": True, "token": token})
-    response.set_cookie("obbystreams_token", token, httponly=False, secure=True, samesite="strict", max_age=60 * 60 * 24 * 30)
+    secure_cookie = request.url.scheme == "https"
+    response.set_cookie("obbystreams_token", token, httponly=False, secure=secure_cookie, samesite="strict", max_age=60 * 60 * 24 * 30)
     return response
 
 
@@ -110,6 +253,8 @@ async def arango_request(method, path, payload=None):
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.request(method, url, headers=headers, json=payload)
         response.raise_for_status()
+        if not response.content:
+            return {"ok": True}
         return response.json()
 
 
@@ -118,6 +263,58 @@ async def arango_insert(collection, doc):
         return await arango_request("POST", f"/_api/document/{collection}", doc)
     except Exception:
         return None
+
+
+def queue_arango_insert(collection, doc):
+    global ARANGO_QUEUE
+    if ARANGO_QUEUE is None:
+        return
+    item = {"collection": collection, "doc": doc, "attempt": 1}
+    try:
+        ARANGO_QUEUE.put_nowait(item)
+    except asyncio.QueueFull:
+        RUNTIME["arango_dropped_writes"] += 1
+
+
+async def arango_worker_loop():
+    global ARANGO_QUEUE
+    while True:
+        try:
+            if ARANGO_QUEUE is None:
+                await asyncio.sleep(0.25)
+                continue
+            item = await ARANGO_QUEUE.get()
+            collection = item.get("collection")
+            doc = item.get("doc")
+            attempt = int(item.get("attempt", 1))
+            if not collection:
+                ARANGO_QUEUE.task_done()
+                continue
+            try:
+                await arango_request("POST", f"/_api/document/{collection}", doc)
+            except Exception as exc:
+                if attempt < ARANGO_RETRY_MAX_ATTEMPTS:
+                    retry = {"collection": collection, "doc": doc, "attempt": attempt + 1}
+                    delay = 0.25 * (2 ** (attempt - 1))
+                    await asyncio.sleep(delay)
+                    with contextlib.suppress(asyncio.QueueFull):
+                        ARANGO_QUEUE.put_nowait(retry)
+                else:
+                    RUNTIME["arango_write_failures"] += 1
+                    ERRORS.append(
+                        {
+                            "ts": now_ms(),
+                            "level": "error",
+                            "line": f"arango insert failed ({collection}): {exc}",
+                        }
+                    )
+            finally:
+                ARANGO_QUEUE.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            ERRORS.append({"ts": now_ms(), "level": "error", "line": f"arango worker error: {exc}"})
+            await asyncio.sleep(0.5)
 
 
 async def arango_status(request):
@@ -149,6 +346,8 @@ def stream_processes():
             if (
                 "/usr/bin/obbystreams" in cmdline
                 or "/usr/bin/obbystreams" in cmd
+                or "/home/joey/obbystreams/bin/obbystreams" in cmdline
+                or "/home/joey/obbystreams/bin/obbystreams" in cmd
                 or "/usr/bin/ufc" in cmdline
                 or "/usr/bin/ufc" in cmd
                 or "ufc_tool.py" in cmd
@@ -173,7 +372,13 @@ def kill_existing_streams():
             killed.append(item)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    gone, alive = psutil.wait_procs([psutil.Process(p["pid"]) for p in killed if psutil.pid_exists(p["pid"])], timeout=2)
+    procs = []
+    for item in killed:
+        try:
+            procs.append(psutil.Process(item["pid"]))
+        except psutil.NoSuchProcess:
+            continue
+    gone, alive = psutil.wait_procs(procs, timeout=2)
     for proc in alive:
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.kill()
@@ -322,13 +527,48 @@ def status_payload():
         "logs": list(LOGS)[-140:],
         "errors": list(ERRORS)[-80:],
         "server_time": now_ms(),
+        "runtime": {
+            **RUNTIME,
+            "app_started_at": APP_STARTED_AT,
+            "app_uptime_seconds": round(max(0.0, time.time() - (APP_STARTED_AT / 1000)), 2) if APP_STARTED_AT else None,
+            "arango_queue_depth": ARANGO_QUEUE.qsize() if ARANGO_QUEUE else 0,
+        },
     }
-    asyncio.create_task(arango_insert("metrics", {"ts": now_ms(), "payload": payload}))
+    queue_arango_insert("metrics", {"ts": now_ms(), "payload": payload})
     return payload
 
 
 async def status(request):
     return JSONResponse(status_payload())
+
+
+async def health(request):
+    config = load_config()
+    proc = process_metrics()
+    hls = hls_metrics(config)
+    stream = config.get("stream", {})
+    links_configured = bool(stream.get("links"))
+    playlist_stale_seconds = float(stream.get("playlist_stale_seconds", 25))
+    ready = bool(proc.get("managed") and hls.get("playlist_ready"))
+    stale = hls.get("playlist_age") is not None and hls.get("playlist_age", 0) > playlist_stale_seconds
+    checks = {
+        "managed_process": bool(proc.get("managed")),
+        "links_configured": links_configured,
+        "playlist_ready": bool(hls.get("playlist_ready")),
+        "playlist_fresh": not stale,
+    }
+    ok = checks["managed_process"] and checks["playlist_ready"] and checks["playlist_fresh"]
+    status_code = 200 if ok else 503
+    return JSONResponse(
+        {
+            "ok": ok,
+            "ready": ready and not stale,
+            "checks": checks,
+            "health": stream_health(proc, hls),
+            "server_time": now_ms(),
+        },
+        status_code=status_code,
+    )
 
 
 async def get_config(request):
@@ -337,16 +577,33 @@ async def get_config(request):
 
 async def put_config(request):
     config = load_config()
-    body = await request.json()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     stream = config.setdefault("stream", {})
     if "links" in body:
-        stream["links"] = [str(x).strip() for x in body["links"] if str(x).strip()]
-    for key in ("encoder", "bitrate", "audio_bitrate", "output_dir", "public_hls_url"):
+        links = body["links"]
+        if not isinstance(links, list):
+            return JSONResponse({"ok": False, "error": "links must be an array"}, status_code=400)
+        stream["links"] = normalize_links(links)
+    for key in (
+        "encoder",
+        "bitrate",
+        "audio_bitrate",
+        "output_dir",
+        "public_hls_url",
+        "auto_recover",
+        "auto_restart_on_exit",
+        "watchdog_restart_cooldown",
+        "startup_grace_seconds",
+        "playlist_stale_seconds",
+    ):
         if key in body:
             stream[key] = body[key]
     save_config(config)
     event("configuration updated", "ok", {"keys": list(body.keys())})
-    await arango_insert("configs", {"ts": now_ms(), "config": public_config(config)})
+    queue_arango_insert("configs", {"ts": now_ms(), "config": public_config(config)})
     stream_restart_keys = {
         "links",
         "encoder",
@@ -370,31 +627,40 @@ async def put_config(request):
 
 async def add_link(request):
     config = load_config()
-    body = await request.json()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     url = str(body.get("url", "")).strip()
     if not url:
         return JSONResponse({"ok": False, "error": "url required"}, status_code=400)
+    if not valid_stream_url(url):
+        return JSONResponse({"ok": False, "error": "url must be http(s)"}, status_code=400)
     links = config.setdefault("stream", {}).setdefault("links", [])
     if url not in links:
         links.append(url)
+    config["stream"]["links"] = normalize_links(links)
     save_config(config)
     event("link added", "ok", {"url": url})
-    await arango_insert("links", {"ts": now_ms(), "action": "add", "url": url})
+    queue_arango_insert("links", {"ts": now_ms(), "action": "add", "url": url})
     restarted = await restart_managed_with_config("link added")
     if restarted:
         event("running stream picked up updated links", "ok")
-    return JSONResponse({"ok": True, "links": links})
+    return JSONResponse({"ok": True, "links": config["stream"]["links"]})
 
 
 async def remove_link(request):
     config = load_config()
-    body = await request.json()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     url = str(body.get("url", "")).strip()
     links = config.setdefault("stream", {}).setdefault("links", [])
     config["stream"]["links"] = [x for x in links if x != url]
     save_config(config)
     event("link removed", "warn", {"url": url})
-    await arango_insert("links", {"ts": now_ms(), "action": "remove", "url": url})
+    queue_arango_insert("links", {"ts": now_ms(), "action": "remove", "url": url})
     restarted = await restart_managed_with_config("link removed")
     if restarted:
         event("running stream picked up updated links", "ok")
@@ -462,6 +728,23 @@ def terminate_process_tree(proc, timeout=5):
     return True
 
 
+async def stop_managed_process(reason):
+    global PROCESS, READER_TASK
+    proc = PROCESS
+    if not proc or proc.poll() is not None:
+        PROCESS = None
+        return False
+    await asyncio.to_thread(terminate_process_tree, proc)
+    if READER_TASK and not READER_TASK.done():
+        READER_TASK.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await READER_TASK
+    RUNTIME["last_exit_code"] = proc.poll()
+    PROCESS = None
+    event(reason, "warn")
+    return True
+
+
 def start_managed_process(config, links, kill_existing=True):
     global PROCESS, STARTED_AT, READER_TASK
     if not links:
@@ -475,58 +758,136 @@ def start_managed_process(config, links, kill_existing=True):
         PROCESS = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
     except OSError as exc:
         ERRORS.append({"ts": now_ms(), "level": "error", "line": str(exc)})
+        RUNTIME["start_failures"] += 1
         raise
     STARTED_AT = now_ms()
     READER_TASK = asyncio.create_task(read_process_output(PROCESS))
+    RUNTIME["stream_starts"] += 1
     event("stream started", "ok", {"cmd": cmd, "pid": PROCESS.pid})
     return PROCESS.pid, cmd
 
 
 async def restart_managed_with_config(reason):
     global PROCESS
-    if not PROCESS or PROCESS.poll() is not None:
-        return False
-    terminate_process_tree(PROCESS)
-    event(f"restarting stream: {reason}", "warn")
-    config = load_config()
-    links = config.get("stream", {}).get("links", [])
-    try:
-        start_managed_process(config, links, kill_existing=True)
-    except (OSError, ValueError) as exc:
-        event(f"stream restart failed: {exc}", "bad")
-        ERRORS.append({"ts": now_ms(), "level": "error", "line": f"stream restart failed: {exc}"})
-        return False
-    return True
+    async with PROCESS_LOCK:
+        if not PROCESS or PROCESS.poll() is not None:
+            return False
+        await stop_managed_process(f"stream stopped for restart: {reason}")
+        event(f"restarting stream: {reason}", "warn")
+        config = load_config()
+        links = config.get("stream", {}).get("links", [])
+        try:
+            start_managed_process(config, links, kill_existing=True)
+            RUNTIME["stream_restarts"] += 1
+        except (OSError, ValueError) as exc:
+            event(f"stream restart failed: {exc}", "bad")
+            ERRORS.append({"ts": now_ms(), "level": "error", "line": f"stream restart failed: {exc}"})
+            return False
+        return True
 
 
 async def start_stream(request):
     global PROCESS
-    if PROCESS and PROCESS.poll() is None:
-        return JSONResponse({"ok": False, "error": "managed stream already running"}, status_code=409)
-    body = await request.json() if request.headers.get("content-length", "0") != "0" else {}
-    config = load_config()
-    links = body.get("links") or config.get("stream", {}).get("links", [])
     try:
-        pid, cmd = start_managed_process(config, links, kill_existing=body.get("kill_existing", True))
+        body = await parse_json_body(request)
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-    except OSError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    config = load_config()
+    raw_links = body.get("links")
+    if raw_links is not None and not isinstance(raw_links, list):
+        return JSONResponse({"ok": False, "error": "links must be an array"}, status_code=400)
+    links = normalize_links(raw_links) if raw_links is not None else config.get("stream", {}).get("links", [])
+    async with PROCESS_LOCK:
+        if PROCESS and PROCESS.poll() is None:
+            return JSONResponse({"ok": False, "error": "managed stream already running"}, status_code=409)
+        try:
+            pid, cmd = start_managed_process(config, links, kill_existing=body.get("kill_existing", True))
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True, "pid": pid, "cmd": cmd})
 
 
 async def stop_stream(request):
-    global PROCESS
-    if not PROCESS or PROCESS.poll() is not None:
-        return JSONResponse({"ok": True, "stopped": False})
-    await asyncio.to_thread(terminate_process_tree, PROCESS)
-    event("stream stopped", "warn")
-    return JSONResponse({"ok": True, "stopped": True})
+    async with PROCESS_LOCK:
+        stopped = await stop_managed_process("stream stopped")
+        return JSONResponse({"ok": True, "stopped": stopped})
 
 
 async def restart_stream(request):
-    await stop_stream(request)
+    async with PROCESS_LOCK:
+        if PROCESS and PROCESS.poll() is None:
+            await stop_managed_process("stream stopped")
     return await start_stream(request)
+
+
+async def watchdog_loop():
+    global WATCHDOG_LAST_ACTION, PROCESS
+    while True:
+        try:
+            await asyncio.sleep(5)
+            config = load_config()
+            stream = config.get("stream", {})
+            if not stream.get("auto_recover", True):
+                continue
+            restart_cooldown = float(stream.get("watchdog_restart_cooldown", 20))
+            startup_grace = float(stream.get("startup_grace_seconds", 25))
+            stale_seconds = float(stream.get("playlist_stale_seconds", 25))
+            async with PROCESS_LOCK:
+                if not PROCESS or PROCESS.poll() is not None:
+                    if stream.get("auto_restart_on_exit", True) and stream.get("links"):
+                        now = time.monotonic()
+                        if now - WATCHDOG_LAST_ACTION < restart_cooldown:
+                            continue
+                        WATCHDOG_LAST_ACTION = now
+                        RUNTIME["watchdog_restarts"] += 1
+                        event("watchdog restart: managed process exited", "warn")
+                        try:
+                            start_managed_process(config, stream.get("links", []), kill_existing=True)
+                        except (OSError, ValueError) as exc:
+                            event(f"watchdog restart failed: {exc}", "bad")
+                            ERRORS.append({"ts": now_ms(), "level": "error", "line": f"watchdog restart failed: {exc}"})
+                    continue
+                proc = process_metrics()
+                hls = hls_metrics(config)
+                age = proc.get("age") or 0.0
+                has_child = bool(proc.get("children"))
+                playlist_ready = bool(hls.get("playlist_ready"))
+                playlist_age = hls.get("playlist_age")
+                unhealthy = False
+                reason = None
+                if age > startup_grace and not has_child:
+                    unhealthy = True
+                    reason = "runner has no ffmpeg child"
+                elif age > startup_grace and not playlist_ready:
+                    unhealthy = True
+                    reason = "playlist is not ready"
+                elif playlist_age is not None and playlist_age > stale_seconds:
+                    unhealthy = True
+                    reason = f"playlist stale for {playlist_age:.1f}s"
+                if not unhealthy:
+                    continue
+                now = time.monotonic()
+                if now - WATCHDOG_LAST_ACTION < restart_cooldown:
+                    continue
+                WATCHDOG_LAST_ACTION = now
+                RUNTIME["watchdog_restarts"] += 1
+                event(f"watchdog restart: {reason}", "warn")
+                await stop_managed_process(f"stream stopped for watchdog: {reason}")
+                links = stream.get("links", [])
+                if not links:
+                    event("watchdog skipped restart because no links are configured", "warn")
+                    continue
+                try:
+                    start_managed_process(config, links, kill_existing=True)
+                except (OSError, ValueError) as exc:
+                    event(f"watchdog restart failed: {exc}", "bad")
+                    ERRORS.append({"ts": now_ms(), "level": "error", "line": f"watchdog restart failed: {exc}"})
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            event(f"watchdog loop error: {exc}", "warn")
 
 
 def hls_content_type(path):
@@ -603,15 +964,21 @@ async def hls_proxy(request):
     if not upstream_urls:
         return JSONResponse({"ok": False, "error": "public_hls_url is not configured"}, status_code=404)
     last_response = None
+    last_error = None
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True, headers={"User-Agent": "curl/8.0"}) as client:
             for remote_url in upstream_urls:
-                response = await client.get(remote_url)
+                try:
+                    response = await client.get(remote_url)
+                except httpx.HTTPError as exc:
+                    last_error = str(exc)
+                    continue
                 last_response = response
                 if response.status_code < 400:
                     break
             else:
-                assert last_response is not None
+                if last_response is None:
+                    return JSONResponse({"ok": False, "error": last_error or "upstream unavailable"}, status_code=502)
                 return Response(
                     last_response.content,
                     status_code=last_response.status_code,
@@ -633,16 +1000,29 @@ async def index(request):
 
 @asynccontextmanager
 async def lifespan(app):
+    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK
+    ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
+    ARANGO_WORKER_TASK = asyncio.create_task(arango_worker_loop())
     event("obbystreams dashboard booted", "ok")
+    WATCHDOG_TASK = asyncio.create_task(watchdog_loop())
     try:
         yield
     finally:
-        if PROCESS and PROCESS.poll() is None:
-            PROCESS.send_signal(signal.SIGTERM)
+        if WATCHDOG_TASK:
+            WATCHDOG_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await WATCHDOG_TASK
+        async with PROCESS_LOCK:
+            await stop_managed_process("stream stopped during shutdown")
+        if ARANGO_WORKER_TASK:
+            ARANGO_WORKER_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ARANGO_WORKER_TASK
 
 
 routes = [
     Route("/", index),
+    Route("/api/health", health),
     Route("/api/auth/login", login, methods=["POST"]),
     Route("/api/status", guarded(status)),
     Route("/api/config", guarded(get_config), methods=["GET"]),
