@@ -81,6 +81,7 @@ Then open `http://127.0.0.1:8767`.
 ## API
 
 - `POST /api/auth/login`
+- `GET /api/health` (readiness/liveness for monitoring)
 - `GET /api/status`
 - `GET /api/config`
 - `PUT /api/config`
@@ -92,6 +93,8 @@ Then open `http://127.0.0.1:8767`.
 - `GET /api/arango`
 
 Authenticated API calls use `x-obbystreams-token` or the `obbystreams_token` cookie.
+
+`/api/health` is intentionally unauthenticated so systemd/nginx/monitoring checks can probe readiness.
 
 ## Production Notes
 

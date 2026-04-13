@@ -2,6 +2,11 @@ const state = {
   token: localStorage.getItem("obbystreams_token") || "",
   config: null,
   links: [],
+  player: null,
+  hlsUrl: "",
+  playerUrl: "",
+  playRetryTimer: null,
+  playRetryMs: 800,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -25,6 +30,30 @@ function fmtAge(seconds) {
   return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
 }
 
+function fmtClock(ms) {
+  if (!ms) return "n/a";
+  return new Date(ms).toLocaleTimeString();
+}
+
+function absoluteUrl(url) {
+  if (!url) return "";
+  return new URL(url, window.location.origin).toString();
+}
+
+function setText(id, value) {
+  const node = $(id);
+  if (!node) return;
+  node.textContent = value;
+}
+
+function setBadge(id, text, tone = "") {
+  const node = $(id);
+  if (!node) return;
+  node.textContent = text;
+  node.classList.remove("ok", "warn", "bad");
+  if (tone) node.classList.add(tone);
+}
+
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (state.token) headers["x-obbystreams-token"] = state.token;
@@ -37,16 +66,18 @@ async function api(path, options = {}) {
 function showApp() {
   $("login").classList.add("hidden");
   $("app").classList.remove("hidden");
+  setText("sessionState", "active");
 }
 
 function showLogin() {
   $("login").classList.remove("hidden");
   $("app").classList.add("hidden");
+  setText("sessionState", "locked");
 }
 
 async function login(event) {
   event.preventDefault();
-  $("loginError").textContent = "";
+  setText("loginError", "");
   try {
     const data = await api("/api/auth/login", {
       method: "POST",
@@ -57,19 +88,41 @@ async function login(event) {
     showApp();
     await refresh();
   } catch (err) {
-    $("loginError").textContent = err.message;
+    setText("loginError", err.message);
   }
 }
 
 function renderLinks(links) {
   state.links = [...links];
-  $("links").innerHTML = "";
+  const root = $("links");
+  root.innerHTML = "";
+
   state.links.forEach((url, index) => {
     const item = document.createElement("div");
     item.className = "linkItem";
-    item.innerHTML = `<code>${url}</code>`;
+
+    const meta = document.createElement("div");
+    meta.className = "linkMeta";
+
+    const idx = document.createElement("div");
+    idx.className = "linkIndex";
+    idx.textContent = `Link ${index + 1}`;
+
+    const open = document.createElement("a");
+    open.className = "buttonLink";
+    open.href = url;
+    open.target = "_blank";
+    open.rel = "noreferrer";
+    open.textContent = "Open";
+    meta.append(idx, open);
+
+    const urlText = document.createElement("div");
+    urlText.className = "linkUrl";
+    urlText.textContent = url;
+
     const controls = document.createElement("div");
-    controls.className = "actions";
+    controls.className = "linkControls";
+
     const up = document.createElement("button");
     up.className = "secondary";
     up.textContent = "Up";
@@ -79,6 +132,7 @@ function renderLinks(links) {
         renderLinks(state.links);
       }
     };
+
     const down = document.createElement("button");
     down.className = "secondary";
     down.textContent = "Down";
@@ -88,6 +142,7 @@ function renderLinks(links) {
         renderLinks(state.links);
       }
     };
+
     const remove = document.createElement("button");
     remove.className = "danger";
     remove.textContent = "Remove";
@@ -95,38 +150,238 @@ function renderLinks(links) {
       await api("/api/links/remove", { method: "POST", body: JSON.stringify({ url }) });
       await refresh();
     };
+
     controls.append(up, down, remove);
-    item.append(controls);
-    $("links").append(item);
+    item.append(meta, urlText, controls);
+    root.append(item);
   });
+
+  if (state.links.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No stream links configured.";
+    root.append(empty);
+  }
+}
+
+function appendFeedItem(root, level, ts, message) {
+  const item = document.createElement("div");
+  item.className = `feedItem ${level || "info"}`;
+
+  const head = document.createElement("div");
+  head.className = "feedItemHead";
+  const left = document.createElement("strong");
+  left.textContent = level || "info";
+  const right = document.createElement("span");
+  right.textContent = ts ? new Date(ts).toLocaleTimeString() : "";
+  head.append(left, right);
+
+  const body = document.createElement("div");
+  body.textContent = message || "";
+
+  item.append(head, body);
+  root.append(item);
 }
 
 function renderEvents(events) {
-  $("events").innerHTML = "";
-  events.slice(-16).reverse().forEach((event) => {
-    const item = document.createElement("div");
-    item.className = "feedItem";
-    item.innerHTML = `<strong>${event.level}</strong> <span>${new Date(event.ts).toLocaleTimeString()}</span><br>${event.message}`;
-    $("events").append(item);
+  const root = $("events");
+  root.innerHTML = "";
+  events.slice(-20).reverse().forEach((entry) => {
+    appendFeedItem(root, entry.level, entry.ts, entry.message);
   });
 }
 
 function renderLogs(logs) {
-  $("logs").innerHTML = "";
-  logs.slice(-24).reverse().forEach((log) => {
+  const root = $("logs");
+  root.innerHTML = "";
+  logs.slice(-28).reverse().forEach((log) => {
     const item = document.createElement("div");
-    item.className = "logLine";
+    item.className = `logLine ${log.level || ""}`;
     item.textContent = log.line || JSON.stringify(log);
-    $("logs").append(item);
+    root.append(item);
   });
 }
 
-function setVideo(url) {
-  $("previewUrl").textContent = url || "Waiting for HLS output";
-  if (!url || $("preview").src === url) return;
-  $("preview").src = url;
-  $("preview").load();
-  $("preview").play().catch(() => {});
+function renderErrors(errors) {
+  const root = $("errors");
+  root.innerHTML = "";
+  const list = (errors || []).slice(-16).reverse();
+  list.forEach((entry) => {
+    const item = document.createElement("div");
+    item.className = "errorLine";
+    const ts = entry.ts ? new Date(entry.ts).toLocaleTimeString() : "";
+    item.textContent = `${ts} ${entry.line || JSON.stringify(entry)}`.trim();
+    root.append(item);
+  });
+  if (list.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No ffmpeg errors captured yet.";
+    root.append(empty);
+  }
+  setText("errorCount", String((errors || []).length));
+}
+
+function renderSegments(segments) {
+  const root = $("playlistSegments");
+  root.innerHTML = "";
+  (segments || []).slice(-16).reverse().forEach((name) => {
+    const item = document.createElement("div");
+    item.className = "segmentLine";
+    item.textContent = name;
+    root.append(item);
+  });
+}
+
+function renderProcessLists(managed, external) {
+  const childRoot = $("children");
+  childRoot.innerHTML = "";
+  const children = managed.children || [];
+  if (!children.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No child process.";
+    childRoot.append(empty);
+  } else {
+    children.forEach((proc) => {
+      appendFeedItem(childRoot, "info", null, `pid ${proc.pid} ${proc.name} | rss ${fmtBytes(proc.rss)} | cpu ${(proc.cpu ?? 0).toFixed(1)}%`);
+    });
+  }
+
+  const extRoot = $("external");
+  extRoot.innerHTML = "";
+  if (!external.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No other stream process detected.";
+    extRoot.append(empty);
+  } else {
+    external.forEach((proc) => {
+      appendFeedItem(extRoot, "warn", null, `pid ${proc.pid} | age ${fmtAge(proc.age)} | ${proc.cmd}`);
+    });
+  }
+}
+
+function setPlayerState(text) {
+  setText("playerState", text);
+}
+
+function clearPlayRetry() {
+  if (!state.playRetryTimer) return;
+  clearTimeout(state.playRetryTimer);
+  state.playRetryTimer = null;
+}
+
+function schedulePlayRetry(reason = "retry") {
+  clearPlayRetry();
+  const delay = Math.max(400, Math.min(5000, state.playRetryMs));
+  state.playRetryTimer = setTimeout(() => {
+    state.playRetryTimer = null;
+    requestAutoplay(reason);
+  }, delay);
+  state.playRetryMs = Math.min(5000, Math.floor(state.playRetryMs * 1.5));
+}
+
+function requestAutoplay(reason = "autoplay") {
+  if (!state.player || state.player.isDisposed() || !state.playerUrl) return;
+  state.player.muted(true);
+  state.player.volume(0);
+  state.player.play().then(() => {
+    state.playRetryMs = 800;
+    setPlayerState("playing");
+  }).catch(() => {
+    setPlayerState(`${reason}: retrying`);
+    schedulePlayRetry(reason);
+  });
+}
+
+function setVideo(url, playerUrl = url) {
+  setText("previewUrl", url || "Waiting for HLS output");
+  $("openHlsBtn").href = absoluteUrl(playerUrl || url) || "#";
+  if (!playerUrl || state.playerUrl === playerUrl) return;
+  state.hlsUrl = url;
+  state.playerUrl = playerUrl;
+  initPlayer(playerUrl);
+}
+
+function clearVideo(url, message) {
+  clearPlayRetry();
+  setText("previewUrl", url || "Waiting for HLS output");
+  $("openHlsBtn").href = absoluteUrl(url) || "#";
+  setPlayerState(message || "waiting for stream");
+  if (state.player && state.playerUrl) {
+    state.player.pause();
+    state.player.reset();
+  }
+  state.playerUrl = "";
+}
+
+function ensureVideoElement() {
+  if ($("preview")) return $("preview");
+  const video = document.createElement("video");
+  video.id = "preview";
+  video.className = "video-js vjs-theme-obby vjs-big-play-centered";
+  video.setAttribute("controls", "");
+  video.setAttribute("preload", "auto");
+  video.setAttribute("playsinline", "");
+  $("videoMount").replaceChildren(video);
+  return video;
+}
+
+function initPlayer(url = state.playerUrl) {
+  if (!url || !window.videojs) {
+    if (!window.videojs) setPlayerState("Video.js unavailable");
+    return;
+  }
+  ensureVideoElement();
+  if (!state.player || state.player.isDisposed()) {
+    state.player = videojs("preview", {
+      fluid: true,
+      liveui: true,
+      controls: true,
+      autoplay: true,
+      muted: true,
+      preload: "auto",
+      playsinline: true,
+      html5: {
+        vhs: {
+          overrideNative: true,
+          limitRenditionByPlayerDimensions: true,
+        },
+        nativeAudioTracks: false,
+        nativeVideoTracks: false,
+      },
+    });
+
+    state.player.on("loadedmetadata", () => requestAutoplay("metadata"));
+    state.player.on("playing", () => {
+      state.playRetryMs = 800;
+      clearPlayRetry();
+      setPlayerState("playing");
+    });
+    state.player.on("pause", () => schedulePlayRetry("paused"));
+    state.player.on("waiting", () => schedulePlayRetry("buffering"));
+    state.player.on("stalled", () => schedulePlayRetry("stalled"));
+    state.player.on("ended", () => schedulePlayRetry("ended"));
+    state.player.on("error", () => {
+      const err = state.player.error();
+      setPlayerState(`error ${err?.code || ""} retrying`.trim());
+      schedulePlayRetry("error");
+    });
+  }
+
+  state.player.ready(() => {
+    clearPlayRetry();
+    state.playRetryMs = 800;
+    setPlayerState("loading");
+    state.player.muted(true);
+    state.player.volume(0);
+    state.player.pause();
+    state.player.reset();
+    state.player.src({ src: url, type: "application/x-mpegURL" });
+    state.player.load();
+    requestAutoplay("load");
+  });
 }
 
 async function refresh() {
@@ -136,26 +391,57 @@ async function refresh() {
     const stream = data.config.stream || {};
     const proc = data.managed_process || {};
     const hls = data.hls || {};
+    const health = data.health || {};
 
-    $("runState").textContent = proc.managed ? "Running" : "Stopped";
-    $("encoder").textContent = stream.encoder || "auto";
-    $("segments").textContent = hls.segments ?? 0;
-    $("playlistAge").textContent = fmtAge(hls.playlist_age);
-    $("rss").textContent = proc.rss ? fmtBytes(proc.rss) : "n/a";
-    $("pid").textContent = proc.pid || "n/a";
-    $("cpu").textContent = proc.cpu == null ? "n/a" : `${proc.cpu.toFixed(1)}%`;
-    $("hlsBytes").textContent = fmtBytes(hls.bytes);
-    $("externalProcs").textContent = (data.existing_processes || []).length;
-    $("updated").textContent = new Date(data.server_time).toLocaleTimeString();
-    setVideo(hls.public_hls_url);
+    const runState = health.state || (proc.managed ? "running" : "stopped");
+    setBadge("runState", runState, runState === "healthy" || proc.managed ? "ok" : "warn");
+    setBadge("encoder", stream.encoder || "auto");
+    setBadge("updated", new Date(data.server_time).toLocaleTimeString());
+    setBadge("arango", "checking");
+
+    const healthTone = health.level === "ok" ? "ok" : health.level === "bad" ? "bad" : "warn";
+    setBadge("healthState", `${health.level || "warn"}: ${health.state || "unknown"}`, healthTone);
+    setText("healthMessage", health.message || "Waiting for status.");
+
+    setText("segments", String(hls.segments ?? 0));
+    setText("playlistAge", fmtAge(hls.playlist_age));
+    setText("rss", proc.rss ? fmtBytes(proc.rss) : "n/a");
+    setText("pid", proc.pid || "n/a");
+    setText("cpu", proc.cpu == null ? "n/a" : `${proc.cpu.toFixed(1)}%`);
+    setText("hlsBytes", fmtBytes(hls.bytes));
+    setText("externalProcs", String((data.existing_processes || []).length));
+    setText("mediaSequence", hls.media_sequence || "n/a");
+    setText("targetDuration", hls.target_duration ? `${hls.target_duration}s` : "n/a");
+    setText("playlistLineCount", String(hls.playlist_line_count ?? "n/a"));
+    setText("windowSeconds", hls.segment_window_seconds ? `${hls.segment_window_seconds.toFixed(1)}s` : "n/a");
+    setText("playlistModified", fmtClock(hls.playlist_modified_at));
+    setText("firstSegment", hls.first_segment || "n/a");
+    setText("lastSegment", hls.last_segment || "n/a");
+    setText("lastSegmentSize", hls.last_segment_size ? fmtBytes(hls.last_segment_size) : "n/a");
+    setText("hlsRoute", hls.dashboard_hls_url || "/hls/ufc.m3u8");
+    setText("publicHls", hls.public_hls_url || "n/a");
+
+    if (proc.managed && hls.playlist_ready) {
+      setVideo(hls.public_hls_url, hls.dashboard_hls_url || hls.public_hls_url);
+    } else {
+      clearVideo(hls.dashboard_hls_url || hls.public_hls_url, health.message);
+    }
+
     renderLinks(stream.links || []);
     renderEvents(data.events || []);
     renderLogs(data.logs || []);
+    renderErrors(data.errors || health.recent_errors || []);
+    renderSegments(hls.playlist_segments || []);
+    renderProcessLists(proc, data.existing_processes || []);
 
     const arango = await api("/api/arango").catch((err) => ({ connected: false, error: err.message }));
-    $("arango").textContent = arango.connected ? "Connected" : "Offline";
+    setBadge("arango", arango.connected ? "connected" : "offline", arango.connected ? "ok" : "bad");
   } catch (err) {
-    if (err.message === "unauthorized") showLogin();
+    if (err.message === "unauthorized") {
+      showLogin();
+      return;
+    }
+    setText("sessionState", `error: ${err.message}`);
   }
 }
 
@@ -184,6 +470,17 @@ $("saveLinksBtn").addEventListener("click", saveLinks);
 $("startBtn").addEventListener("click", () => streamAction("start"));
 $("restartBtn").addEventListener("click", () => streamAction("restart"));
 $("stopBtn").addEventListener("click", () => streamAction("stop"));
+$("reloadPlayerBtn").addEventListener("click", () => initPlayer());
+$("copyHlsBtn").addEventListener("click", async () => {
+  const url = absoluteUrl(state.playerUrl || state.hlsUrl);
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    setPlayerState("HLS URL copied");
+  } catch (_) {
+    window.prompt("Copy HLS URL:", url);
+  }
+});
 
 if (state.token) {
   showApp();
@@ -195,3 +492,11 @@ if (state.token) {
 setInterval(() => {
   if (!$("app").classList.contains("hidden")) refresh();
 }, 2500);
+
+setInterval(() => {
+  if ($("app").classList.contains("hidden")) return;
+  if (!state.player || state.player.isDisposed() || !state.playerUrl) return;
+  state.player.muted(true);
+  state.player.volume(0);
+  if (state.player.paused()) requestAutoplay("heartbeat");
+}, 3000);
