@@ -1,21 +1,85 @@
 name: Bug report
 description: Report a reproducible Obbystreams problem.
 title: "[Bug]: "
-labels: ["bug"]
+labels: ["bug", "needs-triage"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove secrets, private stream links, dashboard tokens, and ArangoDB credentials before submitting logs or config.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dashboard frontend
+        - Stream process management
+        - HLS playback or proxy
+        - Config or deployment
+        - ArangoDB persistence
+        - CI, release, docs, or GitHub automation
+        - Other
+    validations:
+      required: true
   - type: textarea
     id: what-happened
     attributes:
       label: What happened?
+      description: Describe the visible failure and the impact.
     validations:
       required: true
   - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start service...
+        2. Open dashboard...
+        3. Click restart...
+        4. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: health
+    attributes:
+      label: Health and status output
+      description: Include redacted `/api/health`, relevant dashboard status, or screenshots.
+      render: shell
+  - type: textarea
     id: logs
     attributes:
-      label: Logs or screenshots
+      label: Logs
+      description: Include relevant `journalctl`, dashboard logs, browser console, or workflow logs. Redact secrets and private URLs.
       render: shell
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: OS, Python, uv, nginx, ArangoDB, ffmpeg.
+      description: OS, Python, Node, uv, nginx, ArangoDB, ffmpeg, browser, commit or release version.
+      placeholder: |
+        Obbystreams:
+        OS:
+        Python:
+        Node:
+        uv:
+        nginx:
+        ArangoDB:
+        ffmpeg:
+        Browser:
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submit checks
+      options:
+        - label: I removed dashboard tokens, passwords, private stream URLs, and ArangoDB credentials.
+          required: true
+        - label: I checked the latest documentation or release notes for related changes.
+          required: false
