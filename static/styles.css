@@ -168,7 +168,7 @@ button.danger {
 
 .statusRow {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 0.6rem;
   margin-bottom: 12px;
 }
@@ -311,6 +311,57 @@ h3 {
   padding: 0 12px 12px;
   color: var(--muted);
   line-height: 1.4;
+}
+
+.encoderControl {
+  margin: -2px 12px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.encoderControl span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.encoderControl strong {
+  display: block;
+  margin-top: 0.18rem;
+  color: var(--text);
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.toggleGroup {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.03);
+  justify-content: flex-end;
+}
+
+.toggleGroup button {
+  min-width: 4.2rem;
+  border: 0;
+  border-radius: 0;
+  padding: 0.48rem 0.64rem;
+  background: transparent;
+  color: var(--muted);
+}
+
+.toggleGroup button + button {
+  border-left: 1px solid var(--line);
+}
+
+.toggleGroup button.active {
+  background: rgba(135, 214, 255, 0.16);
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--good);
 }
 
 .statsGrid {
@@ -463,6 +514,11 @@ h3 {
   color: #baf5d2;
 }
 
+.gpuPanel .statsGrid strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+}
+
 .feedItemHead {
   display: flex;
   justify-content: space-between;
@@ -518,6 +574,19 @@ h3 {
 
   .statsGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .encoderControl {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toggleGroup {
+    width: 100%;
+  }
+
+  .toggleGroup button {
+    flex: 1 1 0;
   }
 
   .playerBar button,

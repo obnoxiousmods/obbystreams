@@ -43,9 +43,16 @@ stream:
   command: /usr/bin/obbystreams
   encoder: auto
   output_dir: /var/www/live.obnoxious.lol/stream
+  ffmpeg_log_dir: ffmpegLogs
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
   bitrate: 6M
   audio_bitrate: 192k
+  min_assessment_seconds: 15
+  health_sample_interval: 2
+  success_score_threshold: 180
+  failure_score_threshold: -120
+  confirmed_failure_samples: 2
+  failure_ramp_seconds: 60
   links: []
 
 arangodb:
@@ -95,6 +102,12 @@ Then open `http://127.0.0.1:8767`.
 Authenticated API calls use `x-obbystreams-token` or the `obbystreams_token` cookie.
 
 `/api/health` is intentionally unauthenticated so systemd/nginx/monitoring checks can probe readiness.
+
+Stream health is scored over time. A managed stream gets at least `min_assessment_seconds` of runtime evidence before the dashboard or transcoder confirms failure. Fresh HLS output, segment growth, media sequence movement, bytes written, and ffmpeg progress add strong positive score; stale/missing HLS, repeated ffmpeg errors, and no progress add negative score that ramps over `failure_ramp_seconds`.
+
+The dashboard encoder toggle writes `encoder: auto`, `encoder: gpu-only`, or `encoder: cpu`. `gpu-only` refuses to fall back to CPU if no GPU encoder/device is available; `cpu` always uses libx264.
+
+Every ffmpeg child process writes a durable log file under `ffmpeg_log_dir` (default `ffmpegLogs` relative to the service working directory). Each file includes the command, selected link, encoder, ffmpeg progress output, stderr, exit code, HLS snapshot, and stream assessment summary.
 
 ## Production Notes
 

@@ -9,6 +9,7 @@ dist/
 build/
 *.egg-info/
 *.log
+ffmpegLogs/
 .env
 .env.*
 !.env.example

@@ -35,6 +35,16 @@ function fmtClock(ms) {
   return new Date(ms).toLocaleTimeString();
 }
 
+function fmtPercent(value, digits = 0) {
+  if (value == null) return "n/a";
+  return `${Number(value).toFixed(digits)}%`;
+}
+
+function fmtMetric(value, suffix = "", digits = 0) {
+  if (value == null) return "n/a";
+  return `${Number(value).toFixed(digits)}${suffix}`;
+}
+
 function absoluteUrl(url) {
   if (!url) return "";
   return new URL(url, window.location.origin).toString();
@@ -52,6 +62,22 @@ function setBadge(id, text, tone = "") {
   node.textContent = text;
   node.classList.remove("ok", "warn", "bad");
   if (tone) node.classList.add(tone);
+}
+
+function setActiveToggle(id, active) {
+  const node = $(id);
+  if (!node) return;
+  node.classList.toggle("active", active);
+  node.setAttribute("aria-pressed", active ? "true" : "false");
+}
+
+function encoderLabel(encoder) {
+  const labels = {
+    auto: "Auto",
+    "gpu-only": "GPU only",
+    cpu: "CPU only",
+  };
+  return labels[encoder || "auto"] || encoder || "Auto";
 }
 
 async function api(path, options = {}) {
@@ -87,6 +113,7 @@ async function login(event) {
     localStorage.setItem("obbystreams_token", state.token);
     showApp();
     await refresh();
+    await refreshGpuTelemetry();
   } catch (err) {
     setText("loginError", err.message);
   }
@@ -262,6 +289,120 @@ function renderProcessLists(managed, external) {
   }
 }
 
+function renderEncoderMode(encoder) {
+  const mode = encoder || "auto";
+  setText("encoderMode", encoderLabel(mode));
+  setActiveToggle("autoEncoderBtn", mode === "auto");
+  setActiveToggle("gpuOnlyBtn", mode === "gpu-only");
+  setActiveToggle("cpuOnlyBtn", mode === "cpu");
+}
+
+function gpuTone(gpu) {
+  if ((gpu.temperature_c || 0) >= 88) return "bad";
+  if ((gpu.memory_used_pct || 0) >= 92) return "warn";
+  return "info";
+}
+
+function renderGpuTelemetry(data) {
+  const summary = data.summary || {};
+  const gpus = data.gpus || [];
+  const processes = data.processes || [];
+  const primary = gpus[0] || {};
+  const tone = data.available ? data.level || "ok" : "bad";
+  const stateText = data.available ? (data.level === "ok" ? "online" : data.level || "warn") : "offline";
+  setBadge("gpuState", stateText, tone);
+  setText("gpuUpdated", data.checked_at ? `${new Date(data.checked_at).toLocaleTimeString()} | 5s` : "5s");
+  setText("gpuMessage", data.message || "No GPU telemetry.");
+  setText("gpuDriver", summary.driver_version || "n/a");
+  setText("gpuUtil", fmtPercent(summary.max_gpu_utilization_pct));
+
+  if (primary.memory_used_mb != null && primary.memory_total_mb != null) {
+    const used = fmtBytes(primary.memory_used_mb * 1024 * 1024);
+    const total = fmtBytes(primary.memory_total_mb * 1024 * 1024);
+    setText("gpuMemory", `${used} / ${total} (${fmtPercent(primary.memory_used_pct)})`);
+  } else {
+    setText("gpuMemory", fmtPercent(summary.max_memory_used_pct));
+  }
+
+  setText("gpuTemp", fmtMetric(summary.max_temperature_c, "C"));
+  if (summary.power_draw_w != null && summary.power_limit_w != null) {
+    setText("gpuPower", `${fmtMetric(summary.power_draw_w, "W", 1)} / ${fmtMetric(summary.power_limit_w, "W", 1)}`);
+  } else {
+    setText("gpuPower", fmtMetric(summary.power_draw_w, "W", 1));
+  }
+  const encoderBits = [];
+  if (summary.encoder_session_count != null) encoderBits.push(`${summary.encoder_session_count} sessions`);
+  if (summary.encoder_utilization_pct != null) encoderBits.push(`${summary.encoder_utilization_pct}% enc`);
+  setText("gpuEncoder", encoderBits.length ? encoderBits.join(" | ") : "n/a");
+  setText("gpuProcessCount", String(summary.process_count ?? processes.length));
+  setText("gpuFfmpeg", summary.stream_gpu_active ? "visible" : "not visible");
+
+  const gpuRoot = $("gpuList");
+  gpuRoot.innerHTML = "";
+  if (!gpus.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No GPU rows parsed from nvidia-smi.";
+    gpuRoot.append(empty);
+  } else {
+    gpus.forEach((gpu) => {
+      const memory = gpu.memory_used_mb != null && gpu.memory_total_mb != null
+        ? `${fmtBytes(gpu.memory_used_mb * 1024 * 1024)} / ${fmtBytes(gpu.memory_total_mb * 1024 * 1024)}`
+        : "memory n/a";
+      appendFeedItem(
+        gpuRoot,
+        gpuTone(gpu),
+        null,
+        `GPU ${gpu.index ?? "?"} ${gpu.name || "unknown"} | util ${fmtPercent(gpu.gpu_utilization_pct)} | mem ${memory} | temp ${fmtMetric(gpu.temperature_c, "C")} | power ${fmtMetric(gpu.power_draw_w, "W", 1)} | ${gpu.pstate || "pstate n/a"}`
+      );
+    });
+  }
+
+  const processRoot = $("gpuProcesses");
+  processRoot.innerHTML = "";
+  if (!processes.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No GPU processes visible.";
+    processRoot.append(empty);
+  } else {
+    processes.forEach((proc) => {
+      const procTone = proc.is_ffmpeg ? "ok" : "info";
+      const memory = proc.used_memory_mb == null ? "memory n/a" : `${proc.used_memory_mb} MB`;
+      const enc = proc.enc_pct == null ? "enc n/a" : `enc ${proc.enc_pct}%`;
+      const dec = proc.dec_pct == null ? "dec n/a" : `dec ${proc.dec_pct}%`;
+      appendFeedItem(
+        processRoot,
+        procTone,
+        null,
+        `GPU ${proc.gpu_index ?? "?"} pid ${proc.pid} ${proc.process_name || "unknown"} | ${memory} | sm ${fmtPercent(proc.sm_pct)} | mem ${fmtPercent(proc.mem_pct)} | ${enc} | ${dec}`
+      );
+    });
+  }
+
+  const diagRoot = $("gpuDiagnostics");
+  diagRoot.innerHTML = "";
+  const lines = [...(data.diagnosis || []), ...(data.errors || [])];
+  Object.entries(data.commands || {}).forEach(([name, result]) => {
+    if (result.returncode && result.returncode !== 0) {
+      lines.push(`${name}: ${result.stderr || result.stdout || `exit ${result.returncode}`}`);
+    }
+  });
+  if (!lines.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyLine";
+    empty.textContent = "No GPU diagnostics.";
+    diagRoot.append(empty);
+  } else {
+    lines.slice(0, 12).forEach((line) => {
+      const item = document.createElement("div");
+      item.className = "logLine";
+      item.textContent = line;
+      diagRoot.append(item);
+    });
+  }
+}
+
 function setPlayerState(text) {
   setText("playerState", text);
 }
@@ -396,6 +537,7 @@ async function refresh() {
     const runState = health.state || (proc.managed ? "running" : "stopped");
     setBadge("runState", runState, runState === "healthy" || proc.managed ? "ok" : "warn");
     setBadge("encoder", stream.encoder || "auto");
+    renderEncoderMode(stream.encoder || "auto");
     setBadge("updated", new Date(data.server_time).toLocaleTimeString());
     setBadge("arango", "checking");
 
@@ -409,6 +551,23 @@ async function refresh() {
     setText("pid", proc.pid || "n/a");
     setText("cpu", proc.cpu == null ? "n/a" : `${proc.cpu.toFixed(1)}%`);
     setText("hlsBytes", fmtBytes(hls.bytes));
+    setText("healthScore", health.score == null ? "n/a" : health.score.toFixed ? health.score.toFixed(1) : String(health.score));
+    setText("healthConfidence", health.confidence == null ? "n/a" : `${health.confidence}%`);
+    setText("healthDecision", health.decision || "n/a");
+    const remaining = health.assessment_remaining || 0;
+    const elapsed = health.assessment_elapsed || 0;
+    setText("assessmentWindow", remaining > 0 ? `${elapsed.toFixed(1)}s + ${remaining.toFixed(1)}s` : `${elapsed.toFixed(1)}s`);
+    const evidence = health.evidence || {};
+    const reasons = evidence.reasons || [];
+    const dataPoints = [
+      evidence.progress_seen ? "progress" : null,
+      evidence.playlist_fresh ? "fresh playlist" : null,
+      evidence.media_sequence_advanced ? "sequence moved" : null,
+      evidence.bytes_delta ? `+${fmtBytes(evidence.bytes_delta)}` : null,
+      evidence.segment_delta ? `+${evidence.segment_delta} segment` : null,
+      reasons[0] || null,
+    ].filter(Boolean);
+    setText("healthEvidence", dataPoints.length ? dataPoints.join(" | ") : "Collecting evidence.");
     setText("externalProcs", String((data.existing_processes || []).length));
     setText("mediaSequence", hls.media_sequence || "n/a");
     setText("targetDuration", hls.target_duration ? `${hls.target_duration}s` : "n/a");
@@ -445,6 +604,25 @@ async function refresh() {
   }
 }
 
+async function refreshGpuTelemetry() {
+  try {
+    const data = await api("/api/nvidia-smi");
+    renderGpuTelemetry(data);
+  } catch (err) {
+    setBadge("gpuState", "error", "bad");
+    setText("gpuMessage", `GPU telemetry error: ${err.message}`);
+    setText("gpuUpdated", "5s");
+    const diagRoot = $("gpuDiagnostics");
+    if (diagRoot) {
+      diagRoot.innerHTML = "";
+      const item = document.createElement("div");
+      item.className = "logLine error";
+      item.textContent = err.message;
+      diagRoot.append(item);
+    }
+  }
+}
+
 async function addLink(event) {
   event.preventDefault();
   const url = $("newLink").value.trim();
@@ -459,6 +637,17 @@ async function saveLinks() {
   await refresh();
 }
 
+async function setEncoderMode(encoder) {
+  setText("encoderMode", `${encoderLabel(encoder)}...`);
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify({ encoder }) });
+    await refresh();
+  } catch (err) {
+    setText("sessionState", `encoder error: ${err.message}`);
+    await refresh();
+  }
+}
+
 async function streamAction(action) {
   await api(`/api/stream/${action}`, { method: "POST", body: JSON.stringify({ kill_existing: true }) });
   await refresh();
@@ -467,6 +656,9 @@ async function streamAction(action) {
 $("loginForm").addEventListener("submit", login);
 $("addLinkForm").addEventListener("submit", addLink);
 $("saveLinksBtn").addEventListener("click", saveLinks);
+$("autoEncoderBtn").addEventListener("click", () => setEncoderMode("auto"));
+$("gpuOnlyBtn").addEventListener("click", () => setEncoderMode("gpu-only"));
+$("cpuOnlyBtn").addEventListener("click", () => setEncoderMode("cpu"));
 $("startBtn").addEventListener("click", () => streamAction("start"));
 $("restartBtn").addEventListener("click", () => streamAction("restart"));
 $("stopBtn").addEventListener("click", () => streamAction("stop"));
@@ -485,6 +677,7 @@ $("copyHlsBtn").addEventListener("click", async () => {
 if (state.token) {
   showApp();
   refresh();
+  refreshGpuTelemetry();
 } else {
   showLogin();
 }
@@ -492,6 +685,10 @@ if (state.token) {
 setInterval(() => {
   if (!$("app").classList.contains("hidden")) refresh();
 }, 2500);
+
+setInterval(() => {
+  if (!$("app").classList.contains("hidden")) refreshGpuTelemetry();
+}, 5000);
 
 setInterval(() => {
   if ($("app").classList.contains("hidden")) return;

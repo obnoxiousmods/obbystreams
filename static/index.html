@@ -51,6 +51,10 @@
           <strong id="encoder" class="stateBadge">auto</strong>
         </div>
         <div class="pillWrap">
+          <span class="pillLabel">GPU</span>
+          <strong id="gpuState" class="stateBadge">checking</strong>
+        </div>
+        <div class="pillWrap">
           <span class="pillLabel">ArangoDB</span>
           <strong id="arango" class="stateBadge">checking</strong>
         </div>
@@ -93,13 +97,29 @@
               <div><span>Playlist age</span><strong id="playlistAge">waiting</strong></div>
               <div><span>HLS size</span><strong id="hlsBytes">0 MB</strong></div>
               <div><span>RSS</span><strong id="rss">n/a</strong></div>
+              <div><span>Score</span><strong id="healthScore">n/a</strong></div>
+              <div><span>Confidence</span><strong id="healthConfidence">n/a</strong></div>
+              <div><span>Decision</span><strong id="healthDecision">n/a</strong></div>
+              <div><span>Assessment</span><strong id="assessmentWindow">n/a</strong></div>
             </div>
+            <p id="healthEvidence" class="subtle">Waiting for evidence.</p>
           </article>
 
           <article class="panel">
             <div class="panelHead">
               <h2>Process</h2>
               <span class="pill">Runtime</span>
+            </div>
+            <div class="encoderControl">
+              <div class="encoderSummary">
+                <span>Encoder mode</span>
+                <strong id="encoderMode">Auto</strong>
+              </div>
+              <div class="toggleGroup" aria-label="Encoder mode">
+                <button id="autoEncoderBtn" class="secondary" type="button">Auto</button>
+                <button id="gpuOnlyBtn" class="secondary" type="button">GPU</button>
+                <button id="cpuOnlyBtn" class="secondary" type="button">CPU</button>
+              </div>
             </div>
             <div class="statsGrid compact">
               <div><span>PID</span><strong id="pid">n/a</strong></div>
@@ -111,6 +131,30 @@
             <div id="children" class="feed"></div>
             <h3>Other stream processes</h3>
             <div id="external" class="feed"></div>
+          </article>
+
+          <article class="panel gpuPanel">
+            <div class="panelHead">
+              <h2>NVIDIA SMI</h2>
+              <span id="gpuUpdated" class="pill">5s</span>
+            </div>
+            <p id="gpuMessage" class="healthMessage">Waiting for GPU telemetry.</p>
+            <div class="statsGrid compact">
+              <div><span>Driver</span><strong id="gpuDriver">n/a</strong></div>
+              <div><span>Utilization</span><strong id="gpuUtil">n/a</strong></div>
+              <div><span>Memory</span><strong id="gpuMemory">n/a</strong></div>
+              <div><span>Temperature</span><strong id="gpuTemp">n/a</strong></div>
+              <div><span>Power</span><strong id="gpuPower">n/a</strong></div>
+              <div><span>Encoder</span><strong id="gpuEncoder">n/a</strong></div>
+              <div><span>GPU processes</span><strong id="gpuProcessCount">0</strong></div>
+              <div><span>FFmpeg</span><strong id="gpuFfmpeg">n/a</strong></div>
+            </div>
+            <h3>GPUs</h3>
+            <div id="gpuList" class="feed"></div>
+            <h3>GPU processes</h3>
+            <div id="gpuProcesses" class="feed"></div>
+            <h3>Diagnostics</h3>
+            <div id="gpuDiagnostics" class="logFeed"></div>
           </article>
         </aside>
       </section>
