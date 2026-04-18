@@ -52,11 +52,17 @@ The app reads the configured output directory and checks:
 - segment count
 - total segment bytes
 - last segment size
+- media sequence movement
+- bytes and segment deltas between scorer samples
+- recent stream errors
+- ffmpeg progress evidence
 
 `/api/health` returns:
 
 - `200` when a managed process is running, a playlist is ready, and the playlist is fresh.
 - `503` when the stream is stopped, still starting, missing playlist output, or stale.
+
+The stream health scorer waits at least `min_assessment_seconds` before confirming failure, then requires `confirmed_failure_samples` bad samples. This prevents a normal startup window or a quiet segment interval from being treated as a hard failure.
 
 ## Logs And Events
 

@@ -13,6 +13,7 @@ import subprocess
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -62,6 +63,25 @@ def now_ms():
 
 APP_STARTED_AT = now_ms()
 
+ENCODER_CHOICES = {
+    "auto",
+    "gpu",
+    "gpu-only",
+    "gpu-trans",
+    "nv",
+    "nvidia",
+    "nvenc",
+    "nv-gpu-trans",
+    "intel",
+    "qsv",
+    "intel-gpu-trans",
+    "amd",
+    "amf",
+    "amd-gpu-trans",
+    "vaapi",
+    "cpu",
+}
+
 
 DEFAULT_CONFIG = {
     "server": {"host": "127.0.0.1", "port": 8767, "workers": 1},
@@ -70,6 +90,7 @@ DEFAULT_CONFIG = {
         "command": "/usr/bin/obbystreams",
         "encoder": "auto",
         "output_dir": "/var/www/live.obnoxious.lol/stream",
+        "ffmpeg_log_dir": "ffmpegLogs",
         "public_hls_url": "",
         "bitrate": "6M",
         "audio_bitrate": "192k",
@@ -78,6 +99,12 @@ DEFAULT_CONFIG = {
         "watchdog_restart_cooldown": 20,
         "startup_grace_seconds": 25,
         "playlist_stale_seconds": 25,
+        "min_assessment_seconds": 15,
+        "health_sample_interval": 2,
+        "success_score_threshold": 180,
+        "failure_score_threshold": -120,
+        "confirmed_failure_samples": 2,
+        "failure_ramp_seconds": 60,
         "links": [],
     },
     "arangodb": {
@@ -98,6 +125,17 @@ def safe_number(value, fallback, minimum=None):
     if minimum is not None:
         n = max(float(minimum), n)
     return n
+
+
+def safe_int(value, fallback, minimum=None):
+    return int(safe_number(value, fallback, minimum=minimum))
+
+
+def safe_float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def smi_text(value):
@@ -164,8 +202,11 @@ def normalize_config(config):
     stream = merged["stream"]
     stream["links"] = normalize_links(stream.get("links", []))
     stream["output_dir"] = str(stream.get("output_dir") or DEFAULT_CONFIG["stream"]["output_dir"])
+    stream["ffmpeg_log_dir"] = str(stream.get("ffmpeg_log_dir") or DEFAULT_CONFIG["stream"]["ffmpeg_log_dir"])
     stream["command"] = str(stream.get("command") or DEFAULT_CONFIG["stream"]["command"])
     stream["encoder"] = str(stream.get("encoder") or DEFAULT_CONFIG["stream"]["encoder"])
+    if stream["encoder"] not in ENCODER_CHOICES:
+        stream["encoder"] = DEFAULT_CONFIG["stream"]["encoder"]
     stream["bitrate"] = str(stream.get("bitrate") or DEFAULT_CONFIG["stream"]["bitrate"])
     stream["audio_bitrate"] = str(stream.get("audio_bitrate") or DEFAULT_CONFIG["stream"]["audio_bitrate"])
     stream["public_hls_url"] = str(stream.get("public_hls_url") or "")
@@ -174,6 +215,12 @@ def normalize_config(config):
     stream["watchdog_restart_cooldown"] = safe_number(stream.get("watchdog_restart_cooldown"), 20, minimum=5)
     stream["startup_grace_seconds"] = safe_number(stream.get("startup_grace_seconds"), 25, minimum=5)
     stream["playlist_stale_seconds"] = safe_number(stream.get("playlist_stale_seconds"), 25, minimum=10)
+    stream["min_assessment_seconds"] = safe_number(stream.get("min_assessment_seconds"), 15, minimum=15)
+    stream["health_sample_interval"] = safe_number(stream.get("health_sample_interval"), 2, minimum=1)
+    stream["success_score_threshold"] = safe_number(stream.get("success_score_threshold"), 180)
+    stream["failure_score_threshold"] = safe_number(stream.get("failure_score_threshold"), -120)
+    stream["confirmed_failure_samples"] = safe_int(stream.get("confirmed_failure_samples"), 2, minimum=1)
+    stream["failure_ramp_seconds"] = safe_number(stream.get("failure_ramp_seconds"), 60, minimum=15)
     arango = merged["arangodb"]
     arango["enabled"] = bool(arango.get("enabled", True))
     arango["url"] = str(arango.get("url") or DEFAULT_CONFIG["arangodb"]["url"])
@@ -212,6 +259,260 @@ def public_config(config):
     safe.get("dashboard", {}).pop("session_token", None)
     safe.get("arangodb", {}).pop("password", None)
     return safe
+
+
+@dataclass
+class StreamHealthScorer:
+    pid: int | None = None
+    started_at: int | None = None
+    last_sample_at: float = 0.0
+    consecutive_bad_samples: int = 0
+    consecutive_good_samples: int = 0
+    previous_hls: dict = field(default_factory=dict)
+    samples: deque[dict] = field(default_factory=lambda: deque(maxlen=90))
+    last_assessment: dict | None = None
+
+    def reset(self, pid=None, started_at=None):
+        self.pid = pid
+        self.started_at = started_at
+        self.last_sample_at = 0.0
+        self.consecutive_bad_samples = 0
+        self.consecutive_good_samples = 0
+        self.previous_hls = {}
+        self.samples.clear()
+        self.last_assessment = None
+
+    def assess(self, config, proc, hls, force=False):
+        stream = config.get("stream", {})
+        recent_errors = recent_stream_errors(limit=8, seconds=60)
+        if not proc.get("managed"):
+            self.reset()
+            assessment = {
+                "state": "stopped",
+                "level": "warn",
+                "decision": "stopped",
+                "message": "No managed stream process is running.",
+                "score": 0.0,
+                "confidence": 100,
+                "assessment_elapsed": 0.0,
+                "assessment_remaining": float(stream.get("min_assessment_seconds", 15)),
+                "evidence": {"recent_error_count": len(recent_errors)},
+                "samples": [],
+                "recent_errors": recent_errors,
+            }
+            self.last_assessment = assessment
+            return assessment
+
+        pid = proc.get("pid")
+        started_at = proc.get("started_at")
+        if self.pid != pid or self.started_at != started_at:
+            self.reset(pid=pid, started_at=started_at)
+
+        now = time.monotonic()
+        sample_interval = float(stream.get("health_sample_interval", 2))
+        if self.last_assessment and not force and self.last_sample_at and now - self.last_sample_at < sample_interval:
+            return self.last_assessment
+
+        elapsed = float(proc.get("age") or 0.0)
+        min_assessment = float(stream.get("min_assessment_seconds", 15))
+        stale_seconds = float(stream.get("playlist_stale_seconds", 25))
+        ramp_seconds = float(stream.get("failure_ramp_seconds", 60))
+        success_threshold = float(stream.get("success_score_threshold", 180))
+        failure_threshold = float(stream.get("failure_score_threshold", -120))
+        confirmed_failure_samples = int(stream.get("confirmed_failure_samples", 2))
+
+        score, evidence, reasons = score_stream_snapshot(proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors)
+        bad_sample = elapsed >= min_assessment and score <= failure_threshold
+        good_sample = score >= success_threshold
+        if bad_sample:
+            self.consecutive_bad_samples += 1
+            self.consecutive_good_samples = 0
+        elif good_sample:
+            self.consecutive_good_samples += 1
+            self.consecutive_bad_samples = 0
+        elif score > failure_threshold / 2:
+            self.consecutive_bad_samples = 0
+
+        if elapsed < min_assessment:
+            state = "assessing"
+            level = "warn"
+            decision = "assessing"
+            message = f"Collecting stream evidence for {min_assessment - elapsed:.1f}s before making a failure decision."
+        elif bad_sample and self.consecutive_bad_samples >= confirmed_failure_samples:
+            state = "failed"
+            level = "bad"
+            decision = "failed"
+            reason_text = "; ".join(reasons[:3]) if reasons else "score remained below failure threshold"
+            message = f"Confirmed weak stream after {self.consecutive_bad_samples} bad samples: {reason_text}."
+        elif good_sample:
+            state = "healthy"
+            level = "ok"
+            decision = "healthy"
+            message = "Stream is producing fresh HLS output with positive progress evidence."
+        elif score < 0:
+            state = "degraded"
+            level = "warn"
+            decision = "degraded"
+            reason_text = "; ".join(reasons[:3]) if reasons else "score is below zero"
+            message = f"Stream is being watched closely: {reason_text}."
+        else:
+            state = "recovering"
+            level = "warn"
+            decision = "recovering"
+            message = "Stream has some positive evidence, but not enough yet for a healthy decision."
+
+        confidence = confidence_for_assessment(score, elapsed, min_assessment, len(self.samples), self.consecutive_bad_samples, self.consecutive_good_samples)
+        sample = {
+            "ts": now_ms(),
+            "score": round(score, 1),
+            "decision": decision,
+            "playlist_age": hls.get("playlist_age"),
+            "segments": hls.get("segments"),
+            "bytes": hls.get("bytes"),
+            "bytes_delta": evidence.get("bytes_delta", 0),
+            "media_sequence": hls.get("media_sequence"),
+            "segment_delta": evidence.get("segment_delta", 0),
+            "playlist_moved": evidence.get("playlist_moved", False),
+            "recent_error_count": evidence.get("recent_error_count", 0),
+        }
+        self.samples.append(sample)
+        self.last_sample_at = now
+        self.previous_hls = {
+            "segments": hls.get("segments"),
+            "bytes": hls.get("bytes"),
+            "playlist_modified_at": hls.get("playlist_modified_at"),
+            "media_sequence": hls.get("media_sequence"),
+            "last_segment": hls.get("last_segment"),
+            "last_segment_size": hls.get("last_segment_size"),
+        }
+        assessment = {
+            "state": state,
+            "level": level,
+            "decision": decision,
+            "message": message,
+            "score": round(score, 1),
+            "confidence": confidence,
+            "assessment_elapsed": round(elapsed, 1),
+            "assessment_remaining": round(max(0.0, min_assessment - elapsed), 1),
+            "consecutive_bad_samples": self.consecutive_bad_samples,
+            "consecutive_good_samples": self.consecutive_good_samples,
+            "evidence": evidence,
+            "samples": list(self.samples)[-12:],
+            "recent_errors": recent_errors,
+        }
+        self.last_assessment = assessment
+        return assessment
+
+
+STREAM_HEALTH_SCORER = StreamHealthScorer()
+
+
+def recent_stream_errors(limit=5, seconds=30):
+    cutoff = time.time() - seconds
+    return [item for item in list(ERRORS) if item.get("ts", 0) / 1000 >= cutoff][-limit:]
+
+
+def bounded_penalty(base, cap, ramp):
+    return min(cap, base * ramp)
+
+
+def score_stream_snapshot(proc, hls, previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors):
+    score = 0.0
+    reasons = []
+    has_child = bool(proc.get("children"))
+    playlist_exists = bool(hls.get("playlist_exists"))
+    playlist_ready = bool(hls.get("playlist_ready"))
+    playlist_age = hls.get("playlist_age")
+    playlist_fresh = playlist_age is not None and playlist_age <= stale_seconds
+    ramp = max(0.15, min(2.5, elapsed / max(ramp_seconds, 1.0)))
+    if elapsed < min_assessment:
+        ramp *= 0.35
+
+    current_segments = int(hls.get("segments") or 0)
+    previous_segments = int(previous_hls.get("segments") or 0) if previous_hls else 0
+    segment_delta = max(0, current_segments - previous_segments) if previous_hls else 0
+    current_bytes = int(hls.get("bytes") or 0)
+    previous_bytes = int(previous_hls.get("bytes") or 0) if previous_hls else 0
+    bytes_delta = max(0, current_bytes - previous_bytes) if previous_hls else 0
+    playlist_moved = bool(previous_hls and hls.get("playlist_modified_at") and hls.get("playlist_modified_at") != previous_hls.get("playlist_modified_at"))
+
+    media_sequence = safe_float_or_none(hls.get("media_sequence"))
+    previous_media_sequence = safe_float_or_none(previous_hls.get("media_sequence")) if previous_hls else None
+    media_sequence_advanced = media_sequence is not None and previous_media_sequence is not None and media_sequence > previous_media_sequence
+    progress_seen = segment_delta > 0 or bytes_delta > 0 or playlist_moved or media_sequence_advanced
+
+    if proc.get("managed"):
+        score += 20
+    if has_child:
+        score += 20
+    else:
+        penalty = bounded_penalty(100 + elapsed, 220, ramp)
+        score -= penalty
+        reasons.append("runner has no ffmpeg child")
+    if playlist_exists:
+        score += 10
+    if playlist_ready:
+        score += 35
+    else:
+        penalty = bounded_penalty(80 + elapsed * 2, 240, ramp)
+        score -= penalty
+        reasons.append("playlist is not ready")
+    if playlist_fresh:
+        score += 60
+    elif playlist_age is not None:
+        stale_over = max(0.0, playlist_age - stale_seconds)
+        penalty = bounded_penalty(60 + stale_over * 6, 260, ramp)
+        score -= penalty
+        reasons.append(f"playlist is stale ({playlist_age:.1f}s old)")
+    if media_sequence_advanced:
+        score += 60
+    if segment_delta > 0:
+        score += 45
+    if bytes_delta > 0:
+        score += 60
+    if playlist_moved:
+        score += 35
+    if hls.get("last_segment_size"):
+        score += 25
+    if elapsed >= min_assessment:
+        score += 40
+    no_progress_grace = min(stale_seconds, max(8.0, min_assessment / 2))
+    if previous_hls and elapsed >= min_assessment and not progress_seen and (playlist_age is None or playlist_age > no_progress_grace):
+        score -= bounded_penalty(30 + elapsed * 1.2, 160, ramp)
+        reasons.append("no HLS progress since previous sample")
+    if recent_errors:
+        score -= min(140, len(recent_errors) * 14 * ramp)
+        reasons.append(f"{len(recent_errors)} recent ffmpeg error(s)")
+    else:
+        score += 15
+
+    evidence = {
+        "has_child": has_child,
+        "playlist_exists": playlist_exists,
+        "playlist_ready": playlist_ready,
+        "playlist_fresh": playlist_fresh,
+        "playlist_age": playlist_age,
+        "segment_delta": segment_delta,
+        "bytes_delta": bytes_delta,
+        "playlist_moved": playlist_moved,
+        "media_sequence_advanced": media_sequence_advanced,
+        "progress_seen": progress_seen,
+        "recent_error_count": len(recent_errors),
+        "ramp": round(ramp, 3),
+        "reasons": reasons,
+    }
+    return score, evidence, reasons
+
+
+def confidence_for_assessment(score, elapsed, min_assessment, sample_count, bad_samples, good_samples):
+    elapsed_score = min(45, (elapsed / max(min_assessment, 1.0)) * 45)
+    sample_score = min(30, sample_count * 5)
+    signal_score = min(25, abs(score) / 8)
+    streak_score = min(15, max(bad_samples, good_samples) * 5)
+    confidence = int(min(100, elapsed_score + sample_score + signal_score + streak_score))
+    if elapsed < min_assessment:
+        return min(85, confidence)
+    return confidence
 
 
 def event(message, level="info", extra=None):
@@ -427,14 +728,21 @@ def safe_stat_size(path):
         return 0
 
 
+def safe_stat_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def classify_stream_log(line):
     lowered = line.lower()
+    if "starting" in lowered or "stream commander" in lowered or "status:" in lowered:
+        return "info"
     if "ffmpeg:" in lowered or any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")):
         return "error"
     if "ffmpeg exited" in lowered or "restart" in lowered or "weak stream" in lowered or "every link failed" in lowered:
         return "warn"
-    if "starting" in lowered or "stream commander" in lowered or "status:" in lowered:
-        return "info"
     return "debug"
 
 
@@ -451,6 +759,8 @@ def hls_metrics(config):
     media_sequence = None
     playlist_segment_names = []
     segment_durations = []
+    segment_mtimes = [safe_stat_mtime(p) for p in segments]
+    segment_mtimes = [m for m in segment_mtimes if m is not None]
     if playlist.exists():
         playlist_mtime = playlist.stat().st_mtime
         playlist_age = max(0, time.time() - playlist_mtime)
@@ -478,9 +788,12 @@ def hls_metrics(config):
         "playlist_line_count": len(playlist_lines),
         "segments": len(segments),
         "bytes": total_bytes,
+        "latest_segment_modified_at": int(max(segment_mtimes) * 1000) if segment_mtimes else None,
+        "oldest_segment_modified_at": int(min(segment_mtimes) * 1000) if segment_mtimes else None,
         "target_duration": target_duration,
         "media_sequence": media_sequence,
         "segment_window_seconds": round(sum(segment_durations), 3),
+        "playlist_segment_count": len(playlist_segment_names),
         "playlist_segments": playlist_segment_names[-12:],
         "first_segment": playlist_segment_names[0] if playlist_segment_names else None,
         "last_segment": playlist_segment_names[-1] if playlist_segment_names else None,
@@ -511,40 +824,8 @@ def process_metrics():
     return data
 
 
-def stream_health(proc, hls):
-    recent_errors = list(ERRORS)[-5:]
-    if not proc.get("managed"):
-        return {"state": "stopped", "level": "warn", "message": "No managed stream process is running.", "recent_errors": recent_errors}
-    if not proc.get("children"):
-        return {
-            "state": "starting",
-            "level": "warn",
-            "message": "Runner is alive, but no ffmpeg child is active yet.",
-            "recent_errors": recent_errors,
-        }
-    if not hls.get("playlist_ready"):
-        return {
-            "state": "starting",
-            "level": "warn",
-            "message": "ffmpeg is running, but no playable HLS playlist has been written yet.",
-            "recent_errors": recent_errors,
-        }
-    age = hls.get("playlist_age")
-    if age is not None and age > 20:
-        return {
-            "state": "stale",
-            "level": "bad",
-            "message": f"HLS playlist is stale ({age:.1f}s old).",
-            "recent_errors": recent_errors,
-        }
-    if recent_errors and time.time() - (recent_errors[-1]["ts"] / 1000) < 30:
-        return {
-            "state": "degraded",
-            "level": "warn",
-            "message": "Recent ffmpeg errors were reported; playback may be recovering.",
-            "recent_errors": recent_errors,
-        }
-    return {"state": "healthy", "level": "ok", "message": "Stream is producing fresh HLS output.", "recent_errors": recent_errors}
+def stream_health(config, proc, hls, force=False):
+    return STREAM_HEALTH_SCORER.assess(config, proc, hls, force=force)
 
 
 NVIDIA_GPU_QUERY_FIELDS = [
@@ -614,30 +895,29 @@ def parse_nvidia_gpu_csv(text):
         used = smi_int(row.get("memory_used"))
         power_draw = smi_float(row.get("power_draw"))
         power_limit = smi_float(row.get("power_limit"))
-        gpus.append(
-            {
-                "index": smi_int(row.get("index")),
-                "name": smi_text(row.get("name")),
-                "uuid": smi_text(row.get("uuid")),
-                "driver_version": smi_text(row.get("driver_version")),
-                "pstate": smi_text(row.get("pstate")),
-                "temperature_c": smi_int(row.get("temperature_gpu")),
-                "gpu_utilization_pct": smi_int(row.get("utilization_gpu")),
-                "memory_utilization_pct": smi_int(row.get("utilization_memory")),
-                "memory_total_mb": total,
-                "memory_used_mb": used,
-                "memory_free_mb": smi_int(row.get("memory_free")),
-                "memory_used_pct": smi_percent(used, total),
-                "power_draw_w": power_draw,
-                "power_limit_w": power_limit,
-                "power_used_pct": smi_percent(power_draw, power_limit),
-                "graphics_clock_mhz": smi_int(row.get("clocks_graphics")),
-                "memory_clock_mhz": smi_int(row.get("clocks_memory")),
-                "encoder_session_count": None,
-                "encoder_average_fps": None,
-                "encoder_average_latency_ms": None,
-            }
-        )
+        gpu = {
+            "index": smi_int(row.get("index")),
+            "name": smi_text(row.get("name")),
+            "uuid": smi_text(row.get("uuid")),
+            "driver_version": smi_text(row.get("driver_version")),
+            "pstate": smi_text(row.get("pstate")),
+            "temperature_c": smi_int(row.get("temperature_gpu")),
+            "gpu_utilization_pct": smi_int(row.get("utilization_gpu")),
+            "memory_utilization_pct": smi_int(row.get("utilization_memory")),
+            "memory_total_mb": total,
+            "memory_used_mb": used,
+            "memory_free_mb": smi_int(row.get("memory_free")),
+            "memory_used_pct": smi_percent(used, total),
+            "power_draw_w": power_draw,
+            "power_limit_w": power_limit,
+            "power_used_pct": smi_percent(power_draw, power_limit),
+            "graphics_clock_mhz": smi_int(row.get("clocks_graphics")),
+            "memory_clock_mhz": smi_int(row.get("clocks_memory")),
+            "encoder_session_count": None,
+            "encoder_average_fps": None,
+            "encoder_average_latency_ms": None,
+        }
+        gpus.append(gpu)
     return gpus
 
 
@@ -829,7 +1109,11 @@ def analyze_nvidia_smi(gpus, processes, commands):
     else:
         diagnosis.append("No FFmpeg/NVENC process visible to nvidia-smi")
 
-    optional_failures = [name for name in ("encoder", "processes", "pmon") if commands.get(name, {}).get("returncode") not in (None, 0)]
+    optional_failures = [
+        name
+        for name in ("encoder", "processes", "pmon")
+        if commands.get(name, {}).get("returncode") not in (None, 0)
+    ]
     if optional_failures:
         diagnosis.append(f"Optional query failed: {', '.join(optional_failures)}")
 
@@ -954,7 +1238,7 @@ def status_payload():
         "managed_process": proc,
         "existing_processes": stream_processes(),
         "hls": hls,
-        "health": stream_health(proc, hls),
+        "health": stream_health(config, proc, hls),
         "events": list(EVENTS)[-80:],
         "logs": list(LOGS)[-140:],
         "errors": list(ERRORS)[-80:],
@@ -981,6 +1265,7 @@ async def health(request):
     stream = config.get("stream", {})
     links_configured = bool(stream.get("links"))
     playlist_stale_seconds = float(stream.get("playlist_stale_seconds", 25))
+    health_doc = stream_health(config, proc, hls, force=True)
     ready = bool(proc.get("managed") and hls.get("playlist_ready"))
     stale = hls.get("playlist_age") is not None and hls.get("playlist_age", 0) > playlist_stale_seconds
     checks = {
@@ -988,15 +1273,17 @@ async def health(request):
         "links_configured": links_configured,
         "playlist_ready": bool(hls.get("playlist_ready")),
         "playlist_fresh": not stale,
+        "confirmed_failure": health_doc.get("decision") == "failed",
+        "assessment_complete": not health_doc.get("assessment_remaining"),
     }
-    ok = checks["managed_process"] and checks["playlist_ready"] and checks["playlist_fresh"]
+    ok = checks["managed_process"] and checks["links_configured"] and not checks["confirmed_failure"]
     status_code = 200 if ok else 503
     return JSONResponse(
         {
             "ok": ok,
-            "ready": ready and not stale,
+            "ready": ready and not stale and not checks["confirmed_failure"],
             "checks": checks,
-            "health": stream_health(proc, hls),
+            "health": health_doc,
             "server_time": now_ms(),
         },
         status_code=status_code,
@@ -1024,12 +1311,19 @@ async def put_config(request):
         "bitrate",
         "audio_bitrate",
         "output_dir",
+        "ffmpeg_log_dir",
         "public_hls_url",
         "auto_recover",
         "auto_restart_on_exit",
         "watchdog_restart_cooldown",
         "startup_grace_seconds",
         "playlist_stale_seconds",
+        "min_assessment_seconds",
+        "health_sample_interval",
+        "success_score_threshold",
+        "failure_score_threshold",
+        "confirmed_failure_samples",
+        "failure_ramp_seconds",
     ):
         if key in body:
             stream[key] = body[key]
@@ -1042,6 +1336,7 @@ async def put_config(request):
         "bitrate",
         "audio_bitrate",
         "output_dir",
+        "ffmpeg_log_dir",
         "public_hls_url",
         "restart_delay",
         "max_restart_delay",
@@ -1050,6 +1345,11 @@ async def put_config(request):
         "rate_limit_delay",
         "quick_fail",
         "stop_after_failed_rounds",
+        "min_assessment_seconds",
+        "success_score_threshold",
+        "failure_score_threshold",
+        "confirmed_failure_samples",
+        "failure_ramp_seconds",
     }
     restarted = await restart_managed_with_config("configuration changed") if stream_restart_keys.intersection(body) else False
     if restarted:
@@ -1125,6 +1425,8 @@ def build_command(config, links=None):
         cmd += ["--encoder", encoder]
     if stream.get("output_dir"):
         cmd += ["--output-dir", stream["output_dir"]]
+    if stream.get("ffmpeg_log_dir"):
+        cmd += ["--ffmpeg-log-dir", stream["ffmpeg_log_dir"]]
     if stream.get("bitrate"):
         cmd += ["--bitrate", str(stream["bitrate"])]
     if stream.get("audio_bitrate"):
@@ -1137,6 +1439,11 @@ def build_command(config, links=None):
         "rate_limit_delay": "--rate-limit-delay",
         "quick_fail": "--quick-fail",
         "stop_after_failed_rounds": "--stop-after-failed-rounds",
+        "min_assessment_seconds": "--min-assessment-seconds",
+        "success_score_threshold": "--success-score-threshold",
+        "failure_score_threshold": "--failure-score-threshold",
+        "confirmed_failure_samples": "--confirmed-failure-samples",
+        "failure_ramp_seconds": "--failure-ramp-seconds",
     }
     for key, flag in option_flags.items():
         if stream.get(key) is not None:
@@ -1165,6 +1472,7 @@ async def stop_managed_process(reason):
     proc = PROCESS
     if not proc or proc.poll() is not None:
         PROCESS = None
+        STREAM_HEALTH_SCORER.reset()
         return False
     await asyncio.to_thread(terminate_process_tree, proc)
     if READER_TASK and not READER_TASK.done():
@@ -1173,6 +1481,7 @@ async def stop_managed_process(reason):
             await READER_TASK
     RUNTIME["last_exit_code"] = proc.poll()
     PROCESS = None
+    STREAM_HEALTH_SCORER.reset()
     event(reason, "warn")
     return True
 
@@ -1193,6 +1502,7 @@ def start_managed_process(config, links, kill_existing=True):
         RUNTIME["start_failures"] += 1
         raise
     STARTED_AT = now_ms()
+    STREAM_HEALTH_SCORER.reset(pid=PROCESS.pid, started_at=STARTED_AT)
     READER_TASK = asyncio.create_task(read_process_output(PROCESS))
     RUNTIME["stream_starts"] += 1
     event("stream started", "ok", {"cmd": cmd, "pid": PROCESS.pid})
@@ -1258,14 +1568,12 @@ async def watchdog_loop():
     global WATCHDOG_LAST_ACTION, PROCESS
     while True:
         try:
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             config = load_config()
             stream = config.get("stream", {})
             if not stream.get("auto_recover", True):
                 continue
             restart_cooldown = float(stream.get("watchdog_restart_cooldown", 20))
-            startup_grace = float(stream.get("startup_grace_seconds", 25))
-            stale_seconds = float(stream.get("playlist_stale_seconds", 25))
             async with PROCESS_LOCK:
                 if not PROCESS or PROCESS.poll() is not None:
                     if stream.get("auto_restart_on_exit", True) and stream.get("links"):
@@ -1283,23 +1591,11 @@ async def watchdog_loop():
                     continue
                 proc = process_metrics()
                 hls = hls_metrics(config)
-                age = proc.get("age") or 0.0
-                has_child = bool(proc.get("children"))
-                playlist_ready = bool(hls.get("playlist_ready"))
-                playlist_age = hls.get("playlist_age")
-                unhealthy = False
-                reason = None
-                if age > startup_grace and not has_child:
-                    unhealthy = True
-                    reason = "runner has no ffmpeg child"
-                elif age > startup_grace and not playlist_ready:
-                    unhealthy = True
-                    reason = "playlist is not ready"
-                elif playlist_age is not None and playlist_age > stale_seconds:
-                    unhealthy = True
-                    reason = f"playlist stale for {playlist_age:.1f}s"
-                if not unhealthy:
+                assessment = stream_health(config, proc, hls, force=True)
+                if assessment.get("decision") != "failed":
                     continue
+                reasons = assessment.get("evidence", {}).get("reasons", [])
+                reason = "; ".join(reasons[:3]) if reasons else assessment.get("message", "stream score confirmed failure")
                 now = time.monotonic()
                 if now - WATCHDOG_LAST_ACTION < restart_cooldown:
                     continue

@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 import glob
+import json
 import os
 import random
 import re
@@ -20,6 +21,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 DEFAULT_STREAM_DIR = "/var/www/live.obnoxious.lol/stream"
+DEFAULT_FFMPEG_LOG_DIR = "ffmpegLogs"
 APP_NAME = "obbystreams"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -138,14 +140,23 @@ class StreamHealth:
     attempts: int = 0
     failures: int = 0
     quick_failures: int = 0
+    inconclusive_exits: int = 0
+    confirmed_failures: int = 0
+    successes: int = 0
     total_runtime: float = 0.0
+    assessment_runtime: float = 0.0
+    assessment_started_at: float = 0.0
     best_runtime: float = 0.0
     last_runtime: float = 0.0
     last_failure_at: float = 0.0
     last_started_at: float = 0.0
     backoff_until: float = 0.0
     consecutive_failures: int = 0
+    consecutive_bad_samples: int = 0
     last_error: str = ""
+    last_score: float = 0.0
+    last_decision: str = "new"
+    score_history: deque = field(default_factory=lambda: deque(maxlen=16))
     tried_this_round: bool = False
     failed_this_round: bool = False
 
@@ -158,33 +169,234 @@ class StreamHealth:
     def record_start(self):
         self.attempts += 1
         self.last_started_at = time.monotonic()
+        if not self.assessment_started_at:
+            self.assessment_started_at = self.last_started_at
         self.tried_this_round = True
 
-    def record_exit(self, elapsed, quick_fail, failed=True):
+    def reset_assessment_window(self):
+        self.assessment_runtime = 0.0
+        self.assessment_started_at = 0.0
+        self.consecutive_bad_samples = 0
+        self.quick_failures = 0
+
+    def record_exit(self, elapsed, args, failed=True, error_summary="", progress=None, hls=None):
+        progress = progress or {}
+        hls = hls or {}
         if failed:
             self.failures += 1
-            self.failed_this_round = True
-            self.consecutive_failures += 1
         else:
             self.consecutive_failures = 0
         self.last_runtime = elapsed
         self.total_runtime += elapsed
+        self.assessment_runtime += elapsed
         self.best_runtime = max(self.best_runtime, elapsed)
-        self.last_failure_at = time.monotonic()
-        if failed and elapsed < quick_fail:
+        now = time.monotonic()
+        if failed:
+            self.last_failure_at = now
+        if failed and elapsed < args.quick_fail:
             self.quick_failures += 1
-            return True
-        self.quick_failures = 0
-        return False
+        elif not failed:
+            self.quick_failures = 0
+
+        score, evidence, reasons = score_stream_evidence(self, args, failed, error_summary, progress, hls)
+        self.last_score = score
+        if failed and self.assessment_runtime < args.min_assessment_seconds:
+            decision = "assessing"
+            self.inconclusive_exits += 1
+        elif score <= args.failure_score_threshold:
+            self.consecutive_bad_samples += 1
+            if self.consecutive_bad_samples >= args.confirmed_failure_samples:
+                decision = "failed"
+                self.confirmed_failures += 1
+                self.consecutive_failures += 1
+                self.failed_this_round = True
+            else:
+                decision = "degraded"
+        elif score >= args.success_score_threshold:
+            decision = "healthy"
+            self.successes += 1
+            self.consecutive_bad_samples = 0
+            self.failed_this_round = False
+            self.reset_assessment_window()
+        else:
+            decision = "degraded" if failed else "ended"
+            if score > args.failure_score_threshold / 2:
+                self.consecutive_bad_samples = 0
+        if decision != "failed" and not failed:
+            self.consecutive_failures = 0
+        self.last_decision = decision
+        self.score_history.append({
+            "at": now,
+            "score": score,
+            "decision": decision,
+            "assessment_runtime": self.assessment_runtime,
+            "elapsed": elapsed,
+            "failed": failed,
+            "reasons": reasons,
+        })
+        return {"decision": decision, "score": score, "evidence": evidence, "reasons": reasons}
 
     def score(self, now, current_index, explore_bias=20.0):
         if self.backoff_until > now:
             return -1_000_000.0 - (self.backoff_until - now)
         freshness_penalty = max(0.0, 12.0 - (now - self.last_failure_at)) if self.last_failure_at else 0.0
         current_penalty = 8.0 if self.index == current_index else 0.0
-        quick_penalty = min(60.0, self.quick_failures * 18.0)
+        quick_penalty = min(90.0, self.quick_failures * 10.0 + self.confirmed_failures * 24.0)
         explore_bonus = explore_bias if self.attempts == 0 else 0.0
-        return self.best_runtime * 1.8 + self.average_runtime + explore_bonus - quick_penalty - freshness_penalty - current_penalty
+        success_bonus = self.successes * 120.0
+        return self.best_runtime * 2.5 + self.average_runtime * 1.5 + self.last_score + success_bonus + explore_bonus - quick_penalty - freshness_penalty - current_penalty
+
+
+def number_or_zero(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def progress_seconds(value):
+    text = str(value or "").strip()
+    if not text or text == "N/A":
+        return 0.0
+    if text.isdigit():
+        return float(text) / 1_000_000.0
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return 0.0
+    return number_or_zero(text)
+
+
+def safe_file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def hls_probe(output_dir):
+    playlist = os.path.join(output_dir, "ufc.m3u8")
+    segments = sorted(glob.glob(os.path.join(output_dir, "ufc*.ts")))
+    segment_names = []
+    media_sequence = None
+    target_duration = None
+    if os.path.exists(playlist):
+        try:
+            with open(playlist, encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                        media_sequence = line.split(":", 1)[1]
+                    elif line.startswith("#EXT-X-TARGETDURATION:"):
+                        target_duration = line.split(":", 1)[1]
+                    elif line and not line.startswith("#"):
+                        segment_names.append(line)
+        except OSError:
+            segment_names = []
+    playlist_mtime = os.path.getmtime(playlist) if os.path.exists(playlist) else None
+    last_segment = os.path.join(output_dir, segment_names[-1]) if segment_names else None
+    return {
+        "playlist_exists": os.path.exists(playlist),
+        "playlist_ready": bool(segment_names),
+        "playlist_age": max(0.0, time.time() - playlist_mtime) if playlist_mtime else None,
+        "playlist_modified_at": playlist_mtime,
+        "segment_count": len(segments),
+        "bytes": sum(safe_file_size(path) for path in segments),
+        "media_sequence": media_sequence,
+        "target_duration": target_duration,
+        "last_segment": segment_names[-1] if segment_names else None,
+        "last_segment_size": safe_file_size(last_segment) if last_segment else 0,
+    }
+
+
+def score_stream_evidence(stream, args, failed, error_summary, progress, hls):
+    score = 0.0
+    reasons = []
+    assessment_runtime = stream.assessment_runtime
+    ramp = max(0.15, min(2.5, assessment_runtime / max(args.failure_ramp_seconds, 1.0)))
+    if assessment_runtime < args.min_assessment_seconds:
+        ramp *= 0.35
+
+    frame_count = number_or_zero(progress.get("frame"))
+    out_seconds = progress_seconds(progress.get("out_time") or progress.get("out_time_ms"))
+    speed = str(progress.get("speed", "")).strip()
+    speed_value = number_or_zero(speed.rstrip("x")) if speed else 0.0
+    progress_seen = frame_count > 0 or out_seconds > 0 or speed_value > 0
+
+    if progress_seen:
+        score += 95
+    if frame_count > 30:
+        score += 45
+    if out_seconds >= 5:
+        score += 50
+    if speed_value > 0:
+        score += 25
+
+    if hls.get("playlist_exists"):
+        score += 20
+    if hls.get("playlist_ready"):
+        score += 70
+    else:
+        score -= min(180, (45 + assessment_runtime * 1.8) * ramp)
+        reasons.append("playlist not ready")
+
+    playlist_age = hls.get("playlist_age")
+    stale_after = max(args.hls_time * 3, args.timeout, 15)
+    if playlist_age is not None and playlist_age <= stale_after:
+        score += 85
+    elif playlist_age is not None:
+        score -= min(220, (60 + max(0.0, playlist_age - stale_after) * 5) * ramp)
+        reasons.append(f"playlist stale {playlist_age:.1f}s")
+
+    if hls.get("segment_count", 0) > 0:
+        score += 45
+    if hls.get("bytes", 0) > 0:
+        score += 50
+    if hls.get("last_segment_size", 0) > 0:
+        score += 30
+    if assessment_runtime >= args.min_assessment_seconds:
+        score += 45
+    if stream.best_runtime >= args.min_assessment_seconds:
+        score += min(180, stream.best_runtime * 5)
+
+    lowered_error = (error_summary or "").lower()
+    if failed:
+        score -= min(160, (25 + stream.quick_failures * 12 + stream.failures * 4) * ramp)
+        if assessment_runtime < args.min_assessment_seconds:
+            reasons.append(f"still assessing ({assessment_runtime:.1f}/{args.min_assessment_seconds:.1f}s)")
+    else:
+        score += 55
+    if lowered_error:
+        score -= min(180, (30 + len(lowered_error.split("|")) * 12) * ramp)
+        reasons.append("ffmpeg reported errors")
+    else:
+        score += 20
+    if any(token in lowered_error for token in ("403", "404", "invalid data", "not found")):
+        score -= min(150, 60 * ramp)
+        reasons.append("hard upstream error")
+    if any(token in lowered_error for token in ("429", "too many requests", "rate limit")):
+        score -= min(220, 120 * ramp)
+        reasons.append("rate limited")
+    if failed and not progress_seen and not hls.get("playlist_ready") and assessment_runtime >= args.min_assessment_seconds:
+        score -= min(220, (80 + assessment_runtime * 2) * ramp)
+        reasons.append("no ffmpeg or HLS progress")
+
+    evidence = {
+        "assessment_runtime": round(assessment_runtime, 2),
+        "progress_seen": progress_seen,
+        "frame": frame_count,
+        "out_seconds": round(out_seconds, 2),
+        "speed": speed,
+        "playlist_ready": bool(hls.get("playlist_ready")),
+        "playlist_age": playlist_age,
+        "segment_count": hls.get("segment_count", 0),
+        "bytes": hls.get("bytes", 0),
+        "ramp": round(ramp, 3),
+        "reasons": reasons,
+    }
+    return score, evidence, reasons
 
 
 def short_url(url, width=88):
@@ -261,6 +473,58 @@ def ensure_output_dir(path):
             f"ufc cannot write to {path}: {exc}\n"
             "Fix the directory owner/group/ACL once; runtime should not need sudo."
         ) from exc
+
+
+def ensure_ffmpeg_log_dir(path):
+    path = os.path.abspath(os.path.expanduser(path or DEFAULT_FFMPEG_LOG_DIR))
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, ".obbystreams-log-write-test")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+        os.remove(probe)
+    except OSError as exc:
+        raise SystemExit(f"{APP_NAME} cannot write ffmpeg logs to {path}: {exc}") from exc
+    return path
+
+
+def log_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def filename_timestamp():
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def write_process_log(log_file, lock, kind, text):
+    if not log_file:
+        return
+    with lock:
+        log_file.write(f"{log_timestamp()} [{kind}] {text}\n")
+        log_file.flush()
+
+
+def open_ffmpeg_process_log(args, stream, cmd, encoder, proc):
+    filename = f"{filename_timestamp()}-pid{proc.pid}-link{stream.index + 1}-attempt{stream.attempts}.log"
+    path = os.path.join(args.ffmpeg_log_dir, filename)
+    log_file = open(path, "a", encoding="utf-8", buffering=1)
+    lock = threading.Lock()
+    metadata = {
+        "app": APP_NAME,
+        "pid": proc.pid,
+        "link_index": stream.index + 1,
+        "attempt": stream.attempts,
+        "url": stream.url,
+        "encoder": encoder.key,
+        "encoder_codec": encoder.codec,
+        "output_dir": args.output_dir,
+        "started_at": log_timestamp(),
+        "command": cmd,
+    }
+    log_file.write("# obbystreams ffmpeg process log\n")
+    log_file.write(json.dumps(metadata, ensure_ascii=True, sort_keys=True) + "\n")
+    log_file.flush()
+    return path, log_file, lock
 
 
 def ffmpeg_encoders():
@@ -370,6 +634,7 @@ def choose_encoder(args):
     aliases = {
         "auto": None,
         "gpu": None,
+        "gpu-only": "gpu-only",
         "gpu-trans": None,
         "nv": "nvenc",
         "nvidia": "nvenc",
@@ -385,6 +650,12 @@ def choose_encoder(args):
         "cpu": "cpu",
     }
     wanted = aliases[args.encoder]
+
+    if wanted == "gpu-only":
+        gpu_profiles = [p for p in profiles if p.key != "cpu"]
+        if not gpu_profiles:
+            raise SystemExit("obbystreams: --encoder gpu-only requested, but no accessible GPU encoder/device is available.")
+        return max(gpu_profiles, key=lambda p: p.score), profiles
 
     if wanted:
         if wanted in by_key:
@@ -447,7 +718,9 @@ def build_ffmpeg_cmd(args, url, encoder):
     ]
 
     if encoder.key in ("cpu", "nvenc"):
-        cmd += ["-profile:v", "high", "-level", "4.1"]
+        # Let the encoder choose the H.264 level. Forcing 4.1 makes NVENC fail
+        # hard on high frame-rate/resolution sources that exceed that level.
+        cmd += ["-profile:v", "high"]
 
     cmd += [
         "-c:a", "aac",
@@ -551,9 +824,10 @@ def is_ffmpeg_error_line(line):
     return any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500", "connection"))
 
 
-def stream_reader(stream, state, args, kind):
+def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=None):
     try:
         for line in iter(stream.readline, ""):
+            write_process_log(process_log, process_log_lock, kind, line.rstrip())
             if kind == "progress":
                 update_progress(state, line)
             else:
@@ -613,7 +887,7 @@ def render_live_panel(state, args, health, encoder, frame):
 
     ratio = 0.0
     if current.attempts:
-        ratio = min(1.0, current.best_runtime / max(args.quick_fail, 1.0))
+        ratio = min(1.0, current.assessment_runtime / max(args.min_assessment_seconds, 1.0))
 
     lines = [
         title,
@@ -623,6 +897,12 @@ def render_live_panel(state, args, health, encoder, frame):
         render_kv("hls", f"{len(seg_files)} segments | {seg_bytes / (1024 * 1024):.1f} MB | playlist {age}", body_width, args),
         render_kv("ffmpeg", f"frame {frame_no} | fps {fps} | bitrate {bitrate} | speed {speed} | out {out_time}", body_width, args),
         render_kv("process", f"pid {pid or 'waiting'} | cpu {f'{cpu_s:.1f}s' if cpu_s is not None else 'n/a'} | rss {f'{rss_mb:.0f} MB' if rss_mb is not None else 'n/a'}", body_width, args),
+        render_kv(
+            "score",
+            f"{current.last_score:.1f} {current.last_decision} | evidence {current.assessment_runtime:.1f}/{args.min_assessment_seconds:.1f}s",
+            body_width,
+            args,
+        ),
         render_kv("best", f"link {best.index + 1} | best run {fmt_duration(best.best_runtime)} | average {fmt_duration(best.average_runtime)}", body_width, args),
         "  " + progress_bar(ratio, max(10, body_width - 4), args),
     ]
@@ -674,6 +954,7 @@ def status_thread(state, args, health, encoder, interval=10):
             msg = (
                 f"status: link {current.index + 1}/{len(health)}, "
                 f"stream {fmt_duration(now - state['stream_start']) if state['stream_start'] else 'waiting'}, "
+                f"score {current.last_score:.1f} {current.last_decision}, "
                 f"speed {progress.get('speed', 'n/a')}, fps {progress.get('fps', 'n/a')}, "
                 f"last ffmpeg: {logs[-1] if logs else 'none'}"
             )
@@ -777,7 +1058,7 @@ def parser_for_args():
 
     enc = parser.add_mutually_exclusive_group()
     enc.add_argument("--encoder", default="auto",
-                     choices=["auto", "gpu", "gpu-trans", "nv", "nvidia", "nvenc", "nv-gpu-trans",
+                     choices=["auto", "gpu", "gpu-only", "gpu-trans", "nv", "nvidia", "nvenc", "nv-gpu-trans",
                               "intel", "qsv", "intel-gpu-trans", "amd", "amf", "amd-gpu-trans", "vaapi", "cpu"],
                      help="Transcode backend. auto tries GPU first and falls back to CPU.")
     enc.add_argument("--gpu", dest="encoder", action="store_const", const="gpu-trans",
@@ -807,6 +1088,8 @@ def parser_for_args():
     parser.add_argument("--hls-delete-threshold", default=4, type=int, help="Extra old HLS segments to keep")
     parser.add_argument("--gop", default=60, type=int, help="GOP / keyframe interval")
     parser.add_argument("--output-dir", default=DEFAULT_STREAM_DIR, dest="output_dir", help="HLS output directory")
+    parser.add_argument("--ffmpeg-log-dir", default=DEFAULT_FFMPEG_LOG_DIR, dest="ffmpeg_log_dir",
+                        help="Directory for one persistent log file per ffmpeg process")
     parser.add_argument("--no-restart", action="store_true", help="Disable auto-restart on ffmpeg exit")
     parser.add_argument("--restart-delay", default=2.0, type=float, help="Seconds between auto-restarts")
     parser.add_argument("--max-restart-delay", default=120.0, type=float, help="Maximum exponential retry backoff in seconds")
@@ -822,15 +1105,25 @@ def parser_for_args():
     parser.add_argument("--probesize", default=2_000_000, type=int, help="ffmpeg probe size in bytes")
     parser.add_argument("--quick-fail", default=30.0, type=float, dest="quick_fail",
                         help="A stream run shorter than this is treated as weak")
+    parser.add_argument("--min-assessment-seconds", default=15.0, type=float,
+                        help="Minimum cumulative runtime before a stream can be confirmed failed")
+    parser.add_argument("--success-score-threshold", default=180.0, type=float,
+                        help="Positive evidence score required to mark a stream healthy")
+    parser.add_argument("--failure-score-threshold", default=-120.0, type=float,
+                        help="Negative evidence score required before failure samples count")
+    parser.add_argument("--confirmed-failure-samples", default=2, type=int,
+                        help="Bad scoring samples required before rotating or stopping")
+    parser.add_argument("--failure-ramp-seconds", default=60.0, type=float,
+                        help="Seconds over which negative scoring ramps to full weight")
     parser.add_argument("--stop-after-failed-rounds", default=2, type=int,
-                        help="Stop after every link quick-fails this many full rounds in a row")
+                        help="Stop after every link confirms failure this many full rounds in a row")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg output")
     parser.add_argument("--print-cmd", action="store_true", help="Print the ffmpeg command and exit")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     return parser
 
 
-def retry_backoff_delay(stream, args, error_summary, return_code):
+def retry_backoff_delay(stream, args, error_summary, return_code, confirmed_failure=False):
     if return_code == 0:
         stream.backoff_until = 0.0
         return args.restart_delay
@@ -839,8 +1132,10 @@ def retry_backoff_delay(stream, args, error_summary, return_code):
     rate_limited = "429" in lowered or "too many requests" in lowered or "rate limit" in lowered
     if rate_limited:
         base = max(args.rate_limit_delay, args.restart_delay)
+    elif not confirmed_failure:
+        base = args.restart_delay
     else:
-        exponent = max(0, stream.consecutive_failures - 1)
+        exponent = max(0, stream.confirmed_failures - 1)
         base = args.restart_delay * (args.backoff_multiplier ** exponent)
     delay = min(args.max_restart_delay, base)
     jitter_ratio = max(0.0, args.backoff_jitter)
@@ -855,6 +1150,9 @@ def main():
     parser = parser_for_args()
     args = parser.parse_args()
     args.reconnect = not args.no_reconnect
+    args.min_assessment_seconds = max(15.0, float(args.min_assessment_seconds))
+    args.confirmed_failure_samples = max(1, int(args.confirmed_failure_samples))
+    args.failure_ramp_seconds = max(15.0, float(args.failure_ramp_seconds))
 
     urls = list(args.url or []) + list(args.link or []) + list(args.links or [])
     if not urls:
@@ -867,6 +1165,7 @@ def main():
         return
 
     ensure_output_dir(args.output_dir)
+    args.ffmpeg_log_dir = ensure_ffmpeg_log_dir(args.ffmpeg_log_dir)
 
     running = find_running_instances()
     if running:
@@ -925,7 +1224,9 @@ def main():
         else:
             print(render_kv("gpu", f"available: {available}", term_width(), args))
         print(render_kv("output", os.path.join(args.output_dir, "ufc.m3u8"), term_width(), args))
+        print(render_kv("ffmpeg logs", args.ffmpeg_log_dir, term_width(), args))
         print(render_kv("fallback", f"smart health scoring across {len(urls)} link(s)", term_width(), args))
+        print(render_kv("assessment", f"{args.min_assessment_seconds:.0f}s min, {args.confirmed_failure_samples} bad samples to fail", term_width(), args))
         print(render_kv("reconnect", "off" if not args.reconnect else f"on, max {args.reconnect_delay}s", term_width(), args))
         print(render_kv("backoff", f"{args.restart_delay:.1f}s base, {args.max_restart_delay:.0f}s max, {args.rate_limit_delay:.0f}s on 429", term_width(), args))
         print(render_kv("keys", "n/right-arrow next link, q quit", term_width(), args))
@@ -956,24 +1257,61 @@ def main():
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
             state["proc_obj"] = proc
             state["proc_pid"] = proc.pid
-            stdout_thread = threading.Thread(target=stream_reader, args=(proc.stdout, state, args, "progress"), daemon=True)
-            stderr_thread = threading.Thread(target=stream_reader, args=(proc.stderr, state, args, "stderr"), daemon=True)
+            log_path, process_log, process_log_lock = open_ffmpeg_process_log(args, current, cmd, encoder, proc)
+            emit(state, args, f"ffmpeg log -> {log_path}", "info")
+            stdout_thread = threading.Thread(target=stream_reader, args=(proc.stdout, state, args, "progress", process_log, process_log_lock), daemon=True)
+            stderr_thread = threading.Thread(target=stream_reader, args=(proc.stderr, state, args, "stderr", process_log, process_log_lock), daemon=True)
             stdout_thread.start()
             stderr_thread.start()
             proc.wait()
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
             state["proc_pid"] = None
 
             if state["interrupted"]:
+                write_process_log(process_log, process_log_lock, "exit", "interrupted")
+                process_log.close()
                 break
 
             elapsed = time.monotonic() - stream_start
             rc = proc.returncode
-            quick = False if state["manual_rotate"] else current.record_exit(elapsed, args.quick_fail, failed=(rc != 0))
             msg = f"ffmpeg exited code {rc}, ran {fmt_duration(elapsed)}"
             error_summary = ffmpeg_error_summary(state)
             if error_summary:
                 current.last_error = error_summary
                 msg += f" | ffmpeg: {error_summary}"
+            progress, _, _ = ffmpeg_snapshot(state)
+            hls = hls_probe(args.output_dir)
+            if state["manual_rotate"]:
+                assessment = {"decision": "manual", "score": current.last_score, "reasons": []}
+            else:
+                assessment = current.record_exit(elapsed, args, failed=(rc != 0), error_summary=error_summary, progress=progress, hls=hls)
+                reasons = assessment.get("reasons") or []
+                assessment_runtime = assessment.get("evidence", {}).get("assessment_runtime", current.assessment_runtime)
+                msg += (
+                    f" | score {assessment['score']:.1f}, "
+                    f"{assessment['decision']}, assessment {assessment_runtime:.1f}/{args.min_assessment_seconds:.1f}s"
+                )
+                if reasons:
+                    msg += f" ({'; '.join(reasons[:2])})"
+            write_process_log(
+                process_log,
+                process_log_lock,
+                "summary",
+                json.dumps(
+                    {
+                        "return_code": rc,
+                        "elapsed_seconds": round(elapsed, 3),
+                        "error_summary": error_summary,
+                        "progress": progress,
+                        "hls": hls,
+                        "assessment": assessment,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            )
+            process_log.close()
 
             if args.no_restart:
                 emit(state, args, msg + " - no-restart set, exiting.", "warn" if rc else "ok")
@@ -981,40 +1319,48 @@ def main():
 
             state["restarts"] += 1
             all_failed = False
+            confirmed_failure = assessment["decision"] == "failed"
+            still_assessing = assessment["decision"] == "assessing"
 
             if state["manual_rotate"]:
                 state["manual_rotate"] = False
                 msg += " - manual switch requested"
-            elif quick and len(health) > 1:
+            elif still_assessing:
+                msg += f" - retrying same link until at least {args.min_assessment_seconds:.0f}s of evidence"
+            elif confirmed_failure and len(health) > 1:
                 previous = state["url_index"]
                 state["url_index"], all_failed = next_stream_index(health, previous)
                 if all_failed:
                     state["url_index"] = 0
-                    msg += " - every link failed this round; returning to link 1"
+                    msg += " - every link has confirmed failure this round; returning to link 1"
                 else:
-                    msg += f" - weak stream, switching to link {state['url_index'] + 1}"
-            elif quick and len(health) == 1:
+                    msg += f" - confirmed weak stream, switching to link {state['url_index'] + 1}"
+                current.reset_assessment_window()
+            elif confirmed_failure and len(health) == 1:
                 all_failed = True
-                msg += " - only link failed quickly"
+                msg += " - only link has confirmed failure"
+                current.reset_assessment_window()
+            elif rc != 0:
+                msg += " - evidence is not bad enough to rotate; retrying same link"
             elif len(health) > 1:
                 # Long-lived streams earn priority, but still rotate after death so alternatives get sampled.
                 state["url_index"], all_failed = next_stream_index(health, state["url_index"])
                 if all_failed:
                     state["url_index"] = 0
-                    msg += " - every link failed this round; returning to link 1"
+                    msg += " - every link has confirmed failure this round; returning to link 1"
                 else:
                     msg += f" - stream ended, trying link {state['url_index'] + 1}"
 
-            current_backoff_delay = retry_backoff_delay(current, args, error_summary, rc)
-            if quick and all_failed:
+            current_backoff_delay = retry_backoff_delay(current, args, error_summary, rc, confirmed_failure=confirmed_failure)
+            if confirmed_failure and all_failed:
                 state["failed_rounds"] += 1
-            elif not quick:
+            elif not confirmed_failure:
                 state["failed_rounds"] = 0
             if args.stop_after_failed_rounds > 0 and state["failed_rounds"] >= args.stop_after_failed_rounds:
                 emit(
                     state,
                     args,
-                    f"{msg} - all links quick-failed {state['failed_rounds']} rounds in a row; stopping to avoid rate limits.",
+                    f"{msg} - all links confirmed failed {state['failed_rounds']} rounds in a row; stopping to avoid rate limits.",
                     "bad",
                 )
                 break

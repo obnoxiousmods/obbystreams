@@ -2,6 +2,18 @@
 
 All notable Obbystreams changes are tracked here.
 
+## 0.2.1 - 2026-04-18
+
+### Fixed
+
+- Restored the full stream health scorer, assessment window, evidence scoring, and confirmed failure logic from the deployed Obbystreams backend.
+- Restored transcoder support for `--ffmpeg-log-dir`, assessment thresholds, failure ramp settings, and strict GPU mode flags.
+- Restored the expanded example YAML keys used by the dashboard and transcoder wrapper.
+
+### Added
+
+- Regression coverage for health scoring, strict GPU mode, NVIDIA telemetry parsing, and transcoder command generation.
+
 ## 0.2.0 - 2026-04-18
 
 ### Added

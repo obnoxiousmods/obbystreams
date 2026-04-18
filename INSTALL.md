@@ -85,7 +85,13 @@ stream:
   command: /usr/bin/obbystreams
   encoder: auto
   output_dir: /var/www/live.obnoxious.lol/stream
+  ffmpeg_log_dir: ffmpegLogs
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
+  min_assessment_seconds: 15
+  success_score_threshold: 180
+  failure_score_threshold: -120
+  confirmed_failure_samples: 2
+  failure_ramp_seconds: 60
   links:
     - https://your-primary-source.example/live.m3u8
     - https://your-backup-source.example/live.m3u8
