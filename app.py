@@ -1726,6 +1726,13 @@ async def index(request):
     return FileResponse(STATIC_DIR / "index.html")
 
 
+def static_asset(name, media_type=None):
+    async def handler(request):
+        return FileResponse(STATIC_DIR / name, media_type=media_type)
+
+    return handler
+
+
 @asynccontextmanager
 async def lifespan(app):
     global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK
@@ -1750,6 +1757,12 @@ async def lifespan(app):
 
 routes = [
     Route("/", index),
+    Route("/robots.txt", static_asset("robots.txt", "text/plain")),
+    Route("/sitemap.xml", static_asset("sitemap.xml", "application/xml")),
+    Route("/site.webmanifest", static_asset("site.webmanifest", "application/manifest+json")),
+    Route("/favicon.svg", static_asset("favicon.svg", "image/svg+xml")),
+    Route("/favicon.ico", static_asset("favicon.svg", "image/svg+xml")),
+    Route("/og-image.png", static_asset("og-image.png", "image/png")),
     Route("/api/health", health),
     Route("/api/auth/login", login, methods=["POST"]),
     Route("/api/status", guarded(status)),

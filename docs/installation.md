@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Installation
+title: Install Obbystreams
+description: Production installation steps for Obbystreams with uv, npm, systemd, nginx, ArangoDB, and HLS output directories.
 ---
 
 # Installation

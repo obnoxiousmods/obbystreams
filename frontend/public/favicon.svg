@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Obbystreams icon</title>
+  <desc id="desc">Purple streaming control mark with signal bars.</desc>
+  <rect width="128" height="128" rx="24" fill="#111018"/>
+  <rect x="18" y="20" width="92" height="88" rx="18" fill="#191726" stroke="#7c3aed" stroke-width="4"/>
+  <path d="M41 43v42l36-21-36-21Z" fill="#a78bfa"/>
+  <path d="M84 38c8 7 12 16 12 26s-4 19-12 26" fill="none" stroke="#c4b5fd" stroke-width="6" stroke-linecap="round"/>
+  <path d="M94 27c12 10 18 23 18 37s-6 27-18 37" fill="none" stroke="#8b5cf6" stroke-width="6" stroke-linecap="round"/>
+</svg>

@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Configuration
+title: Obbystreams Configuration
+description: Configure dashboard auth, stream links, HLS output, health scoring, GPU mode, ffmpeg recovery, and ArangoDB persistence.
 ---
 
 # Configuration

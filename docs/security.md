@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Security
+title: Obbystreams Security
+description: Security model for Obbystreams dashboard access, session tokens, ArangoDB credentials, HLS routes, and production hardening.
 ---
 
 # Security

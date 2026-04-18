@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Obbystreams documentation preview</title>
+  <desc id="desc">Purple-accent documentation preview for Obbystreams.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111018"/>
+      <stop offset="0.6" stop-color="#191726"/>
+      <stop offset="1" stop-color="#2c2440"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="82" y="82" width="1036" height="466" rx="30" fill="#15131f" stroke="#4c3f70" stroke-width="2"/>
+  <rect x="126" y="130" width="182" height="30" rx="15" fill="#7c3aed"/>
+  <rect x="126" y="196" width="520" height="24" rx="12" fill="#f5f3ff"/>
+  <rect x="126" y="240" width="420" height="24" rx="12" fill="#c4b5fd"/>
+  <rect x="126" y="318" width="252" height="118" rx="18" fill="#211c32" stroke="#5b4b82"/>
+  <rect x="414" y="318" width="252" height="118" rx="18" fill="#211c32" stroke="#5b4b82"/>
+  <rect x="702" y="318" width="252" height="118" rx="18" fill="#211c32" stroke="#5b4b82"/>
+  <text x="126" y="505" fill="#f5f3ff" font-family="Inter, Arial, sans-serif" font-size="54" font-weight="800">Obbystreams Docs</text>
+  <text x="126" y="548" fill="#c4b5fd" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="600">Install, operate, secure, and release the HLS control plane</text>
+</svg>

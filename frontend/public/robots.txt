@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /hls/
+
+Sitemap: https://s.obby.ca/sitemap.xml

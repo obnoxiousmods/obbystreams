@@ -1,8 +1,30 @@
 title: Obbystreams
-description: Production HLS stream dashboard and control plane.
+tagline: Live HLS stream control, health telemetry, and recovery.
+description: Production documentation for Obbystreams, a Starlette, React, Tailwind, Video.js, and ffmpeg HLS stream control plane.
+url: "https://obnoxiousmods.github.io"
+baseurl: "/obbystreams"
+repository: obnoxiousmods/obbystreams
+lang: en_US
+timezone: America/Los_Angeles
 theme: minima
 markdown: kramdown
-plugins: []
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+author:
+  name: obnoxiousmods
+  url: "https://github.com/obnoxiousmods"
+logo: /assets/obbystreams-og.png
+image: /assets/obbystreams-og.png
+social:
+  name: Obbystreams
+  links:
+    - "https://github.com/obnoxiousmods/obbystreams"
+defaults:
+  - scope:
+      path: ""
+    values:
+      image: /assets/obbystreams-og.png
 exclude:
   - node_modules
   - vendor

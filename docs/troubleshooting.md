@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Troubleshooting
+title: Obbystreams Troubleshooting
+description: Diagnose Obbystreams nginx 502s, health 503s, blank players, ArangoDB errors, stale frontend assets, and HLS output problems.
 ---
 
 # Troubleshooting
