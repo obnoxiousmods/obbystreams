@@ -7,3 +7,7 @@
 - Dark pastel-purple frontend.
 - ArangoDB persistence for events, links, metrics, configs, and snapshots.
 - Example nginx and systemd deployment files.
+
+## Unreleased
+
+- Replace the static dashboard frontend with a React/Vite broadcast-ops control surface.

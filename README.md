@@ -1,6 +1,6 @@
 # Obbystreams
 
-Obbystreams is a Starlette dashboard for managing a live HLS stream produced by the `ufc` transcoder. It gives you a dark, modern control surface for starting/stopping the stream, managing fallback links, viewing HLS health, reading recent process logs, and persisting events/metrics to ArangoDB.
+Obbystreams is a Starlette dashboard for managing a live HLS stream produced by the `ufc` transcoder. It gives you a dark broadcast-ops control surface for starting/stopping the stream, managing fallback links, viewing HLS health, reading recent process logs, and persisting events/metrics to ArangoDB.
 
 The web UI is intentionally separate from the transcoder CLI. The service starts the configured stream command, captures its output, tracks process/HLS metrics, and stores operational history in ArangoDB.
 
@@ -121,8 +121,29 @@ Every ffmpeg child process writes a durable log file under `ffmpeg_log_dir` (def
 The repo includes:
 
 - uv dependency management with `pyproject.toml` and `uv.lock`.
-- CI for Ruff, mypy, Python compile checks, and example YAML validation.
+- React/Vite frontend source under `frontend/`, with production assets built into `static/`.
+- CI for Ruff, mypy, Python compile checks, frontend typecheck/lint/build, and example YAML validation.
 - CodeQL scanning.
-- Dependabot for GitHub Actions and Python dependencies.
+- Dependabot for GitHub Actions, Python, and npm dependencies.
 - Release workflow for tagged source archives and checksums.
 - Issue templates, pull request template, security policy, changelog, license, and CODEOWNERS.
+
+## Frontend Development
+
+The production service still serves static files from `static/`; React is a build-time dependency only.
+
+```bash
+npm ci
+npm run typecheck
+npm run lint
+npm run build
+```
+
+For local UI development, run the Starlette app on `127.0.0.1:8767`, then start Vite:
+
+```bash
+uv run uvicorn app:app --host 127.0.0.1 --port 8767 --reload
+npm run dev
+```
+
+Vite proxies `/api` and `/hls` to the Starlette backend.

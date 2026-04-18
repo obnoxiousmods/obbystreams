@@ -4,6 +4,13 @@ These steps assume Python 3, Starlette, Uvicorn, PyYAML, httpx, psutil, nginx, a
 
 ## 1. Install files
 
+Build the frontend assets before copying files:
+
+```bash
+npm ci
+npm run build
+```
+
 ```bash
 sudo mkdir -p /opt/obbystreams /etc/obbystreams
 sudo cp -a app.py static tools pyproject.toml uv.lock /opt/obbystreams/

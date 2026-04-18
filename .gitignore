@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+node_modules/
+frontend/dist/
+*.tsbuildinfo
 .coverage
 dist/
 build/
