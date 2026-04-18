@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Obbystreams control room preview</title>
+  <desc id="desc">Purple-accent live HLS stream dashboard preview.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111018"/>
+      <stop offset="0.55" stop-color="#191726"/>
+      <stop offset="1" stop-color="#26203a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1">
+      <stop offset="0" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#c4b5fd"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="64" y="64" width="1072" height="502" rx="34" fill="#15131f" stroke="#3c315f" stroke-width="2"/>
+  <rect x="104" y="106" width="460" height="258" rx="18" fill="#0b0a10" stroke="#4c3f70" stroke-width="2"/>
+  <path d="M290 177v116l100-58-100-58Z" fill="#a78bfa"/>
+  <path d="M428 173c18 16 27 36 27 62s-9 46-27 62" fill="none" stroke="#c4b5fd" stroke-width="10" stroke-linecap="round"/>
+  <rect x="104" y="396" width="992" height="44" rx="12" fill="#211c32"/>
+  <rect x="132" y="410" width="312" height="16" rx="8" fill="url(#accent)"/>
+  <circle cx="492" cy="418" r="13" fill="#c4b5fd"/>
+  <rect x="606" y="116" width="420" height="28" rx="14" fill="#7c3aed"/>
+  <rect x="606" y="168" width="318" height="18" rx="9" fill="#d8b4fe" opacity="0.9"/>
+  <rect x="606" y="208" width="376" height="18" rx="9" fill="#a78bfa" opacity="0.78"/>
+  <rect x="606" y="278" width="180" height="86" rx="16" fill="#201b30" stroke="#5b4b82"/>
+  <rect x="818" y="278" width="180" height="86" rx="16" fill="#201b30" stroke="#5b4b82"/>
+  <text x="104" y="505" fill="#f5f3ff" font-family="Inter, Arial, sans-serif" font-size="54" font-weight="800">Obbystreams</text>
+  <text x="104" y="548" fill="#c4b5fd" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="600">Live HLS stream control, health, telemetry, and recovery</text>
+</svg>

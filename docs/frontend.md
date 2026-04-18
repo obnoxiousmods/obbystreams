@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Frontend
+title: Obbystreams Frontend
+description: React, Vite, Tailwind CSS, TypeScript, and custom Video.js controls for the Obbystreams live stream dashboard.
 ---
 
 # Frontend

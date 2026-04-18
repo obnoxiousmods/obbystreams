@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Release
+title: Obbystreams Release Process
+description: Versioning, validation, GitHub Releases, release artifacts, GitHub Pages, and wiki publishing for Obbystreams.
 ---
 
 # Release

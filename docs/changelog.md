@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Changelog
+title: Obbystreams Changelog
+description: Release history, current version notes, and links to Obbystreams GitHub release details.
 ---
 
 # Changelog

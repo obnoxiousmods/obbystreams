@@ -1,6 +1,7 @@
 ---
 layout: page
-title: Operations
+title: Obbystreams Operations
+description: Day-to-day operating guide for Obbystreams stream actions, watchdog recovery, HLS health, GPU telemetry, logs, and deploys.
 ---
 
 # Operations

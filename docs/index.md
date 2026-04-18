@@ -1,6 +1,8 @@
 ---
 layout: home
 title: Obbystreams Documentation
+description: Install, operate, secure, and release Obbystreams, a production HLS stream control plane for Starlette, React, Video.js, and ffmpeg.
+permalink: /
 ---
 
 # Obbystreams Documentation

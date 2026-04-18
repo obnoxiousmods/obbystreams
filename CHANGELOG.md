@@ -2,6 +2,13 @@
 
 All notable Obbystreams changes are tracked here.
 
+## Unreleased
+
+### Added
+
+- Expanded live dashboard SEO metadata with canonical URL, Open Graph, Twitter Card, JSON-LD, manifest, favicon, robots, sitemap, and social preview assets.
+- Expanded GitHub Pages SEO config with canonical site URL, base URL, page descriptions, social image, Jekyll SEO tag, Jekyll sitemap, and robots output.
+
 ## 0.2.1 - 2026-04-18
 
 ### Fixed

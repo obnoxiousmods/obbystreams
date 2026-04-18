@@ -1,6 +1,7 @@
 ---
 layout: page
-title: API
+title: Obbystreams API Reference
+description: Authentication, health checks, stream actions, HLS proxy behavior, ArangoDB status, and NVIDIA SMI telemetry endpoints for Obbystreams.
 ---
 
 # API

@@ -3,10 +3,69 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Obbystreams Control</title>
+    <title>Obbystreams | Live HLS Stream Control Dashboard</title>
+    <meta
+      name="description"
+      content="Obbystreams is a live HLS stream control dashboard for stream health, GPU telemetry, Video.js playback, link management, and ffmpeg recovery."
+    />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <meta name="application-name" content="Obbystreams" />
+    <meta name="theme-color" content="#7c3aed" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="canonical" href="https://s.obby.ca/" />
+    <link rel="manifest" href="/static/site.webmanifest" />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <meta property="og:site_name" content="Obbystreams" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://s.obby.ca/" />
+    <meta property="og:title" content="Obbystreams | Live HLS Stream Control Dashboard" />
+    <meta
+      property="og:description"
+      content="Control a resilient HLS stream with health scoring, GPU telemetry, custom Video.js playback, source links, and ffmpeg recovery."
+    />
+    <meta property="og:image" content="https://s.obby.ca/static/og-image.png" />
+    <meta property="og:image:secure_url" content="https://s.obby.ca/static/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Obbystreams live HLS stream control dashboard preview" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Obbystreams | Live HLS Stream Control Dashboard" />
+    <meta
+      name="twitter:description"
+      content="Live HLS stream control, Video.js playback, GPU telemetry, source links, and ffmpeg recovery."
+    />
+    <meta name="twitter:image" content="https://s.obby.ca/static/og-image.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Obbystreams",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Linux",
+        "url": "https://s.obby.ca/",
+        "codeRepository": "https://github.com/obnoxiousmods/obbystreams",
+        "description": "Live HLS stream control dashboard for stream health, GPU telemetry, Video.js playback, link management, and ffmpeg recovery.",
+        "image": "https://s.obby.ca/static/og-image.png",
+        "softwareVersion": "0.2.1"
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <main>
+        <h1>Obbystreams Live HLS Stream Control Dashboard</h1>
+        <p>
+          Obbystreams manages resilient HLS streaming with stream health scoring, GPU telemetry, source link
+          management, Video.js playback, and ffmpeg recovery.
+        </p>
+        <p>
+          Documentation: <a href="https://obnoxiousmods.github.io/obbystreams/">Obbystreams docs</a>.
+          Source: <a href="https://github.com/obnoxiousmods/obbystreams">GitHub repository</a>.
+        </p>
+      </main>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
