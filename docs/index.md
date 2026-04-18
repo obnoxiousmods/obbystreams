@@ -53,8 +53,8 @@ The dashboard and transcoder are separate responsibilities. The dashboard starts
 s.obby.ca                          Public nginx vhost
 ```
 
-## Release 0.2.0
+## Release 0.2.1
 
-Version `0.2.0` is the frontend and documentation release. It adds the React/Tailwind dashboard, custom Video.js controls, purple accent theming, GitHub Pages docs, release bundles, and a GitHub wiki publishing pass.
+Version `0.2.1` is the corrected frontend and documentation release. It includes the React/Tailwind dashboard, custom Video.js controls, purple accent theming, GitHub Pages docs, release bundles, and restored advanced stream health parity with the deployed service.
 
-Read the full notes in [releases/v0.2.0.md](releases/v0.2.0.md).
+Read the full notes in [releases/v0.2.1.md](releases/v0.2.1.md).

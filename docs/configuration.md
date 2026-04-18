@@ -41,12 +41,19 @@ stream:
   command: /usr/bin/obbystreams
   encoder: auto
   output_dir: /var/www/live.obnoxious.lol/stream
+  ffmpeg_log_dir: ffmpegLogs
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
   auto_recover: true
   auto_restart_on_exit: true
   watchdog_restart_cooldown: 20
   startup_grace_seconds: 25
   playlist_stale_seconds: 25
+  min_assessment_seconds: 15
+  health_sample_interval: 2
+  success_score_threshold: 180
+  failure_score_threshold: -120
+  confirmed_failure_samples: 2
+  failure_ramp_seconds: 60
   bitrate: 6M
   audio_bitrate: 192k
   restart_delay: 2
@@ -63,17 +70,24 @@ Important keys:
 - `command`: executable launched by the dashboard when starting the managed stream.
 - `encoder`: `auto`, `gpu-only`, or `cpu`.
 - `output_dir`: directory where `ufc.m3u8` and segments are written.
+- `ffmpeg_log_dir`: durable ffmpeg log directory used by the transcoder wrapper.
 - `public_hls_url`: public HLS playlist used by the dashboard and HLS proxy fallback.
 - `auto_recover`: enables watchdog restarts.
 - `auto_restart_on_exit`: restarts the stream after unexpected process exit when links exist.
 - `watchdog_restart_cooldown`: minimum seconds between watchdog restart actions.
 - `startup_grace_seconds`: startup window before missing ffmpeg child or playlist output is considered unhealthy.
 - `playlist_stale_seconds`: maximum playlist age before the health endpoint reports stale output.
+- `min_assessment_seconds`: minimum runtime evidence before a failure can be confirmed.
+- `health_sample_interval`: minimum interval between health scorer samples.
+- `success_score_threshold`: score required to mark output healthy.
+- `failure_score_threshold`: score low enough to count as bad evidence.
+- `confirmed_failure_samples`: repeated bad samples required before confirmed failure.
+- `failure_ramp_seconds`: time window used to ramp failure evidence.
 - `bitrate` and `audio_bitrate`: forwarded to the transcoder command.
 - `restart_delay`, `max_restart_delay`, `rate_limit_delay`, `stop_after_failed_rounds`: forwarded to the transcoder wrapper when configured.
 - `links`: source HLS links used by the transcoder.
 
-Changing links, encoder, bitrate, audio bitrate, output directory, public HLS URL, or transcoder restart parameters restarts a running managed stream so the new settings take effect.
+Changing links, encoder, bitrate, audio bitrate, output directory, public HLS URL, ffmpeg log directory, assessment thresholds, or transcoder restart parameters restarts a running managed stream so the new settings take effect.
 
 ## arangodb
 
