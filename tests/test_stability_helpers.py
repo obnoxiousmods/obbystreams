@@ -3,7 +3,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import normalize_config, normalize_links, rewrite_playlist, safe_hls_path, valid_stream_url
+from app import (
+    analyze_nvidia_smi,
+    merge_nvidia_processes,
+    normalize_config,
+    normalize_links,
+    parse_nvidia_gpu_csv,
+    parse_nvidia_pmon,
+    rewrite_playlist,
+    safe_hls_path,
+    valid_stream_url,
+)
 
 
 def test_normalize_links_filters_invalid_and_deduplicates():
@@ -58,3 +68,17 @@ def test_valid_stream_url():
     assert valid_stream_url("http://example.com/live.m3u8")
     assert not valid_stream_url("ftp://example.com/live.m3u8")
     assert not valid_stream_url("example.com/live.m3u8")
+
+
+def test_nvidia_smi_parsers_and_analysis_detect_ffmpeg_activity():
+    gpus = parse_nvidia_gpu_csv(
+        "0, RTX 4090, GPU-abc, 550.54, P0, 61, 72, 22, 24564, 8192, 16372, 240.5, 450.0, 2550, 10501\n"
+    )
+    processes = merge_nvidia_processes([], parse_nvidia_pmon("# gpu pid type sm mem enc dec command\n0 1234 C 42 15 65 0 ffmpeg\n"), gpus)
+    analysis = analyze_nvidia_smi(gpus, processes, {"gpus": {"returncode": 0}})
+
+    assert gpus[0]["memory_used_pct"] == 33.3
+    assert processes[0]["is_ffmpeg"] is True
+    assert analysis["available"] is True
+    assert analysis["summary"]["stream_gpu_active"] is True
+    assert analysis["summary"]["ffmpeg_process_count"] == 1

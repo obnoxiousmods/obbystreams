@@ -1,6 +1,6 @@
 [project]
 name = "obbystreams"
-version = "0.1.0"
+version = "0.2.0"
 description = "Modern Starlette dashboard for managing resilient HLS stream transcoding."
 readme = "README.md"
 requires-python = ">=3.11"

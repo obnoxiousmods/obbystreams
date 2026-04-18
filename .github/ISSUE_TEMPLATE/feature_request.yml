@@ -1,15 +1,53 @@
 name: Feature request
-description: Suggest an improvement.
+description: Suggest an improvement to Obbystreams.
 title: "[Feature]: "
-labels: ["enhancement"]
+labels: ["enhancement", "needs-triage"]
 body:
-  - type: textarea
-    id: goal
+  - type: dropdown
+    id: area
     attributes:
-      label: Goal
+      label: Area
+      options:
+        - Dashboard frontend
+        - Custom player controls
+        - Stream process management
+        - HLS health or proxy
+        - Config and deployment
+        - ArangoDB persistence
+        - Documentation
+        - Release automation
+        - Other
     validations:
       required: true
   - type: textarea
-    id: details
+    id: problem
     attributes:
-      label: Details
+      label: Problem
+      description: What operator pain or product gap should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, UI, API, config, or release change you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: operator-impact
+    attributes:
+      label: Operator impact
+      description: Mention deploy, rollback, security, performance, docs, or monitoring implications.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submit checks
+      options:
+        - label: This request does not include secrets or private stream URLs.
+          required: true
+        - label: I checked existing issues and release notes for similar work.
+          required: false

@@ -8,28 +8,80 @@ on:
 
 permissions:
   contents: write
-  attestations: write
   id-token: write
+  attestations: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-      - name: Build source archive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install Python dependencies
+        run: uv sync --dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Validate backend
+        run: |
+          uv run pytest
+          uv run ruff check .
+          uv run mypy app.py
+          uv run python -m py_compile app.py tools/bootstrap_arango.py
+
+      - name: Validate and build frontend
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run build
+
+      - name: Select release notes
         run: |
           mkdir -p dist
-          git archive --format=tar.gz --prefix=obbystreams/ HEAD > dist/obbystreams-source.tar.gz
-      - name: Generate checksums
+          NOTES="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$NOTES" ]; then
+            NOTES="CHANGELOG.md"
+          fi
+          awk 'NR == 1 && $0 == "---" { skipping = 1; next } skipping && $0 == "---" { skipping = 0; next } !skipping { print }' "$NOTES" > dist/RELEASE_NOTES.md
+          echo "RELEASE_NOTES=dist/RELEASE_NOTES.md" >> "$GITHUB_ENV"
+
+      - name: Build release artifacts
         run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-manual}"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="obbystreams-${TAG}/" HEAD > "dist/obbystreams-${TAG}-source.tar.gz"
+          tar -czf "dist/obbystreams-${TAG}-static.tar.gz" --transform "s,^,obbystreams-${TAG}/," static
+          tar -czf "dist/obbystreams-${TAG}-install-bundle.tar.gz" \
+            --transform "s,^,obbystreams-${TAG}/," \
+            app.py bin static tools examples systemd nginx docs \
+            pyproject.toml uv.lock package.json package-lock.json \
+            README.md INSTALL.md CONTRIBUTING.md SECURITY.md CHANGELOG.md LICENSE
           cd dist
           sha256sum * > SHA256SUMS
+
       - name: Upload release artifacts
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ env.RELEASE_NOTES }}
+          fail_on_unmatched_files: true
+          make_latest: true
           files: |
-            dist/obbystreams-source.tar.gz
+            dist/obbystreams-${{ github.ref_name }}-source.tar.gz
+            dist/obbystreams-${{ github.ref_name }}-static.tar.gz
+            dist/obbystreams-${{ github.ref_name }}-install-bundle.tar.gz
             dist/SHA256SUMS
-          generate_release_notes: true

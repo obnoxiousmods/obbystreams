@@ -1,39 +1,82 @@
 # Obbystreams
 
-Obbystreams is a Starlette dashboard for managing a live HLS stream produced by the `ufc` transcoder. It gives you a dark, modern control surface for starting/stopping the stream, managing fallback links, viewing HLS health, reading recent process logs, and persisting events/metrics to ArangoDB.
+Obbystreams is a production dashboard for running a resilient HLS stream. It wraps the `ufc` transcoder, controls start/stop/restart from the browser, watches playlist and process health, persists operational history to ArangoDB, and serves a React/Tailwind control room at `s.obby.ca`.
 
-The web UI is intentionally separate from the transcoder CLI. The service starts the configured stream command, captures its output, tracks process/HLS metrics, and stores operational history in ArangoDB.
+The project is intentionally small: one Starlette service, one Vite-built frontend, one managed transcoder process, one YAML configuration file, and optional ArangoDB persistence. The service is designed to sit behind nginx on `127.0.0.1`, while nginx handles TLS and public traffic.
 
-## Features
+## Highlights
 
+- React 19 + Vite + Tailwind CSS frontend with a purple accent system, responsive control panels, and custom Video.js live-stream controls.
 - Start, stop, and restart the managed stream from the browser.
-- Add, remove, and reorder stream links.
-- Start with `kill_existing: true` so an old `ufc`/`obbystreams` process can be killed before a new managed stream starts.
-- View HLS metrics: playlist existence, playlist age, segment count, and bytes on disk.
-- View process metrics: managed PID, CPU, RSS, and child process data.
-- See recent stream events and captured CLI/ffmpeg logs.
-- Persist events, link changes, metrics, configs, and snapshots to ArangoDB.
-- Configurable through `/etc/obbystreams/obbystreams.yaml`.
-- Runs behind nginx at `s.obby.ca` by default.
+- Add, remove, deduplicate, and reorder HLS input links.
+- Kill existing unmanaged `ufc` or `obbystreams` processes before launching a new managed stream.
+- Track HLS freshness, segment count, playlist readiness, target duration, media sequence, and written bytes.
+- Track managed process PID, runtime, CPU, RSS, child processes, exits, and watchdog restarts.
+- Proxy `/hls/*` through the dashboard so the player can use local output first and configured upstream output as fallback.
+- Persist events, logs, metrics, configs, links, and snapshots to ArangoDB when enabled.
+- Expose `/api/health` for systemd, nginx, uptime checks, and external monitoring.
+- Ship production examples for systemd, nginx, ArangoDB bootstrap, GitHub Actions CI, GitHub Releases, GitHub Pages, issue templates, and release notes.
 
-## Layout
+## Repository Layout
 
 ```text
-/opt/obbystreams/                  # installed app
-/etc/obbystreams/obbystreams.yaml  # live config with secrets
-/usr/bin/obbystreams               # stream command wrapper
+app.py                         Starlette backend and stream manager
+bin/obbystreams                Resilient HLS transcoder wrapper
+frontend/                      React, TypeScript, Video.js, Tailwind UI source
+static/                        Built frontend served by Starlette
+examples/obbystreams.example.yaml
+tools/bootstrap_arango.py      Scoped ArangoDB user/database bootstrap
+systemd/obbystreams.service    Production service unit
+nginx/s.obby.ca                Production reverse proxy example
+docs/                          GitHub Pages documentation source
+```
+
+## Quick Start
+
+Install Python dependencies, build the frontend, and run the backend locally:
+
+```bash
+uv sync --dev
+npm ci
+npm run build
+export OBBYSTREAMS_CONFIG=examples/obbystreams.example.yaml
+uv run uvicorn app:app --host 127.0.0.1 --port 8767 --reload
+```
+
+Open `http://127.0.0.1:8767`.
+
+For active frontend development, keep the Starlette app running and start Vite in another shell:
+
+```bash
+npm run dev
+```
+
+Vite proxies `/api` and `/hls` to the backend on `127.0.0.1:8767`.
+
+## Production Model
+
+Default production paths:
+
+```text
+/opt/obbystreams/                  Installed application
+/etc/obbystreams/obbystreams.yaml  Live config with credentials
+/usr/bin/obbystreams               Transcoder command wrapper
+/var/www/live.obnoxious.lol/stream HLS output directory
 /etc/systemd/system/obbystreams.service
 /etc/nginx/sites-available/s.obby.ca
 ```
 
+The service should run as an unprivileged user with write access to the HLS output directory and read access to `/etc/obbystreams/obbystreams.yaml`. nginx should proxy public traffic to `http://127.0.0.1:8767`.
+
 ## Configuration
 
-Start from `examples/obbystreams.example.yaml`:
+Start from [examples/obbystreams.example.yaml](examples/obbystreams.example.yaml):
 
 ```yaml
 server:
   host: 127.0.0.1
   port: 8767
+  workers: 1
 
 dashboard:
   password: "change-me"
@@ -44,9 +87,20 @@ stream:
   encoder: auto
   output_dir: /var/www/live.obnoxious.lol/stream
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
+  auto_recover: true
+  auto_restart_on_exit: true
+  watchdog_restart_cooldown: 20
+  startup_grace_seconds: 25
+  playlist_stale_seconds: 25
   bitrate: 6M
   audio_bitrate: 192k
-  links: []
+  restart_delay: 2
+  max_restart_delay: 120
+  rate_limit_delay: 180
+  stop_after_failed_rounds: 2
+  links:
+    - https://example.com/primary/live.m3u8
+    - https://example.com/backup/live.m3u8
 
 arangodb:
   enabled: true
@@ -56,60 +110,68 @@ arangodb:
   password: "change-me"
 ```
 
-## ArangoDB Bootstrap
+Use long random values for `dashboard.password`, `dashboard.session_token`, and `arangodb.password`. Keep the live YAML mode `640` or tighter.
 
-Use a root ArangoDB credential once to create a scoped database user:
+## API Summary
+
+Authenticated endpoints accept either the `x-obbystreams-token` header or the `obbystreams_token` cookie.
+
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/health` | No | Readiness and liveness checks |
+| `POST` | `/api/auth/login` | Password | Create dashboard token cookie |
+| `GET` | `/api/status` | Yes | Current config, process, HLS, logs, events, runtime |
+| `GET` | `/api/config` | Yes | Sanitized runtime config |
+| `PUT` | `/api/config` | Yes | Update stream config and restart when required |
+| `POST` | `/api/links` | Yes | Add a stream link |
+| `POST` | `/api/links/remove` | Yes | Remove a stream link |
+| `POST` | `/api/stream/start` | Yes | Start managed stream |
+| `POST` | `/api/stream/stop` | Yes | Stop managed stream |
+| `POST` | `/api/stream/restart` | Yes | Restart managed stream |
+| `GET` | `/api/arango` | Yes | ArangoDB connectivity status |
+| `GET` | `/api/nvidia-smi` | Yes | NVIDIA GPU telemetry and ffmpeg/NVENC visibility |
+| `GET` | `/hls/{path}` | No | Local-first HLS proxy |
+
+Full API details live in [docs/api.md](docs/api.md).
+
+## Documentation
+
+- [Installation](INSTALL.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+- [GitHub Pages docs](docs/index.md)
+- [Release process](docs/release.md)
+- [Troubleshooting](docs/troubleshooting.md)
+
+After GitHub Pages is enabled for this repository, the published docs are available at `https://obnoxiousmods.github.io/obbystreams/`.
+
+## Releases And Packages
+
+Tagged releases publish release assets rather than a package registry image:
+
+- `obbystreams-vX.Y.Z-source.tar.gz` contains the repository source at the tag.
+- `obbystreams-vX.Y.Z-static.tar.gz` contains the built frontend served by Starlette.
+- `obbystreams-vX.Y.Z-install-bundle.tar.gz` contains the deployable application files, examples, service files, and docs.
+- `SHA256SUMS` contains checksums for release artifacts.
+
+The release workflow runs on `v*.*.*` tags. See [docs/release.md](docs/release.md) for the checklist.
+
+## Validation
+
+Run these before pushing changes:
 
 ```bash
-python3 tools/bootstrap_arango.py \
-  --root-password 'your-root-password' \
-  --app-password 'long-random-app-password'
+npm run typecheck
+npm run lint
+npm run build
+npm audit --audit-level=moderate
+uv run pytest
+uv run ruff check .
+uv run mypy app.py
+uv run python -m py_compile app.py tools/bootstrap_arango.py
 ```
 
-The app only needs the scoped `obbystreams_app` account after bootstrap.
+## License
 
-## Manual Development
-
-```bash
-uv sync --dev
-export OBBYSTREAMS_CONFIG=/etc/obbystreams/obbystreams.yaml
-uv run uvicorn app:app --host 127.0.0.1 --port 8767 --reload
-```
-
-Then open `http://127.0.0.1:8767`.
-
-## API
-
-- `POST /api/auth/login`
-- `GET /api/health` (readiness/liveness for monitoring)
-- `GET /api/status`
-- `GET /api/config`
-- `PUT /api/config`
-- `POST /api/links`
-- `POST /api/links/remove`
-- `POST /api/stream/start`
-- `POST /api/stream/stop`
-- `POST /api/stream/restart`
-- `GET /api/arango`
-
-Authenticated API calls use `x-obbystreams-token` or the `obbystreams_token` cookie.
-
-`/api/health` is intentionally unauthenticated so systemd/nginx/monitoring checks can probe readiness.
-
-## Production Notes
-
-- Run the web service as an unprivileged user that can write the HLS output directory.
-- Keep `/etc/obbystreams/obbystreams.yaml` mode `640` or tighter because it contains dashboard and ArangoDB credentials.
-- Keep the actual transcoder as `/usr/bin/ufc`; `/usr/bin/obbystreams` is a wrapper for product naming.
-- nginx should proxy only to `127.0.0.1:8767`.
-
-## Repository Features
-
-The repo includes:
-
-- uv dependency management with `pyproject.toml` and `uv.lock`.
-- CI for Ruff, mypy, Python compile checks, and example YAML validation.
-- CodeQL scanning.
-- Dependabot for GitHub Actions and Python dependencies.
-- Release workflow for tagged source archives and checksums.
-- Issue templates, pull request template, security policy, changelog, license, and CODEOWNERS.
+MIT. See [LICENSE](LICENSE).
