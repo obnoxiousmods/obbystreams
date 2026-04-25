@@ -39,6 +39,7 @@ READER_TASK = None
 PROCESS_LOCK = asyncio.Lock()
 WATCHDOG_TASK = None
 WATCHDOG_LAST_ACTION = 0.0
+STREAM_DESIRED_STATE = "running"
 NVIDIA_SMI_CACHE_SECONDS = 5.0
 NVIDIA_SMI_CACHE: dict = {"at": 0.0, "payload": None}
 NVIDIA_SMI_LOCK = asyncio.Lock()
@@ -721,6 +722,16 @@ def kill_existing_streams():
     return killed
 
 
+def should_watchdog_restart_exited_process(config, desired_state):
+    stream = config.get("stream", {})
+    return (
+        desired_state == "running"
+        and stream.get("auto_recover", True)
+        and stream.get("auto_restart_on_exit", True)
+        and bool(stream.get("links"))
+    )
+
+
 def safe_stat_size(path):
     try:
         return path.stat().st_size
@@ -1248,6 +1259,7 @@ def status_payload():
             "app_started_at": APP_STARTED_AT,
             "app_uptime_seconds": round(max(0.0, time.time() - (APP_STARTED_AT / 1000)), 2) if APP_STARTED_AT else None,
             "arango_queue_depth": ARANGO_QUEUE.qsize() if ARANGO_QUEUE else 0,
+            "stream_desired_state": STREAM_DESIRED_STATE,
         },
     }
     queue_arango_insert("metrics", {"ts": now_ms(), "payload": payload})
@@ -1467,27 +1479,37 @@ def terminate_process_tree(proc, timeout=5):
     return True
 
 
-async def stop_managed_process(reason):
-    global PROCESS, READER_TASK
+async def stop_managed_process(reason, kill_orphans=True):
+    global PROCESS, READER_TASK, STARTED_AT
     proc = PROCESS
     if not proc or proc.poll() is not None:
+        if proc and proc.poll() is not None:
+            RUNTIME["last_exit_code"] = proc.poll()
         PROCESS = None
+        STARTED_AT = None
         STREAM_HEALTH_SCORER.reset()
-        return False
-    await asyncio.to_thread(terminate_process_tree, proc)
+        killed = await asyncio.to_thread(kill_existing_streams) if kill_orphans else []
+        if killed:
+            event("killed leftover stream instance(s)", "warn", {"processes": killed})
+        return bool(killed)
+    stopped = await asyncio.to_thread(terminate_process_tree, proc)
     if READER_TASK and not READER_TASK.done():
         READER_TASK.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await READER_TASK
     RUNTIME["last_exit_code"] = proc.poll()
     PROCESS = None
+    STARTED_AT = None
     STREAM_HEALTH_SCORER.reset()
+    killed = await asyncio.to_thread(kill_existing_streams) if kill_orphans else []
+    if killed:
+        event("killed leftover stream instance(s)", "warn", {"processes": killed})
     event(reason, "warn")
-    return True
+    return bool(stopped or killed)
 
 
 def start_managed_process(config, links, kill_existing=True):
-    global PROCESS, STARTED_AT, READER_TASK
+    global PROCESS, STARTED_AT, READER_TASK, STREAM_DESIRED_STATE
     if not links:
         raise ValueError("no links configured")
     if kill_existing:
@@ -1502,6 +1524,7 @@ def start_managed_process(config, links, kill_existing=True):
         RUNTIME["start_failures"] += 1
         raise
     STARTED_AT = now_ms()
+    STREAM_DESIRED_STATE = "running"
     STREAM_HEALTH_SCORER.reset(pid=PROCESS.pid, started_at=STARTED_AT)
     READER_TASK = asyncio.create_task(read_process_output(PROCESS))
     RUNTIME["stream_starts"] += 1
@@ -1529,7 +1552,7 @@ async def restart_managed_with_config(reason):
 
 
 async def start_stream(request):
-    global PROCESS
+    global PROCESS, STREAM_DESIRED_STATE
     try:
         body = await parse_json_body(request)
     except ValueError as exc:
@@ -1544,6 +1567,7 @@ async def start_stream(request):
             return JSONResponse({"ok": False, "error": "managed stream already running"}, status_code=409)
         try:
             pid, cmd = start_managed_process(config, links, kill_existing=body.get("kill_existing", True))
+            STREAM_DESIRED_STATE = "running"
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except OSError as exc:
@@ -1552,20 +1576,25 @@ async def start_stream(request):
 
 
 async def stop_stream(request):
+    global STREAM_DESIRED_STATE, WATCHDOG_LAST_ACTION
     async with PROCESS_LOCK:
+        STREAM_DESIRED_STATE = "stopped"
+        WATCHDOG_LAST_ACTION = time.monotonic()
         stopped = await stop_managed_process("stream stopped")
         return JSONResponse({"ok": True, "stopped": stopped})
 
 
 async def restart_stream(request):
+    global STREAM_DESIRED_STATE
     async with PROCESS_LOCK:
+        STREAM_DESIRED_STATE = "running"
         if PROCESS and PROCESS.poll() is None:
             await stop_managed_process("stream stopped")
     return await start_stream(request)
 
 
 async def watchdog_loop():
-    global WATCHDOG_LAST_ACTION, PROCESS
+    global WATCHDOG_LAST_ACTION, PROCESS, STARTED_AT
     while True:
         try:
             await asyncio.sleep(2)
@@ -1576,7 +1605,12 @@ async def watchdog_loop():
             restart_cooldown = float(stream.get("watchdog_restart_cooldown", 20))
             async with PROCESS_LOCK:
                 if not PROCESS or PROCESS.poll() is not None:
-                    if stream.get("auto_restart_on_exit", True) and stream.get("links"):
+                    if PROCESS and PROCESS.poll() is not None:
+                        RUNTIME["last_exit_code"] = PROCESS.poll()
+                        PROCESS = None
+                        STARTED_AT = None
+                        STREAM_HEALTH_SCORER.reset()
+                    if should_watchdog_restart_exited_process(config, STREAM_DESIRED_STATE):
                         now = time.monotonic()
                         if now - WATCHDOG_LAST_ACTION < restart_cooldown:
                             continue
