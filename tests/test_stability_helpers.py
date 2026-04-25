@@ -14,6 +14,7 @@ from app import (
     parse_nvidia_process_csv,
     rewrite_playlist,
     safe_hls_path,
+    should_watchdog_restart_exited_process,
     valid_stream_url,
 )
 
@@ -175,6 +176,12 @@ def test_normalize_config_rejects_unknown_encoder_mode():
 
 def test_status_lines_do_not_replay_old_errors_as_new_errors():
     assert classify_stream_log("obbystreams status: link 1/3, last ffmpeg: Error opening input") == "info"
+
+
+def test_watchdog_does_not_restart_after_manual_stop():
+    cfg = normalize_config({"stream": {"links": ["https://ok.example.com/a.m3u8"], "auto_restart_on_exit": True}})
+    assert should_watchdog_restart_exited_process(cfg, "running")
+    assert not should_watchdog_restart_exited_process(cfg, "stopped")
 
 
 def test_nvidia_smi_parsers_extract_gpu_and_process_metrics():
