@@ -63,13 +63,17 @@ stream:
 
 # Pasted public internet streams shown on fight.nswfiles.com. These are not
 # ffmpeg inputs for the official managed stream; playback is proxied by
-# /api/proxy-hls to avoid browser CORS failures.
+# /api/proxy-hls to avoid browser CORS failures. Add headers when a public
+# source requires a browser-like Referer, Origin, or User-Agent.
 public_sources:
   - id: public-example
     label: Public example
     type: public-hls
     url: https://example.com/public/live.m3u8
     enabled: false
+    headers:
+      Referer: https://example.com/
+      User-Agent: Mozilla/5.0
 
 arangodb:
   enabled: true

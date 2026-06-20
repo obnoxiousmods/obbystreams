@@ -440,6 +440,9 @@ def normalize_public_sources(raw_sources):
             "url": url,
             "enabled": bool(raw.get("enabled", True)),
             "type": str(raw.get("type") or "public-hls").strip() or "public-hls",
+            "origin": "manual",
+            "read_only": False,
+            "headers": normalize_source_headers(raw.get("headers")),
         }
         description = str(raw.get("description") or raw.get("notes") or "").strip()
         if description:
@@ -451,10 +454,36 @@ def normalize_public_sources(raw_sources):
 
 
 def proxied_public_source(source):
+    safe = {key: value for key, value in source.items() if key != "headers"}
+    if source.get("headers"):
+        safe["has_headers"] = True
     return {
-        **source,
+        **safe,
         "playback_url": _proxy_url(source.get("url", "")),
     }
+
+
+def auto_public_sources():
+    return [
+        {
+            "id": f"auto-public-{index + 1}",
+            "label": f"Auto public {index + 1}",
+            "url": url,
+            "enabled": True,
+            "type": "auto-public-hls",
+            "origin": "auto",
+            "read_only": True,
+            "description": "Auto-discovered from configured public scrape pages.",
+        }
+        for index, url in enumerate(current_auto_sources())
+    ]
+
+
+def public_stream_inventory(config):
+    manual = normalize_public_sources(config.get("public_sources", []))
+    seen_urls = {source.get("url") for source in manual}
+    auto = [source for source in auto_public_sources() if source.get("url") not in seen_urls]
+    return [*manual, *auto]
 
 
 def enabled_source_links(config):
@@ -548,13 +577,7 @@ def current_auto_sources():
 
 def effective_stream_links(config):
     stream = config.setdefault("stream", {})
-    primary_links = enabled_source_links(config) or normalize_links(stream.get("links", []))
-    if not stream.get("include_auto_public_sources", True):
-        return primary_links
-    auto_links = current_auto_sources()
-    if not auto_links:
-        return primary_links
-    return normalize_links([*primary_links, *auto_links])
+    return enabled_source_links(config) or normalize_links(stream.get("links", []))
 
 
 def load_config(fresh=False):
@@ -604,10 +627,7 @@ def public_config(config):
     safe.get("arangodb", {}).pop("password", None)
     for source in safe.get("stream", {}).get("sources", []) or []:
         source.pop("headers", None)
-    safe["public_sources"] = [
-        proxied_public_source(source)
-        for source in safe.get("public_sources", [])
-    ]
+    safe["public_sources"] = [proxied_public_source(source) for source in public_stream_inventory(config)]
     return safe
 
 
@@ -2021,7 +2041,12 @@ def source_headers_for_url(raw_url):
         target = urlparse(raw_url)
     except Exception:
         return {}
-    for source in load_config().get("stream", {}).get("sources", []):
+    config = load_config()
+    configured_sources = [
+        *config.get("stream", {}).get("sources", []),
+        *config.get("public_sources", []),
+    ]
+    for source in configured_sources:
         source_url = source.get("url")
         headers = source.get("headers") or {}
         if not source_url or not headers:
@@ -2459,11 +2484,7 @@ async def public_streams(request):
     if request.method == "OPTIONS":
         return Response("", headers=cors)
     config = load_config()
-    sources = [
-        proxied_public_source(source)
-        for source in config.get("public_sources", [])
-        if source.get("enabled", True)
-    ]
+    sources = [proxied_public_source(source) for source in public_stream_inventory(config) if source.get("enabled", True)]
     return JSONResponse({"ok": True, "sources": sources, "count": len(sources)}, headers=cors)
 
 
@@ -2491,7 +2512,7 @@ async def add_public_stream(request):
     config["public_sources"] = normalize_public_sources(sources)
     save_config(config)
     event("public source added", "ok", {"url": url})
-    return JSONResponse({"ok": True, "sources": [proxied_public_source(source) for source in config["public_sources"]]})
+    return JSONResponse({"ok": True, "sources": [proxied_public_source(source) for source in public_stream_inventory(config)]})
 
 
 async def remove_public_stream(request):
@@ -2510,7 +2531,7 @@ async def remove_public_stream(request):
     ]
     save_config(config)
     event("public source removed", "warn", {"id": source_id, "url": url})
-    return JSONResponse({"ok": True, "sources": [proxied_public_source(source) for source in config["public_sources"]]})
+    return JSONResponse({"ok": True, "sources": [proxied_public_source(source) for source in public_stream_inventory(config)]})
 
 
 async def live_public_events(request):

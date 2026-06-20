@@ -74,6 +74,9 @@ export interface PublicStreamSource {
   enabled?: boolean;
   description?: string;
   playback_url?: string;
+  origin?: "manual" | "auto" | string;
+  read_only?: boolean;
+  has_headers?: boolean;
 }
 
 export interface ViewerCounts {

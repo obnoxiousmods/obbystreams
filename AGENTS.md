@@ -14,7 +14,7 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 - Support explicit source switching through `Switch`, not order-management UX.
 - Recover sour-signal links by finding a replacement stream URL while preserving the source identity.
 - Store and apply private per-source headers for proxy/ffmpeg use.
-- Maintain a separate `public_sources` inventory for pasted public internet stream URLs.
+- Maintain a separate `public_sources` inventory for pasted public internet stream URLs, including per-public-source request headers when needed.
 - Expose safe public managed Server 1 status, viewer telemetry, and proxied public-source playback for ObbyWatcher.
 
 ## Public Contract For ObbyWatcher
@@ -27,7 +27,7 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 - `GET /api/public-source`
 - `GET /hls/ufc.m3u8`
 
-Never expose private official source headers, dashboard credentials, Arango credentials, or raw cockpit config through public endpoints. Keep official ffmpeg sources in `stream.sources`; keep pasted public internet sources in top-level `public_sources`.
+Never expose private official source headers, dashboard credentials, Arango credentials, or raw cockpit config through public endpoints. Keep official ffmpeg sources in `stream.sources`; keep pasted public internet sources in top-level `public_sources`. See `public_srcs.md` before changing, deleting, or reclassifying public source records.
 
 ## Operator UI Guidance
 

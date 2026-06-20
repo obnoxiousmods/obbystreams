@@ -14,6 +14,7 @@ from app import (
     normalize_config,
     normalize_links,
     normalize_scrape_urls,
+    public_stream_inventory,
     parse_nvidia_gpu_csv,
     parse_nvidia_pmon,
     parse_nvidia_process_csv,
@@ -208,7 +209,7 @@ def test_build_command_passes_scoring_flags_to_transcoder():
     assert "--maxrate-1080" in cmd
 
 
-def test_effective_stream_links_appends_auto_public_sources_without_duplicates():
+def test_effective_stream_links_keeps_auto_public_sources_out_of_ffmpeg_pool():
     cfg = normalize_config({"stream": {"links": ["https://a.example.com/live.m3u8"]}})
     import app as obbystreams_app
 
@@ -218,29 +219,35 @@ def test_effective_stream_links_appends_auto_public_sources_without_duplicates()
             "https://a.example.com/live.m3u8",
             "https://b.example.com/live.m3u8",
         ]
-        assert effective_stream_links(cfg) == [
-            "https://a.example.com/live.m3u8",
-            "https://b.example.com/live.m3u8",
-        ]
+        assert effective_stream_links(cfg) == ["https://a.example.com/live.m3u8"]
     finally:
         obbystreams_app._AUTO_SOURCES = original_sources
 
 
-def test_effective_stream_links_can_disable_auto_public_sources():
+def test_public_stream_inventory_includes_manual_and_auto_sources():
     cfg = normalize_config(
         {
-            "stream": {
-                "links": ["https://a.example.com/live.m3u8"],
-                "include_auto_public_sources": False,
-            }
+            "public_sources": [
+                {"id": "manual", "label": "Manual", "url": "https://a.example.com/live.m3u8"}
+            ]
         }
     )
     import app as obbystreams_app
 
     original_sources = list(obbystreams_app._AUTO_SOURCES)
     try:
-        obbystreams_app._AUTO_SOURCES = ["https://b.example.com/live.m3u8"]
-        assert effective_stream_links(cfg) == ["https://a.example.com/live.m3u8"]
+        obbystreams_app._AUTO_SOURCES = [
+            "https://a.example.com/live.m3u8",
+            "https://b.example.com/live.m3u8",
+        ]
+        inventory = public_stream_inventory(cfg)
+        assert [source["url"] for source in inventory] == [
+            "https://a.example.com/live.m3u8",
+            "https://b.example.com/live.m3u8",
+        ]
+        assert inventory[0].get("read_only") is not True
+        assert inventory[1]["read_only"] is True
+        assert inventory[1]["origin"] == "auto"
     finally:
         obbystreams_app._AUTO_SOURCES = original_sources
 

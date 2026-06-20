@@ -29,7 +29,7 @@ The preferred source is the first enabled configured source. Pressing `Switch` m
 
 Sour-signal sources are recoverable. The cockpit keeps their stable source ID/label, attempts to scrape a replacement HLS URL, updates the source, and restarts the stream when appropriate.
 
-Public pasted sources are top-level `public_sources`, not `stream.sources`. They are third-party internet stream URLs pasted for viewers to watch through the public client. They are not ffmpeg inputs for the official managed stream. They are exposed through `/api/public-streams` with `playback_url` values that point at `/api/proxy-hls`, so browser CORS never depends on the third-party origin.
+Public pasted sources are top-level `public_sources`, not `stream.sources`. They are third-party internet stream URLs pasted for viewers to watch through the public client. They are not ffmpeg inputs for the official managed stream. They are exposed through `/api/public-streams` with `playback_url` values that point at `/api/proxy-hls`, so browser CORS never depends on the third-party origin. Some records require `headers` such as `Referer`, `Origin`, or browser user-agent values; the proxy applies those headers server-side and rewrites nested playlists back through itself. The current source inventory is documented in `public_srcs.md`.
 
 The watcher consumes only public and redacted endpoints:
 

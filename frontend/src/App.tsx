@@ -1232,7 +1232,6 @@ function SourcesPanel({
   onRemove,
   onActivate,
   onRecover,
-  onScrape,
 }: {
   sources: SourceStatus[];
   pending: boolean;
@@ -1240,12 +1239,8 @@ function SourcesPanel({
   onRemove: (url: string) => Promise<void>;
   onActivate: (source: SourceStatus) => Promise<void>;
   onRecover: (source: SourceStatus) => Promise<void>;
-  onScrape: (url: string) => Promise<{ count: number }>;
 }) {
   const [newLink, setNewLink] = useState("");
-  const [scrapeUrl, setScrapeUrl] = useState("");
-  const [scraping, setScraping] = useState(false);
-  const [scrapeResult, setScrapeResult] = useState<string | null>(null);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -1255,42 +1250,12 @@ function SourcesPanel({
     setNewLink("");
   }
 
-  async function submitScrape(event: React.FormEvent) {
-    event.preventDefault();
-    const url = scrapeUrl.trim();
-    if (!url) return;
-    setScraping(true);
-    setScrapeResult(null);
-    try {
-      const result = await onScrape(url);
-      setScrapeResult(result.count > 0 ? `Found ${result.count} stream${result.count !== 1 ? "s" : ""} — added to list` : "No streams found on that page");
-      if (result.count > 0) setScrapeUrl("");
-    } catch {
-      setScrapeResult("Failed to scrape — check the URL and try again");
-    } finally {
-      setScraping(false);
-    }
-  }
-
   return (
     <Panel
-      title="Sources"
+      title="Official Source"
       meta={<Badge>{sources.length} configured</Badge>}
       className="linksPanel"
     >
-      <form className="addLink scrapeForm" onSubmit={submitScrape}>
-        <input
-          value={scrapeUrl}
-          onChange={(e) => { setScrapeUrl(e.target.value); setScrapeResult(null); }}
-          type="url"
-          placeholder="https://sportsurge.ws/event/… — paste page URL"
-          disabled={scraping}
-        />
-        <button type="submit" className="streamNow" disabled={scraping || !scrapeUrl.trim()}>
-          {scraping ? "Scanning…" : "Auto Find Streams"}
-        </button>
-      </form>
-      {scrapeResult && <p className="scrapeResult">{scrapeResult}</p>}
       <form className="addLink" onSubmit={submit}>
         <input value={newLink} onChange={(event) => setNewLink(event.target.value)} type="url" placeholder="https://example.com/live.m3u8" />
         <button type="submit" disabled={pending}>
@@ -1347,14 +1312,19 @@ function PublicStreamsPanel({
   pending,
   onAdd,
   onRemove,
+  onScrape,
 }: {
   sources: PublicStreamSource[];
   pending: boolean;
   onAdd: (url: string, label?: string) => Promise<void>;
   onRemove: (source: PublicStreamSource) => Promise<void>;
+  onScrape: (url: string) => Promise<{ count: number }>;
 }) {
   const [url, setUrl] = useState("");
   const [label, setLabel] = useState("");
+  const [scrapeUrl, setScrapeUrl] = useState("");
+  const [scraping, setScraping] = useState(false);
+  const [scrapeResult, setScrapeResult] = useState<string | null>(null);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -1365,8 +1335,41 @@ function PublicStreamsPanel({
     setLabel("");
   }
 
+  async function submitScrape(event: React.FormEvent) {
+    event.preventDefault();
+    const nextUrl = scrapeUrl.trim();
+    if (!nextUrl) return;
+    setScraping(true);
+    setScrapeResult(null);
+    try {
+      const result = await onScrape(nextUrl);
+      setScrapeResult(result.count > 0 ? `Found ${result.count} public stream${result.count !== 1 ? "s" : ""}` : "No public streams found on that page");
+      if (result.count > 0) setScrapeUrl("");
+    } catch {
+      setScrapeResult("Failed to scrape that page");
+    } finally {
+      setScraping(false);
+    }
+  }
+
   return (
-    <Panel title="Public Streams" meta={<Badge>{sources.length} pasted</Badge>} className="linksPanel">
+    <Panel title="Public Streams" meta={<Badge>{sources.length} available</Badge>} className="linksPanel">
+      <form className="addLink scrapeForm" onSubmit={submitScrape}>
+        <input
+          value={scrapeUrl}
+          onChange={(event) => {
+            setScrapeUrl(event.target.value);
+            setScrapeResult(null);
+          }}
+          type="url"
+          placeholder="https://sportsurge.ws/event/..."
+          disabled={scraping}
+        />
+        <button type="submit" className="streamNow" disabled={scraping || !scrapeUrl.trim()}>
+          {scraping ? "Scanning..." : "Find Public"}
+        </button>
+      </form>
+      {scrapeResult && <p className="scrapeResult">{scrapeResult}</p>}
       <form className="addLink publicSourceForm" onSubmit={submit}>
         <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Label" />
         <input value={url} onChange={(event) => setUrl(event.target.value)} type="url" placeholder="https://third-party.example/live.m3u8" />
@@ -1380,7 +1383,10 @@ function PublicStreamsPanel({
             <div className="linkItem sourceItem" key={source.id || `${source.url}-${index}`}>
               <div className="linkTop">
                 <strong>{source.label || `Public ${index + 1}`}</strong>
-                <Badge>{source.enabled === false ? "disabled" : "proxied"}</Badge>
+                <div className="sourceBadges">
+                  <Badge>{source.origin === "auto" ? "auto" : "pasted"}</Badge>
+                  <Badge>{source.enabled === false ? "disabled" : "proxied"}</Badge>
+                </div>
               </div>
               <p>{source.url}</p>
               {source.playback_url && <p className="sourceMeta">Playback {source.playback_url}</p>}
@@ -1388,7 +1394,7 @@ function PublicStreamsPanel({
                 <a className="buttonLink compactButton" href={source.playback_url || source.url} target="_blank" rel="noreferrer">
                   Test
                 </a>
-                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(source)}>
+                <button type="button" className="danger compactButton" disabled={pending || source.read_only} onClick={() => onRemove(source)}>
                   Remove
                 </button>
               </div>
@@ -1752,12 +1758,11 @@ export default function App() {
       body: JSON.stringify({ url }),
     }) as { ok: boolean; links: string[]; count: number };
     if (!data.ok || !data.links?.length) return { count: 0 };
-    // Add each found link (server deduplicates)
     for (const link of data.links) {
       try {
-        await api("/api/links", { method: "POST", body: JSON.stringify({ url: link }) });
+        await api("/api/public-streams", { method: "POST", body: JSON.stringify({ url: link, label: "Public stream" }) });
       } catch {
-        // skip duplicates / bad links
+        // Skip duplicates or invalid scraped links; the server validates each URL.
       }
     }
     await refreshStatus();
@@ -1803,8 +1808,8 @@ export default function App() {
         </aside>
       </section>
       <section className="lowerGrid">
-        <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} onScrape={scrapeLinks} />
-        <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} />
+        <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} />
+        <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} />
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>
       <FooterStatus hls={hls} sessionState={sessionState} />

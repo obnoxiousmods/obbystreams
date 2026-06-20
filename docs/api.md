@@ -189,7 +189,9 @@ POST /api/viewers
 
 `/api/public-configured-sources` returns the synthetic `server-1` managed source for the official ffmpeg output.
 
-`/api/public-streams` returns separately managed pasted public internet streams. Each item includes `url` plus a CORS-safe `playback_url` that points through `/api/proxy-hls`. These records are not official ffmpeg sources and do not affect `stream.sources`.
+`/api/public-streams` returns separately managed pasted public internet streams. Each item includes `url` plus a CORS-safe `playback_url` that points through `/api/proxy-hls`. These records are not official ffmpeg sources and do not affect `stream.sources`. Public records may carry server-side `headers` such as `Referer`, `Origin`, or `User-Agent`; the proxy applies those headers while keeping browser playback on `s.obby.ca`.
+
+The current production public source inventory and nested-playlist notes live in `public_srcs.md`.
 
 ## Stream Actions
 
