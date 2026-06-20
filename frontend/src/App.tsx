@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import videojs from "video.js";
 import type Player from "video.js/dist/types/player";
@@ -16,11 +16,291 @@ import type {
   HlsMetrics,
   LogEntry,
   ManagedProcess,
+  PublicStreamSource,
+  SourceStatus,
   StatusPayload,
   Tone,
 } from "./types";
 
-const TOKEN_KEY = "obbystreams_token";
+type EncoderMode = "auto" | "gpu-only" | "cpu";
+
+type DropdownItem<T extends string> = {
+  value: T;
+  label: string;
+  description?: string;
+  disabled?: boolean;
+  tone?: "default" | "danger";
+  onSelect?: () => void | Promise<void>;
+};
+
+type PictureInPictureDocument = Document & {
+  pictureInPictureElement?: Element | null;
+  pictureInPictureEnabled?: boolean;
+  exitPictureInPicture?: () => Promise<void>;
+};
+
+type PictureInPictureVideo = HTMLVideoElement & {
+  requestPictureInPicture?: () => Promise<PictureInPictureWindow>;
+};
+
+type PlayerIconName = "play" | "pause" | "volume" | "muted" | "settings" | "pip" | "fullscreen" | "retry";
+
+function PlayerIcon({ name }: { name: PlayerIconName }) {
+  const commonProps = {
+    className: "playerIcon",
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
+
+  switch (name) {
+    case "play":
+      return (
+        <svg {...commonProps}>
+          <path d="M8 5v14l11-7-11-7z" fill="currentColor" stroke="none" />
+        </svg>
+      );
+    case "pause":
+      return (
+        <svg {...commonProps}>
+          <path d="M8 5v14" />
+          <path d="M16 5v14" />
+        </svg>
+      );
+    case "volume":
+      return (
+        <svg {...commonProps}>
+          <path d="M4 10v4h4l5 4V6l-5 4H4z" />
+          <path d="M16 9.5a4 4 0 0 1 0 5" />
+          <path d="M18.5 7a7 7 0 0 1 0 10" />
+        </svg>
+      );
+    case "muted":
+      return (
+        <svg {...commonProps}>
+          <path d="M4 10v4h4l5 4V6l-5 4H4z" />
+          <path d="M17 9l4 4" />
+          <path d="M21 9l-4 4" />
+        </svg>
+      );
+    case "settings":
+      return (
+        <svg {...commonProps}>
+          <path d="M4 7h16" />
+          <path d="M4 17h16" />
+          <path d="M9 7a2 2 0 1 0 0 .01" />
+          <path d="M15 17a2 2 0 1 0 0 .01" />
+        </svg>
+      );
+    case "pip":
+      return (
+        <svg {...commonProps}>
+          <rect x="3" y="5" width="18" height="14" rx="2" />
+          <rect x="12" y="11" width="6" height="4" rx="1" />
+        </svg>
+      );
+    case "fullscreen":
+      return (
+        <svg {...commonProps}>
+          <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+          <path d="M16 3h3a2 2 0 0 1 2 2v3" />
+          <path d="M8 21H5a2 2 0 0 1-2-2v-3" />
+          <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+        </svg>
+      );
+    case "retry":
+      return (
+        <svg {...commonProps}>
+          <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+          <path d="M20 4v6h-6" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+function firstEnabledIndex<T extends string>(items: DropdownItem<T>[]) {
+  return items.findIndex((item) => !item.disabled);
+}
+
+function normalizeEncoder(encoder?: string): EncoderMode {
+  if (encoder === "gpu-only" || encoder === "cpu") return encoder;
+  return "auto";
+}
+
+function ModernDropdown<T extends string>({
+  label,
+  value,
+  buttonLabel,
+  status,
+  items,
+  mode = "select",
+  disabled = false,
+  className = "",
+  onSelect,
+}: {
+  label: string;
+  value?: T;
+  buttonLabel?: string;
+  status?: string;
+  items: DropdownItem<T>[];
+  mode?: "select" | "menu";
+  disabled?: boolean;
+  className?: string;
+  onSelect?: (value: T) => void | Promise<void>;
+}) {
+  const dropdownId = useId();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [placement, setPlacement] = useState<"up" | "down">("down");
+  const selectedIndex = value == null ? -1 : items.findIndex((item) => item.value === value);
+  const selected = selectedIndex >= 0 ? items[selectedIndex] : undefined;
+  const displayLabel = buttonLabel || selected?.label || label;
+  const panelRole = mode === "select" ? "listbox" : "menu";
+  const optionRole = mode === "select" ? "option" : "menuitem";
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (!open) return;
+    function closeOnOutside(event: PointerEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [open]);
+
+  function moveActive(direction: 1 | -1) {
+    const enabledIndexes = items.map((item, index) => (item.disabled ? -1 : index)).filter((index) => index >= 0);
+    if (!enabledIndexes.length) return;
+    const currentPosition = enabledIndexes.indexOf(activeIndex);
+    const nextPosition = currentPosition === -1 ? 0 : (currentPosition + direction + enabledIndexes.length) % enabledIndexes.length;
+    setActiveIndex(enabledIndexes[nextPosition]);
+  }
+
+  function setBoundaryActive(boundary: "first" | "last") {
+    const enabledIndexes = items.map((item, index) => (item.disabled ? -1 : index)).filter((index) => index >= 0);
+    if (!enabledIndexes.length) return;
+    setActiveIndex(boundary === "first" ? enabledIndexes[0] : enabledIndexes[enabledIndexes.length - 1]);
+  }
+
+  function openDropdown() {
+    const fallbackIndex = firstEnabledIndex(items);
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (rect) {
+      const estimatedPanelHeight = Math.min(320, Math.max(88, items.length * 64 + 12));
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      setPlacement(spaceBelow < estimatedPanelHeight && spaceAbove > spaceBelow ? "up" : "down");
+    }
+    setActiveIndex(selectedIndex >= 0 && !items[selectedIndex]?.disabled ? selectedIndex : fallbackIndex);
+    setOpen(true);
+  }
+
+  function choose(item?: DropdownItem<T>) {
+    if (!item || item.disabled) return;
+    setOpen(false);
+    void item.onSelect?.();
+    void onSelect?.(item.value);
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent) {
+    if (disabled) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!open) {
+        openDropdown();
+      } else {
+        moveActive(1);
+      }
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) {
+        openDropdown();
+        setBoundaryActive("last");
+      } else {
+        moveActive(-1);
+      }
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      setOpen(true);
+      setBoundaryActive("first");
+    } else if (event.key === "End") {
+      event.preventDefault();
+      setOpen(true);
+      setBoundaryActive("last");
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+    } else if ((event.key === "Enter" || event.key === " ") && open) {
+      event.preventDefault();
+      choose(items[activeIndex]);
+    }
+  }
+
+  return (
+    <div className={`customDropdown drop-${placement} ${className}`} ref={rootRef} onKeyDown={handleKeyDown}>
+      <button
+        type="button"
+        className="dropdownButton"
+        disabled={disabled}
+        aria-haspopup={panelRole}
+        aria-expanded={open}
+        aria-controls={`${dropdownId}-panel`}
+        onClick={() => {
+          if (open) {
+            setOpen(false);
+          } else {
+            openDropdown();
+          }
+        }}
+      >
+        <span>
+          <span className="dropdownLabel">{label}</span>
+          <strong>{displayLabel}</strong>
+          {status ? <span className="dropdownStatus">{status}</span> : null}
+        </span>
+        <span className="dropdownChevron" aria-hidden="true" />
+      </button>
+      {open ? (
+        <div className="dropdownPanel" id={`${dropdownId}-panel`} role={panelRole}>
+          {items.map((item, index) => {
+            const itemSelected = mode === "select" && item.value === value;
+            return (
+              <button
+                type="button"
+                id={`${dropdownId}-${item.value}`}
+                key={item.value}
+                role={optionRole}
+                aria-selected={mode === "select" ? itemSelected : undefined}
+                disabled={item.disabled}
+                className={`dropdownOption ${index === activeIndex ? "active" : ""} ${itemSelected ? "selected" : ""} ${item.tone === "danger" ? "danger" : ""}`}
+                onMouseEnter={() => {
+                  if (!item.disabled) setActiveIndex(index);
+                }}
+                onClick={() => choose(item)}
+              >
+                <span>
+                  <strong>{item.label}</strong>
+                  {item.description ? <small>{item.description}</small> : null}
+                </span>
+                {itemSelected ? <em>Selected</em> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: Tone }) {
   return <span className={`badge tone-${tone}`}>{children}</span>;
@@ -153,8 +433,10 @@ function CommandHeader({
   onStreamAction: (action: "start" | "restart" | "stop") => Promise<void>;
 }) {
   const proc = status?.managed_process || {};
+  const externalProcessCount = status?.existing_processes?.length || 0;
   const hls = status?.hls || {};
   const busy = Boolean(pendingAction);
+  const canStop = Boolean(proc.managed) || externalProcessCount > 0;
   const hlsUrl = hls.public_hls_url || hls.dashboard_hls_url || "Waiting for HLS output";
 
   return (
@@ -171,7 +453,7 @@ function CommandHeader({
         <button type="button" className="secondary" disabled={busy} onClick={() => onStreamAction("restart")}>
           {pendingAction === "restart" ? "Restarting" : "Restart"}
         </button>
-        <button type="button" className="danger" disabled={busy || !proc.managed} onClick={() => onStreamAction("stop")}>
+        <button type="button" className="danger" disabled={busy || !canStop} onClick={() => onStreamAction("stop")}>
           {pendingAction === "stop" ? "Stopping" : "Stop"}
         </button>
       </div>
@@ -179,8 +461,27 @@ function CommandHeader({
   );
 }
 
-function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMetrics; health?: HealthAssessment }) {
+function LivePlayer({
+  proc,
+  hls,
+  health,
+  overrideUrl,
+  onWatchSource,
+  onClearSource,
+  sourceBusy,
+  sourceMsg,
+}: {
+  proc?: ManagedProcess;
+  hls?: HlsMetrics;
+  health?: HealthAssessment;
+  overrideUrl?: string | null;
+  onWatchSource: (url: string) => Promise<void>;
+  onClearSource: () => void;
+  sourceBusy: boolean;
+  sourceMsg: string | null;
+}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const videoSurfaceRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<Player | null>(null);
   const retryTimerRef = useRef<number | null>(null);
   const retryMsRef = useRef(800);
@@ -190,8 +491,15 @@ function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMet
   const [volume, setVolume] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [atLiveEdge, setAtLiveEdge] = useState(true);
-  const playerUrl = proc?.managed && hls?.playlist_ready ? hls.dashboard_hls_url || hls.public_hls_url || "" : "";
+  const [pictureInPicture, setPictureInPicture] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [volumePanelOpen, setVolumePanelOpen] = useState(false);
+  const [scUrl, setScUrl] = useState("");
+  const managedUrl = proc?.managed && hls?.playlist_ready ? hls.dashboard_hls_url || hls.public_hls_url || "" : "";
+  const playerUrl = overrideUrl || managedUrl;
   const displayUrl = hls?.public_hls_url || hls?.dashboard_hls_url || "";
+  const managedDot = proc?.managed && hls?.playlist_ready ? "green" : proc?.managed ? "yellow" : "red";
+  const overrideDot = overrideUrl ? "green" : "yellow";
 
   const clearRetry = useCallback(() => {
     if (retryTimerRef.current == null) return;
@@ -348,6 +656,40 @@ function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMet
   }, [clearRetry]);
 
   useEffect(() => {
+    function closeOnOutside(event: PointerEvent) {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (videoSurfaceRef.current?.contains(target)) return;
+      setMoreOpen(false);
+      setVolumePanelOpen(false);
+    }
+
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, []);
+
+  useEffect(() => {
+    const video = videoRef.current as PictureInPictureVideo | null;
+    if (!video) return;
+
+    const pipOn = () => setPictureInPicture(true);
+    const pipOff = () => setPictureInPicture(false);
+    const syncFullscreen = () => {
+      const fullscreenElement = document.fullscreenElement;
+      setIsFullscreen(Boolean(fullscreenElement && videoSurfaceRef.current?.contains(fullscreenElement)));
+    };
+
+    video.addEventListener("enterpictureinpicture", pipOn);
+    video.addEventListener("leavepictureinpicture", pipOff);
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => {
+      video.removeEventListener("enterpictureinpicture", pipOn);
+      video.removeEventListener("leavepictureinpicture", pipOff);
+      document.removeEventListener("fullscreenchange", syncFullscreen);
+    };
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       const player = playerRef.current;
       if (!player || player.isDisposed() || !playerUrl) return;
@@ -400,15 +742,25 @@ function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMet
     syncPlayerState(player);
   }
 
-  function toggleFullscreen() {
-    const player = playerRef.current;
-    if (!player || player.isDisposed()) return;
-    if (player.isFullscreen()) {
-      player.exitFullscreen();
-    } else {
-      player.requestFullscreen();
+  async function togglePictureInPicture() {
+    const pipDocument = document as PictureInPictureDocument;
+    const video = videoRef.current as PictureInPictureVideo | null;
+    if (!video || !pipDocument.pictureInPictureEnabled || !video.requestPictureInPicture) return;
+    if (pipDocument.pictureInPictureElement && pipDocument.exitPictureInPicture) {
+      await pipDocument.exitPictureInPicture();
+      return;
     }
-    syncPlayerState(player);
+    await video.requestPictureInPicture();
+  }
+
+  async function toggleFullscreen() {
+    const surface = videoSurfaceRef.current;
+    if (!surface) return;
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      return;
+    }
+    await surface.requestFullscreen();
   }
 
   function goLive() {
@@ -430,51 +782,156 @@ function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMet
   }
 
   const canUsePlayer = Boolean(playerUrl);
+  const hlsActionUrl = absoluteUrl(playerUrl || displayUrl);
+  const statusTone: Tone = playerState === "playing" ? "ok" : playerState.includes("error") ? "bad" : "neutral";
 
   return (
-    <Panel title="Live Player" meta={<Badge tone={playerState === "playing" ? "ok" : "neutral"}>{playerState}</Badge>} className="stagePanel">
-      <div className="videoSurface">
+    <Panel title="Live Player" meta={<Badge tone={statusTone}>{playerState}</Badge>} className="stagePanel">
+      <div className="videoSurface" ref={videoSurfaceRef}>
         <video ref={videoRef} className="video-js vjs-big-play-centered vjs-obby" preload="auto" playsInline />
         <div className="customPlayerChrome">
           <div className="playerTopRail">
-            <Badge tone={proc?.managed && hls?.playlist_ready ? "ok" : "warn"}>LIVE</Badge>
-            <span>{playerState}</span>
+            <span className="playerSignalLine">
+              <Badge tone={proc?.managed && hls?.playlist_ready ? "ok" : "warn"}>{overrideUrl ? "OVERRIDE" : "LIVE"}</Badge>
+              <span>{playerState}</span>
+            </span>
+            <span className="playerMetaLine">
+              {overrideUrl ? "Custom source preview" : "Managed stream preview"}
+            </span>
           </div>
           <div className="playerBottomRail">
-            <button type="button" className="playerControl primary" disabled={!canUsePlayer} onClick={togglePlayback}>
-              {isPaused ? "Play" : "Pause"}
-            </button>
-            <button type="button" className="playerControl" disabled={!canUsePlayer} onClick={toggleMute}>
-              {isMuted || volume === 0 ? "Muted" : "Sound"}
-            </button>
-            <label className="volumeControl">
-              <span>Vol</span>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.01"
-                value={volume}
+            <div className="playerControlRow">
+              <button
+                type="button"
+                className="playerIconButton primary"
                 disabled={!canUsePlayer}
-                onChange={(event) => updateVolume(Number(event.target.value))}
-              />
-            </label>
-            <button type="button" className="playerControl" disabled={!canUsePlayer} onClick={() => loadSource("manual")}>
-              Reload
-            </button>
-            <button type="button" className="playerControl" disabled={!canUsePlayer || atLiveEdge} onClick={goLive}>
-              Go live
-            </button>
-            <button type="button" className="playerControl" onClick={copyHls}>
-              Copy HLS
-            </button>
-            <a className="playerControl link" href={absoluteUrl(playerUrl || displayUrl) || "#"} target="_blank" rel="noreferrer">
-              Open
-            </a>
-            <button type="button" className="playerControl" disabled={!canUsePlayer} onClick={toggleFullscreen}>
-              {isFullscreen ? "Exit full" : "Full"}
-            </button>
+                onClick={togglePlayback}
+                aria-label={isPaused ? "Play" : "Pause"}
+                title={isPaused ? "Play" : "Pause"}
+              >
+                <PlayerIcon name={isPaused ? "play" : "pause"} />
+              </button>
+              <div className={`volumeCluster ${volumePanelOpen ? "open" : ""}`}>
+                <button
+                  type="button"
+                  className={`playerIconButton ${volumePanelOpen ? "active" : ""}`}
+                  disabled={!canUsePlayer}
+                  onClick={() => {
+                    setMoreOpen(false);
+                    setVolumePanelOpen((open) => !open);
+                  }}
+                  aria-label="Volume"
+                  title="Volume"
+                >
+                  <PlayerIcon name={isMuted || volume === 0 ? "muted" : "volume"} />
+                </button>
+                {volumePanelOpen ? (
+                  <div className="volumePopover">
+                    <button type="button" className="volumeMuteButton" onClick={toggleMute}>
+                      <PlayerIcon name={isMuted || volume === 0 ? "muted" : "volume"} />
+                      <span>{isMuted || volume === 0 ? "Unmute" : "Mute"}</span>
+                    </button>
+                    <div className="volumeSliderRow">
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={volume}
+                        disabled={!canUsePlayer}
+                        onChange={(event) => updateVolume(Number(event.target.value))}
+                      />
+                      <span>{Math.round(volume * 100)}%</span>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+              <button type="button" className="liveChip" disabled={!canUsePlayer || atLiveEdge} onClick={goLive}>
+                <span aria-hidden="true" />
+                LIVE
+              </button>
+              <span className="playerReadout">
+                {overrideUrl ? "Custom source active" : "Dashboard stream"} · {atLiveEdge ? "at live edge" : "behind live"}
+              </span>
+              <div className="sourceDots" aria-label="Source status">
+                <span className={`sourceDot sourceDot-${managedDot}${!overrideUrl ? " active" : ""}`} title="Managed stream" />
+                <span className={`sourceDot sourceDot-${overrideDot}${overrideUrl ? " active" : ""}`} title="Override source" />
+              </div>
+            </div>
+            <div className="playerActionRow">
+              <button
+                type="button"
+                className="playerIconButton"
+                disabled={!canUsePlayer}
+                onClick={() => loadSource("manual")}
+                aria-label="Reload"
+                title="Reload"
+              >
+                <PlayerIcon name="retry" />
+              </button>
+              <button
+                type="button"
+                className={`playerIconButton ${moreOpen ? "active" : ""}`}
+                onClick={() => {
+                  setVolumePanelOpen(false);
+                  setMoreOpen((open) => !open);
+                }}
+                aria-label="More"
+                title="More"
+              >
+                <PlayerIcon name="settings" />
+              </button>
+              <button
+                type="button"
+                className="playerIconButton"
+                disabled={!canUsePlayer}
+                onClick={() => void togglePictureInPicture()}
+                aria-label={pictureInPicture ? "Close picture in picture" : "Picture in picture"}
+                title={pictureInPicture ? "Close picture in picture" : "Picture in picture"}
+              >
+                <PlayerIcon name="pip" />
+              </button>
+              <button
+                type="button"
+                className="playerIconButton"
+                disabled={!canUsePlayer}
+                onClick={() => void toggleFullscreen()}
+                aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              >
+                <PlayerIcon name="fullscreen" />
+              </button>
+            </div>
           </div>
+          {moreOpen ? (
+            <div className="playerMoreMenu" role="menu">
+              <div className="playerMoreGrid">
+                <button type="button" className="playerMenuButton" disabled={!canUsePlayer} onClick={() => loadSource("manual")}>
+                  <strong>Reload stream</strong>
+                  <span>Refresh the preview source.</span>
+                </button>
+                <button type="button" className="playerMenuButton" disabled={!canUsePlayer || atLiveEdge} onClick={goLive}>
+                  <strong>Go live</strong>
+                  <span>Jump to the newest buffered segment.</span>
+                </button>
+                <button type="button" className="playerMenuButton" disabled={!hlsActionUrl} onClick={() => void copyHls()}>
+                  <strong>Copy HLS URL</strong>
+                  <span>Copy the active playback URL.</span>
+                </button>
+                <button
+                  type="button"
+                  className="playerMenuButton"
+                  disabled={!hlsActionUrl}
+                  onClick={() => {
+                    if (hlsActionUrl) window.open(hlsActionUrl, "_blank", "noopener,noreferrer");
+                  }}
+                >
+                  <strong>Open HLS URL</strong>
+                  <span>Open the stream in a new tab.</span>
+                </button>
+              </div>
+            </div>
+          ) : null}
         </div>
       </div>
       <div className="playerToolbar">
@@ -484,6 +941,38 @@ function LivePlayer({ proc, hls, health }: { proc?: ManagedProcess; hls?: HlsMet
         <span className="inlineMetric">
           Playlist <strong>{fmtClock(hls?.playlist_modified_at)}</strong>
         </span>
+      </div>
+      <div className="sourceChanger">
+        <form
+          className="addLink"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const url = scUrl.trim();
+            if (!url) return;
+            await onWatchSource(url);
+          }}
+        >
+          <input
+            value={scUrl}
+            onChange={(e) => setScUrl(e.target.value)}
+            type="url"
+            placeholder="Paste SportSurge or stream URL to watch here"
+            disabled={sourceBusy}
+          />
+          <button type="submit" className="streamNow" disabled={sourceBusy || !scUrl.trim()}>
+            {sourceBusy ? "Loading…" : "Watch Source"}
+          </button>
+          {overrideUrl ? (
+            <button
+              type="button"
+              className="danger compactButton"
+              onClick={() => { onClearSource(); setScUrl(""); }}
+            >
+              Stop
+            </button>
+          ) : null}
+        </form>
+        {sourceMsg ? <p className="scrapeResult">{sourceMsg}</p> : null}
       </div>
     </Panel>
   );
@@ -542,26 +1031,33 @@ function EncoderControl({
 }: {
   encoder?: string;
   pending: boolean;
-  onSetEncoder: (encoder: "auto" | "gpu-only" | "cpu") => Promise<void>;
+  onSetEncoder: (encoder: EncoderMode) => Promise<void>;
 }) {
-  const mode = encoder || "auto";
+  const mode = normalizeEncoder(encoder);
+  const encoderItems: DropdownItem<EncoderMode>[] = [
+    {
+      value: "auto",
+      label: "Auto",
+      description: "Use the best available encoder.",
+    },
+    {
+      value: "gpu-only",
+      label: "GPU only",
+      description: "Require NVENC acceleration.",
+    },
+    {
+      value: "cpu",
+      label: "CPU only",
+      description: "Run without GPU encoding.",
+    },
+  ];
   return (
     <div className="encoderControl">
       <div>
         <span>Encoder mode</span>
         <strong>{pending ? "Updating..." : encoderLabel(mode)}</strong>
       </div>
-      <div className="segmentedControl" aria-label="Encoder mode">
-        <button type="button" className={mode === "auto" ? "active" : ""} disabled={pending} onClick={() => onSetEncoder("auto")}>
-          Auto
-        </button>
-        <button type="button" className={mode === "gpu-only" ? "active" : ""} disabled={pending} onClick={() => onSetEncoder("gpu-only")}>
-          GPU
-        </button>
-        <button type="button" className={mode === "cpu" ? "active" : ""} disabled={pending} onClick={() => onSetEncoder("cpu")}>
-          CPU
-        </button>
-      </div>
+      <ModernDropdown label="Mode" value={mode} status={pending ? "Saving" : undefined} items={encoderItems} disabled={pending} className="encoderDropdown" onSelect={onSetEncoder} />
     </div>
   );
 }
@@ -579,7 +1075,7 @@ function ProcessPanel({
   encoder?: string;
   errorCount: number;
   pendingEncoder: boolean;
-  onSetEncoder: (encoder: "auto" | "gpu-only" | "cpu") => Promise<void>;
+  onSetEncoder: (encoder: EncoderMode) => Promise<void>;
 }) {
   return (
     <Panel title="Process" meta={<Badge tone={proc?.managed ? "ok" : "warn"}>{proc?.managed ? "runtime" : "stopped"}</Badge>}>
@@ -729,24 +1225,27 @@ function GpuProcessLine({ proc }: { proc: GpuProcess }) {
   );
 }
 
-function LinksPanel({
-  links,
-  dirty,
+function SourcesPanel({
+  sources,
   pending,
   onAdd,
-  onMove,
   onRemove,
-  onSave,
+  onActivate,
+  onRecover,
+  onScrape,
 }: {
-  links: string[];
-  dirty: boolean;
+  sources: SourceStatus[];
   pending: boolean;
   onAdd: (url: string) => Promise<void>;
-  onMove: (index: number, direction: -1 | 1) => void;
   onRemove: (url: string) => Promise<void>;
-  onSave: () => Promise<void>;
+  onActivate: (source: SourceStatus) => Promise<void>;
+  onRecover: (source: SourceStatus) => Promise<void>;
+  onScrape: (url: string) => Promise<{ count: number }>;
 }) {
   const [newLink, setNewLink] = useState("");
+  const [scrapeUrl, setScrapeUrl] = useState("");
+  const [scraping, setScraping] = useState(false);
+  const [scrapeResult, setScrapeResult] = useState<string | null>(null);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -756,16 +1255,42 @@ function LinksPanel({
     setNewLink("");
   }
 
+  async function submitScrape(event: React.FormEvent) {
+    event.preventDefault();
+    const url = scrapeUrl.trim();
+    if (!url) return;
+    setScraping(true);
+    setScrapeResult(null);
+    try {
+      const result = await onScrape(url);
+      setScrapeResult(result.count > 0 ? `Found ${result.count} stream${result.count !== 1 ? "s" : ""} — added to list` : "No streams found on that page");
+      if (result.count > 0) setScrapeUrl("");
+    } catch {
+      setScrapeResult("Failed to scrape — check the URL and try again");
+    } finally {
+      setScraping(false);
+    }
+  }
+
   return (
     <Panel
-      title="Links"
-      meta={
-        <button type="button" className="secondary compactButton" disabled={pending || !dirty} onClick={onSave}>
-          {pending ? "Saving" : dirty ? "Save order" : "Saved"}
-        </button>
-      }
+      title="Sources"
+      meta={<Badge>{sources.length} configured</Badge>}
       className="linksPanel"
     >
+      <form className="addLink scrapeForm" onSubmit={submitScrape}>
+        <input
+          value={scrapeUrl}
+          onChange={(e) => { setScrapeUrl(e.target.value); setScrapeResult(null); }}
+          type="url"
+          placeholder="https://sportsurge.ws/event/… — paste page URL"
+          disabled={scraping}
+        />
+        <button type="submit" className="streamNow" disabled={scraping || !scrapeUrl.trim()}>
+          {scraping ? "Scanning…" : "Auto Find Streams"}
+        </button>
+      </form>
+      {scrapeResult && <p className="scrapeResult">{scrapeResult}</p>}
       <form className="addLink" onSubmit={submit}>
         <input value={newLink} onChange={(event) => setNewLink(event.target.value)} type="url" placeholder="https://example.com/live.m3u8" />
         <button type="submit" disabled={pending}>
@@ -773,31 +1298,104 @@ function LinksPanel({
         </button>
       </form>
       <div className="linksList">
-        {links.length ? (
-          links.map((url, index) => (
-            <div className="linkItem" key={`${url}-${index}`}>
+        {sources.length ? (
+          sources.map((source, index) => {
+            const url = source.url || "";
+            const recoverable = source.type === "soursignal" || url.includes("soursignal.com");
+            return (
+            <div className="linkItem sourceItem" key={source.id || `${url}-${index}`}>
               <div className="linkTop">
-                <strong>Link {index + 1}</strong>
+                <strong>{source.label || `Source ${index + 1}`}</strong>
+                <div className="sourceBadges">
+                  <Badge tone={source.preferred ? "ok" : "neutral"}>{source.preferred ? "Preferred" : "Fallback"}</Badge>
+                  <Badge tone={source.health === "red" ? "bad" : source.health === "yellow" ? "warn" : source.health === "green" ? "ok" : "neutral"}>{source.health || "unknown"}</Badge>
+                  <Badge>{source.type || "hls"}</Badge>
+                  <Badge>{source.viewer_count || 0} watching</Badge>
+                </div>
+              </div>
+              <p>{url}</p>
+              {source.health_message && <p className="sourceMeta">{source.health_message}</p>}
+              <div className="linkActions">
                 <a className="buttonLink compactButton" href={url} target="_blank" rel="noreferrer">
                   Open
                 </a>
-              </div>
-              <p>{url}</p>
-              <div className="linkActions">
-                <button type="button" className="secondary compactButton" disabled={pending || index === 0} onClick={() => onMove(index, -1)}>
-                  Up
+                <button type="button" className="compactButton streamNow" disabled={pending || source.preferred} onClick={() => onActivate(source)}>
+                  {source.preferred ? "Active" : "Switch"}
                 </button>
-                <button type="button" className="secondary compactButton" disabled={pending || index === links.length - 1} onClick={() => onMove(index, 1)}>
-                  Down
-                </button>
+                {recoverable && (
+                  <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onRecover(source)}>
+                    Recover
+                  </button>
+                )}
                 <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(url)}>
+                  Remove
+                </button>
+              </div>
+            </div>
+            );
+          })
+        ) : (
+          <EmptyLine>No stream sources configured.</EmptyLine>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+function PublicStreamsPanel({
+  sources,
+  pending,
+  onAdd,
+  onRemove,
+}: {
+  sources: PublicStreamSource[];
+  pending: boolean;
+  onAdd: (url: string, label?: string) => Promise<void>;
+  onRemove: (source: PublicStreamSource) => Promise<void>;
+}) {
+  const [url, setUrl] = useState("");
+  const [label, setLabel] = useState("");
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    const nextUrl = url.trim();
+    if (!nextUrl) return;
+    await onAdd(nextUrl, label.trim() || undefined);
+    setUrl("");
+    setLabel("");
+  }
+
+  return (
+    <Panel title="Public Streams" meta={<Badge>{sources.length} pasted</Badge>} className="linksPanel">
+      <form className="addLink publicSourceForm" onSubmit={submit}>
+        <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Label" />
+        <input value={url} onChange={(event) => setUrl(event.target.value)} type="url" placeholder="https://third-party.example/live.m3u8" />
+        <button type="submit" disabled={pending || !url.trim()}>
+          Add
+        </button>
+      </form>
+      <div className="linksList">
+        {sources.length ? (
+          sources.map((source, index) => (
+            <div className="linkItem sourceItem" key={source.id || `${source.url}-${index}`}>
+              <div className="linkTop">
+                <strong>{source.label || `Public ${index + 1}`}</strong>
+                <Badge>{source.enabled === false ? "disabled" : "proxied"}</Badge>
+              </div>
+              <p>{source.url}</p>
+              {source.playback_url && <p className="sourceMeta">Playback {source.playback_url}</p>}
+              <div className="linkActions">
+                <a className="buttonLink compactButton" href={source.playback_url || source.url} target="_blank" rel="noreferrer">
+                  Test
+                </a>
+                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(source)}>
                   Remove
                 </button>
               </div>
             </div>
           ))
         ) : (
-          <EmptyLine>No stream links configured.</EmptyLine>
+          <EmptyLine>No pasted public streams configured.</EmptyLine>
         )}
       </div>
     </Panel>
@@ -886,8 +1484,8 @@ function FooterStatus({ hls, sessionState }: { hls?: HlsMetrics; sessionState: s
 }
 
 export default function App() {
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
-  const [locked, setLocked] = useState(() => !localStorage.getItem(TOKEN_KEY));
+  const [locked, setLocked] = useState(true);
+  const [authChecked, setAuthChecked] = useState(false);
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [gpu, setGpu] = useState<GpuTelemetryPayload | null>(null);
   const [arango, setArango] = useState<ArangoStatus | null>(null);
@@ -895,15 +1493,16 @@ export default function App() {
   const [pendingAction, setPendingAction] = useState("");
   const [pendingEncoder, setPendingEncoder] = useState(false);
   const [pendingLinks, setPendingLinks] = useState(false);
-  const [localLinks, setLocalLinks] = useState<string[]>([]);
-  const [linksDirty, setLinksDirty] = useState(false);
-  const authenticated = Boolean(token) && !locked;
-  const serverLinks = useMemo(() => status?.config.stream?.links || [], [status?.config.stream?.links]);
+  const [sourceOverride, setSourceOverride] = useState<string | null>(null);
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceMsg, setSourceMsg] = useState<string | null>(null);
+  const authenticated = !locked;
+  const configuredSources = useMemo<SourceStatus[]>(() => (status?.sources || status?.config.stream?.sources || []) as SourceStatus[], [status?.config.stream?.sources, status?.sources]);
+  const publicStreams = useMemo<PublicStreamSource[]>(() => status?.config.public_sources || [], [status?.config.public_sources]);
 
   const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
-    setToken("");
     setLocked(true);
+    setAuthChecked(true);
     setStatus(null);
     setGpu(null);
     setArango(null);
@@ -911,12 +1510,13 @@ export default function App() {
   }, []);
 
   const refreshStatus = useCallback(async () => {
-    if (!token) return;
     try {
-      const data = await api<StatusPayload>("/api/status", token);
+      const data = await api<StatusPayload>("/api/status");
+      setLocked(false);
+      setAuthChecked(true);
       setStatus(data);
       setSessionState("active");
-      const arangoStatus = await api<ArangoStatus>("/api/arango", token).catch((err) => ({
+      const arangoStatus = await api<ArangoStatus>("/api/arango").catch((err) => ({
         ok: true,
         connected: false,
         error: errorMessage(err),
@@ -927,14 +1527,14 @@ export default function App() {
         logout();
         return;
       }
+      setAuthChecked(true);
       setSessionState(`error: ${errorMessage(err)}`);
     }
-  }, [logout, token]);
+  }, [logout]);
 
   const refreshGpuTelemetry = useCallback(async () => {
-    if (!token) return;
     try {
-      const data = await api<GpuTelemetryPayload>("/api/nvidia-smi", token);
+      const data = await api<GpuTelemetryPayload>("/api/nvidia-smi");
       setGpu(data);
     } catch (err) {
       if (isUnauthorized(err)) {
@@ -958,11 +1558,11 @@ export default function App() {
         processes: [],
       });
     }
-  }, [logout, token]);
+  }, [logout]);
 
   useEffect(() => {
-    if (!authenticated) return;
     void refreshStatus();
+    if (!authenticated) return;
     void refreshGpuTelemetry();
     const statusTimer = window.setInterval(() => void refreshStatus(), 2500);
     const gpuTimer = window.setInterval(() => void refreshGpuTelemetry(), 5000);
@@ -972,25 +1572,21 @@ export default function App() {
     };
   }, [authenticated, refreshGpuTelemetry, refreshStatus]);
 
-  useEffect(() => {
-    if (!linksDirty) setLocalLinks(serverLinks);
-  }, [linksDirty, serverLinks]);
-
   async function login(password: string) {
-    const data = await api<{ ok: boolean; token: string }>("/api/auth/login", "", {
+    await api<{ ok: boolean }>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({ password }),
     });
-    setToken(data.token);
-    localStorage.setItem(TOKEN_KEY, data.token);
     setLocked(false);
+    setAuthChecked(true);
     setSessionState("active");
+    await refreshStatus();
   }
 
   async function streamAction(action: "start" | "restart" | "stop") {
     setPendingAction(action);
     try {
-      await api(`/api/stream/${action}`, token, {
+      await api(`/api/stream/${action}`, {
         method: "POST",
         body: JSON.stringify({ kill_existing: true }),
       });
@@ -1003,10 +1599,10 @@ export default function App() {
     }
   }
 
-  async function setEncoderMode(encoder: "auto" | "gpu-only" | "cpu") {
+  async function setEncoderMode(encoder: EncoderMode) {
     setPendingEncoder(true);
     try {
-      await api("/api/config", token, {
+      await api("/api/config", {
         method: "PUT",
         body: JSON.stringify({ encoder }),
       });
@@ -1022,11 +1618,10 @@ export default function App() {
   async function addLink(url: string) {
     setPendingLinks(true);
     try {
-      await api("/api/links", token, {
+      await api("/api/links", {
         method: "POST",
         body: JSON.stringify({ url }),
       });
-      setLinksDirty(false);
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();
@@ -1034,27 +1629,15 @@ export default function App() {
     } finally {
       setPendingLinks(false);
     }
-  }
-
-  function moveLink(index: number, direction: -1 | 1) {
-    setLocalLinks((current) => {
-      const target = index + direction;
-      if (target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-    setLinksDirty(true);
   }
 
   async function removeLink(url: string) {
     setPendingLinks(true);
     try {
-      await api("/api/links/remove", token, {
+      await api("/api/links/remove", {
         method: "POST",
         body: JSON.stringify({ url }),
       });
-      setLinksDirty(false);
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();
@@ -1064,23 +1647,124 @@ export default function App() {
     }
   }
 
-  async function saveLinks() {
+  async function activateSource(source: SourceStatus) {
     setPendingLinks(true);
     try {
-      await api("/api/config", token, {
-        method: "PUT",
-        body: JSON.stringify({ links: localLinks }),
+      await api("/api/sources/activate", {
+        method: "POST",
+        body: JSON.stringify({ id: source.id, url: source.url }),
       });
-      setLinksDirty(false);
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();
-      setSessionState(`link save error: ${errorMessage(err)}`);
+      setSessionState(`switch error: ${errorMessage(err)}`);
     } finally {
       setPendingLinks(false);
     }
   }
 
+  async function recoverSource(source: SourceStatus) {
+    setPendingLinks(true);
+    try {
+      await api("/api/sources/recover-soursignal", {
+        method: "POST",
+        body: JSON.stringify({ id: source.id, url: source.url }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`recover error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
+  async function addPublicStream(url: string, label?: string) {
+    setPendingLinks(true);
+    try {
+      await api("/api/public-streams", {
+        method: "POST",
+        body: JSON.stringify({ url, label }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`public source error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
+  async function removePublicStream(source: PublicStreamSource) {
+    setPendingLinks(true);
+    try {
+      await api("/api/public-streams/remove", {
+        method: "POST",
+        body: JSON.stringify({ id: source.id, url: source.url }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`public source error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
+  async function watchSource(inputUrl: string) {
+    setSourceBusy(true);
+    setSourceMsg(null);
+    try {
+      const isDirectStream =
+        inputUrl.split("?")[0].endsWith(".m3u8") ||
+        inputUrl.includes("load-playlist");
+      let streamUrl = inputUrl;
+      if (!isDirectStream) {
+        const data = (await api("/api/scrape", {
+          method: "POST",
+          body: JSON.stringify({ url: inputUrl }),
+        })) as { ok: boolean; links: string[]; count: number };
+        if (!data.ok || !data.links?.length) {
+          setSourceMsg("No streams found — try a direct stream URL");
+          return;
+        }
+        streamUrl = data.links[0];
+      }
+      const proxied = `/api/proxy-hls?url=${encodeURIComponent(streamUrl)}`;
+      setSourceOverride(proxied);
+      setSourceMsg("Watching custom source — stream active in player");
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSourceMsg("Failed to load source");
+    } finally {
+      setSourceBusy(false);
+    }
+  }
+
+  function clearSource() {
+    setSourceOverride(null);
+    setSourceMsg(null);
+  }
+
+  async function scrapeLinks(url: string): Promise<{ count: number }> {
+    const data = await api("/api/scrape", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }) as { ok: boolean; links: string[]; count: number };
+    if (!data.ok || !data.links?.length) return { count: 0 };
+    // Add each found link (server deduplicates)
+    for (const link of data.links) {
+      try {
+        await api("/api/links", { method: "POST", body: JSON.stringify({ url: link }) });
+      } catch {
+        // skip duplicates / bad links
+      }
+    }
+    await refreshStatus();
+    return { count: data.links.length };
+  }
+
+  if (!authenticated && !authChecked) return <main className="loginShell" />;
   if (!authenticated) return <LoginScreen onLogin={login} />;
 
   const hls = status?.hls || {};
@@ -1095,7 +1779,16 @@ export default function App() {
       <CommandHeader status={status} pendingAction={pendingAction} onStreamAction={streamAction} />
       <StatusStrip status={status} gpu={gpu} arango={arango} />
       <section className="primaryGrid">
-        <LivePlayer proc={proc} hls={hls} health={health} />
+        <LivePlayer
+          proc={proc}
+          hls={hls}
+          health={health}
+          overrideUrl={sourceOverride}
+          onWatchSource={watchSource}
+          onClearSource={clearSource}
+          sourceBusy={sourceBusy}
+          sourceMsg={sourceMsg}
+        />
         <aside className="rightRail">
           <HealthPanel health={health} hls={hls} proc={proc} />
           <ProcessPanel
@@ -1110,7 +1803,8 @@ export default function App() {
         </aside>
       </section>
       <section className="lowerGrid">
-        <LinksPanel links={localLinks} dirty={linksDirty} pending={pendingLinks} onAdd={addLink} onMove={moveLink} onRemove={removeLink} onSave={saveLinks} />
+        <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} onScrape={scrapeLinks} />
+        <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} />
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>
       <FooterStatus hls={hls} sessionState={sessionState} />

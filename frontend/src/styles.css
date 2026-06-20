@@ -29,10 +29,14 @@
   body,
   #root {
     @apply m-0 min-h-full;
+    width: 100%;
   }
 
   body {
     @apply bg-obby-bg text-obby-text;
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
     background:
       linear-gradient(180deg, rgba(168, 85, 247, 0.12), transparent 320px),
@@ -88,6 +92,14 @@
     @apply border-obby-bad bg-[#ff9aa5] text-[#1c0508];
   }
 
+  button.streamNow {
+    @apply border-obby-accent bg-obby-accent/20 text-obby-accent;
+  }
+
+  button.streamNow:hover:not(:disabled) {
+    @apply bg-obby-accent/35;
+  }
+
   .muted {
     @apply text-obby-muted;
   }
@@ -97,7 +109,11 @@
   }
 
   .loginShell {
-    @apply grid min-h-screen place-items-center p-6;
+    @apply grid min-h-dvh place-items-center p-6;
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+    padding-top: max(1.5rem, env(safe-area-inset-top));
+    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
   }
 
   .loginPanel {
@@ -142,12 +158,19 @@
   }
 
   .appShell {
-    @apply mx-auto w-[min(1680px,calc(100%-24px))] py-3.5;
+    @apply mx-auto w-full max-w-[1680px] px-3 py-3.5;
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+    padding-bottom: max(0.875rem, env(safe-area-inset-bottom));
   }
 
   .commandHeader {
     @apply flex min-h-[120px] items-end justify-between gap-5 rounded-lg border border-obby-line p-4 shadow-obby;
     background: linear-gradient(180deg, #171220, #100d17);
+  }
+
+  .commandHeader > div:first-child {
+    @apply min-w-0 flex-1;
   }
 
   .commandHeader h1 {
@@ -156,14 +179,16 @@
 
   .monoLine {
     @apply mt-2.5 max-w-full break-words font-mono text-[0.82rem] text-obby-muted;
+    overflow-wrap: anywhere;
   }
 
   .commandActions {
-    @apply flex flex-wrap justify-end gap-2;
+    @apply flex min-w-0 flex-wrap justify-end gap-2;
   }
 
   .statusStrip {
-    @apply mt-2.5 grid grid-cols-6 gap-2.5;
+    @apply mt-2.5 grid gap-2.5;
+    grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
   }
 
   .panel,
@@ -175,7 +200,7 @@
   }
 
   .panel {
-    @apply overflow-hidden;
+    @apply min-w-0 overflow-hidden;
   }
 
   .panelHeader {
@@ -213,7 +238,7 @@
   }
 
   .metricTile {
-    @apply min-h-[76px] overflow-hidden bg-obby-tile px-3 py-2.5;
+    @apply min-h-[74px] min-w-0 overflow-hidden bg-obby-tile px-3 py-2.5;
   }
 
   .metricTile span {
@@ -222,6 +247,7 @@
 
   .metricTile strong {
     @apply mt-1.5 block break-words text-sm font-extrabold text-obby-text;
+    overflow-wrap: anywhere;
   }
 
   .metricTile.tone-ok,
@@ -241,11 +267,11 @@
 
   .primaryGrid {
     @apply mt-2.5 grid items-start gap-2.5;
-    grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.75fr);
+    grid-template-columns: minmax(0, 1.45fr) minmax(min(430px, 100%), 0.75fr);
   }
 
   .rightRail {
-    @apply grid gap-2.5;
+    @apply grid min-w-0 gap-2.5;
   }
 
   .stagePanel {
@@ -253,7 +279,7 @@
   }
 
   .videoSurface {
-    @apply relative aspect-video w-full overflow-hidden bg-black;
+    @apply relative aspect-video min-w-0 w-full overflow-hidden bg-black;
     background:
       linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
       linear-gradient(180deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
@@ -284,36 +310,242 @@
   }
 
   .playerTopRail {
-    @apply flex items-center justify-between gap-3 text-xs font-bold text-obby-muted;
+    @apply flex min-w-0 items-center justify-between gap-3 text-xs font-bold text-obby-muted;
+  }
+
+  .playerTopRail > span {
+    @apply min-w-0 truncate;
+  }
+
+  .playerSignalLine {
+    @apply flex min-w-0 items-center gap-2;
+  }
+
+  .playerMetaLine {
+    @apply shrink-0 text-[0.72rem] text-obby-muted;
   }
 
   .playerBottomRail {
-    @apply pointer-events-auto grid items-center gap-2 rounded-lg border border-obby-line-strong/70 bg-[#0b0910]/90 p-2 shadow-obby backdrop-blur;
-    grid-template-columns: auto auto minmax(130px, 1fr) auto auto auto auto auto;
+    @apply pointer-events-auto flex flex-wrap items-center justify-between gap-2 rounded-lg border border-obby-line-strong/70 bg-[#0b0910]/90 p-2 shadow-obby backdrop-blur;
   }
 
-  .playerControl {
-    @apply min-h-9 rounded-lg border border-obby-line-strong bg-[#191324]/90 px-3 py-1.5 text-xs font-black text-obby-text shadow-none;
+  .playerControlRow,
+  .playerActionRow {
+    @apply flex min-w-0 items-center gap-2;
   }
 
-  .playerControl.primary {
+  .playerControlRow {
+    @apply flex-1 flex-wrap;
+  }
+
+  .playerIconButton {
+    @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-obby-line-strong bg-[#191324]/90 text-obby-text;
+  }
+
+  .playerIconButton:hover:not(:disabled),
+  .playerIconButton.active {
+    @apply border-obby-accent bg-obby-accent/20;
+  }
+
+  .playerIconButton.primary {
     @apply border-obby-accent bg-obby-accent-strong text-[#12051d];
   }
 
-  .playerControl.link {
-    @apply no-underline;
+  .playerIcon {
+    @apply h-5 w-5;
   }
 
-  .volumeControl {
-    @apply flex min-h-9 items-center gap-2 rounded-lg border border-obby-line-strong bg-[#191324]/90 px-3 text-xs font-black text-obby-muted;
+  .volumeCluster {
+    @apply relative;
   }
 
-  .volumeControl input {
+  .volumePopover,
+  .playerMoreMenu {
+    @apply absolute bottom-[calc(100%+8px)] z-30 rounded-lg border border-obby-line-strong bg-[#100d17] p-2 shadow-obby;
+  }
+
+  .volumePopover {
+    @apply right-0 grid min-w-[220px] gap-2;
+  }
+
+  .volumeMuteButton {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-obby-line-strong bg-[#171220] px-3 text-sm font-bold text-obby-text;
+  }
+
+  .volumeSliderRow {
+    @apply flex items-center gap-2 text-xs font-bold text-obby-muted;
+  }
+
+  .volumeSliderRow input {
     @apply h-2 min-h-0 w-full cursor-pointer appearance-none rounded-full border-0 bg-obby-line-strong p-0 accent-obby-accent;
   }
 
-  .volumeControl input::-webkit-slider-thumb {
+  .volumeSliderRow input::-webkit-slider-thumb {
     @apply h-4 w-4 appearance-none rounded-full bg-obby-accent-strong;
+  }
+
+  .liveChip {
+    @apply inline-flex min-h-10 shrink-0 items-center gap-2 rounded-lg border border-obby-bad/50 bg-[#2a1117] px-3 text-xs font-black text-[#ffb3be];
+  }
+
+  .liveChip span {
+    @apply h-2.5 w-2.5 rounded-full bg-obby-bad;
+  }
+
+  .playerReadout {
+    @apply min-w-0 truncate text-xs font-semibold text-obby-muted;
+  }
+
+  .sourceDots {
+    @apply flex shrink-0 items-center gap-1.5;
+  }
+
+  .sourceDot {
+    @apply h-2.5 w-2.5 rounded-full border border-white/12;
+  }
+
+  .sourceDot.active {
+    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.18);
+  }
+
+  .sourceDot-green {
+    background: #73f0a8;
+  }
+
+  .sourceDot-yellow {
+    background: #f0bf57;
+  }
+
+  .sourceDot-red {
+    background: #ff6f7f;
+  }
+
+  .playerMoreMenu {
+    @apply right-3 grid w-[min(360px,calc(100%-24px))] gap-2;
+  }
+
+  .playerMoreGrid {
+    @apply grid gap-2;
+  }
+
+  .playerMenuButton {
+    @apply grid min-h-[58px] w-full gap-1 rounded-lg border border-obby-line-strong bg-[#171220] px-3 py-2 text-left;
+  }
+
+  .playerMenuButton strong {
+    @apply text-sm text-obby-text;
+  }
+
+  .playerMenuButton span {
+    @apply text-xs font-semibold text-obby-muted;
+  }
+
+  .customDropdown {
+    @apply relative;
+    min-width: min(220px, 100%);
+  }
+
+  .dropdownButton {
+    @apply flex min-h-[44px] w-full min-w-0 items-center justify-between gap-3 rounded-lg border border-obby-line-strong bg-[#191324]/95 px-3 py-2 text-left text-obby-text shadow-none;
+  }
+
+  .dropdownButton:hover:not(:disabled),
+  .dropdownButton[aria-expanded="true"] {
+    @apply border-obby-accent bg-[#22172f] translate-y-0;
+  }
+
+  .dropdownButton:focus-visible {
+    @apply outline-none;
+    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.24);
+  }
+
+  .dropdownButton > span:first-child {
+    @apply grid min-w-0 gap-0.5;
+  }
+
+  .dropdownLabel,
+  .dropdownStatus {
+    @apply text-[0.67rem] font-black uppercase tracking-normal text-obby-muted;
+  }
+
+  .dropdownButton strong {
+    @apply truncate text-sm font-black leading-tight;
+  }
+
+  .dropdownStatus {
+    @apply normal-case text-obby-accent-strong;
+  }
+
+  .dropdownChevron {
+    @apply h-2.5 w-2.5 shrink-0 rotate-45 border-b-2 border-r-2 border-obby-accent-strong transition;
+    transform: translateY(-2px) rotate(45deg);
+  }
+
+  .dropdownButton[aria-expanded="true"] .dropdownChevron {
+    transform: translateY(2px) rotate(225deg);
+  }
+
+  .dropdownPanel {
+    @apply absolute right-0 top-[calc(100%+8px)] z-30 grid max-h-[320px] min-w-full gap-1 overflow-auto rounded-lg border border-obby-line-strong bg-[#100d17] p-1.5 shadow-obby;
+    width: max-content;
+    max-width: min(360px, calc(100vw - 24px));
+  }
+
+  .customDropdown.drop-up .dropdownPanel {
+    top: auto;
+    bottom: calc(100% + 8px);
+  }
+
+  .customDropdown.drop-down .dropdownPanel {
+    top: calc(100% + 8px);
+    bottom: auto;
+  }
+
+  .dropdownOption {
+    @apply grid min-h-[54px] w-full min-w-0 grid-cols-[1fr_auto] items-center gap-3 rounded-md border border-transparent bg-transparent px-3 py-2 text-left text-obby-text shadow-none;
+  }
+
+  .dropdownOption:hover:not(:disabled),
+  .dropdownOption.active {
+    @apply border-obby-line-strong bg-obby-accent/15 translate-y-0;
+  }
+
+  .dropdownOption.selected {
+    @apply border-obby-accent bg-obby-accent/20;
+  }
+
+  .dropdownOption.danger {
+    @apply text-obby-bad;
+  }
+
+  .dropdownOption span {
+    @apply grid min-w-0 gap-0.5;
+  }
+
+  .dropdownOption strong {
+    @apply truncate text-sm font-black;
+  }
+
+  .dropdownOption small {
+    @apply truncate text-xs font-semibold text-obby-muted;
+  }
+
+  .dropdownOption em {
+    @apply rounded-md border border-obby-accent/45 px-2 py-1 text-[0.67rem] not-italic text-obby-accent-strong;
+  }
+
+  .playerMenu {
+    min-width: min(178px, 100%);
+  }
+
+  .playerMenu .dropdownButton {
+    @apply min-h-9 px-3 py-1.5 text-xs;
+  }
+
+  .playerMenu .dropdownPanel {
+    top: auto;
+    bottom: calc(100% + 8px);
+    width: min(300px, 82vw);
   }
 
   .playerToolbar,
@@ -322,11 +554,13 @@
   }
 
   .inlineMetric {
-    @apply inline-flex min-h-[42px] items-center gap-1.5 bg-[#15111d] px-2.5 py-2 text-obby-muted;
+    @apply inline-flex min-h-[42px] min-w-0 max-w-full items-center gap-1.5 bg-[#15111d] px-2.5 py-2 text-obby-muted;
   }
 
   .inlineMetric strong {
     @apply break-words text-obby-text;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .panelMessage {
@@ -338,11 +572,11 @@
   }
 
   .metricGrid.two {
-    @apply grid-cols-2;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .metricGrid.three {
-    @apply grid-cols-3;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .chipRow {
@@ -359,7 +593,7 @@
   }
 
   .encoderControl {
-    @apply flex items-center justify-between gap-3 p-3;
+    @apply flex min-w-0 items-center justify-between gap-3 p-3;
   }
 
   .encoderControl span {
@@ -370,25 +604,12 @@
     @apply mt-1 block break-words;
   }
 
-  .segmentedControl {
-    @apply inline-flex overflow-hidden rounded-lg border border-obby-line-strong bg-[#0b0910];
-  }
-
-  .segmentedControl button {
-    @apply min-h-[38px] min-w-[66px] rounded-none border-0 bg-transparent px-2.5 py-2 text-obby-muted;
-  }
-
-  .segmentedControl button + button {
-    @apply border-l border-obby-line;
-  }
-
-  .segmentedControl button.active {
-    @apply bg-obby-accent/20 text-obby-text;
-    box-shadow: inset 0 -2px 0 var(--color-obby-accent);
+  .encoderDropdown {
+    @apply w-[260px];
   }
 
   .subsection {
-    @apply px-3 pb-3;
+    @apply min-w-0 px-3 pb-3;
   }
 
   .subsection h3 {
@@ -396,7 +617,7 @@
   }
 
   .feedBox {
-    @apply max-h-56 overflow-auto bg-[#0b0910];
+    @apply max-h-56 min-w-0 overflow-auto bg-[#0b0910];
   }
 
   .logBox {
@@ -406,6 +627,7 @@
   .feedLine,
   .emptyLine {
     @apply break-words border-b border-white/5 px-2.5 py-2 text-xs leading-normal text-[#ddd6ec];
+    overflow-wrap: anywhere;
   }
 
   .feedLine:last-child,
@@ -427,11 +649,31 @@
 
   .lowerGrid {
     @apply mt-2.5 grid items-start gap-2.5;
-    grid-template-columns: minmax(300px, 0.72fr) minmax(0, 1.28fr);
+    grid-template-columns: minmax(min(390px, 100%), 0.72fr) minmax(0, 1.28fr);
   }
 
   .addLink {
     @apply grid grid-cols-[1fr_auto] gap-2 p-3;
+  }
+
+  .publicSourceForm {
+    grid-template-columns: minmax(120px, 0.35fr) minmax(180px, 1fr) auto;
+  }
+
+  .scrapeForm {
+    @apply border-b border-obby-line pb-0;
+  }
+
+  .scrapeResult {
+    @apply px-3 pb-1 text-xs text-obby-muted;
+  }
+
+  .sourceChanger {
+    @apply border-t border-obby-line;
+  }
+
+  .sourceChanger .addLink {
+    @apply grid-cols-[1fr_auto_auto];
   }
 
   .linksList {
@@ -439,11 +681,19 @@
   }
 
   .linkItem {
-    @apply bg-obby-tile p-2.5;
+    @apply min-w-0 bg-obby-tile p-2.5;
   }
 
   .linkTop {
     @apply flex items-center justify-between gap-2;
+  }
+
+  .sourceItem {
+    @apply border border-obby-line;
+  }
+
+  .sourceBadges {
+    @apply flex flex-wrap justify-end gap-1.5;
   }
 
   .linkTop strong {
@@ -452,6 +702,11 @@
 
   .linkItem p {
     @apply mt-2 break-words font-mono text-xs text-[#ddd6ec];
+    overflow-wrap: anywhere;
+  }
+
+  .linkItem .sourceMeta {
+    @apply mt-1 font-sans text-xs text-obby-muted;
   }
 
   .linkActions {
@@ -463,7 +718,8 @@
   }
 
   .telemetryFeeds {
-    @apply grid grid-cols-2;
+    @apply grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   }
 
   .telemetryFeeds .feedBox {
@@ -471,15 +727,12 @@
   }
 
   .footerStatus {
-    @apply mt-2.5 rounded-lg border border-obby-line bg-[#100d17];
+    @apply mt-2.5 grid rounded-lg border border-obby-line bg-[#100d17];
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   }
 }
 
 @media (max-width: 1360px) {
-  .statusStrip {
-    @apply grid-cols-3;
-  }
-
   .primaryGrid {
     @apply grid-cols-1;
   }
@@ -501,9 +754,17 @@
   }
 }
 
+@media (max-width: 1040px) {
+  .rightRail {
+    @apply grid-cols-1;
+  }
+}
+
 @media (max-width: 880px) {
   .appShell {
-    @apply w-[calc(100%-16px)] py-2.5;
+    @apply px-2 py-2.5;
+    padding-left: max(0.5rem, env(safe-area-inset-left));
+    padding-right: max(0.5rem, env(safe-area-inset-right));
   }
 
   .commandHeader {
@@ -518,7 +779,6 @@
     @apply flex-1 basis-28;
   }
 
-  .statusStrip,
   .rightRail,
   .metricGrid.three,
   .telemetryFeeds {
@@ -533,12 +793,8 @@
     @apply flex-col items-stretch;
   }
 
-  .segmentedControl {
+  .encoderDropdown {
     @apply w-full;
-  }
-
-  .segmentedControl button {
-    @apply flex-1 basis-0;
   }
 
   .playerBottomRail {
@@ -547,6 +803,10 @@
 
   .volumeControl {
     @apply col-span-2;
+  }
+
+  .playerMenu {
+    @apply col-span-2 min-w-0;
   }
 
   .playerToolbar .inlineMetric {
@@ -558,9 +818,48 @@
   }
 }
 
+@media (max-width: 720px) {
+  .stagePanel {
+    @apply overflow-visible;
+  }
+
+  .videoSurface {
+    @apply aspect-auto overflow-visible rounded-b-lg;
+  }
+
+  .videoSurface .video-js {
+    @apply h-auto! min-h-0;
+    aspect-ratio: 16 / 9;
+  }
+
+  .customPlayerChrome {
+    @apply pointer-events-auto static grid gap-2 p-2;
+    background: #0b0910;
+  }
+
+  .playerTopRail {
+    @apply rounded-lg border border-obby-line bg-[#15111d] px-2.5 py-2;
+  }
+
+  .playerBottomRail {
+    @apply shadow-none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .playerMenu .dropdownPanel {
+    top: auto;
+    bottom: calc(100% + 8px);
+  }
+}
+
 @media (max-width: 560px) {
   .loginShell {
     @apply p-3;
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+    padding-top: max(0.75rem, env(safe-area-inset-top));
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
   }
 
   .loginPanel {
@@ -568,13 +867,60 @@
   }
 
   .loginForm,
-  .metricGrid.two,
-  .statusStrip {
+  .metricGrid.two {
     @apply grid-cols-1;
   }
 
   .commandHeader h1,
   .loginPanel h1 {
     @apply text-[1.72rem];
+  }
+
+  .customDropdown .dropdownPanel,
+  .playerMenu .dropdownPanel {
+    position: fixed !important;
+    top: auto !important;
+    left: max(0.5rem, env(safe-area-inset-left)) !important;
+    right: max(0.5rem, env(safe-area-inset-right)) !important;
+    bottom: max(0.5rem, env(safe-area-inset-bottom)) !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    max-height: min(320px, calc(100dvh - 1rem)) !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .commandHeader {
+    @apply p-3;
+  }
+
+  .commandActions {
+    @apply grid grid-cols-1;
+  }
+
+  .commandActions button {
+    @apply w-full basis-auto;
+  }
+
+  .panelHeader {
+    @apply min-h-0 flex-col items-start;
+  }
+
+  .panelMeta {
+    @apply w-full justify-start;
+  }
+
+  .playerBottomRail {
+    @apply grid-cols-1;
+  }
+
+  .volumeControl,
+  .playerMenu {
+    @apply col-span-1;
+  }
+
+  .footerStatus {
+    @apply gap-2;
   }
 }

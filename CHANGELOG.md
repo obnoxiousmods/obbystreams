@@ -8,6 +8,8 @@ All notable Obbystreams changes are tracked here.
 
 - Expanded live dashboard SEO metadata with canonical URL, Open Graph, Twitter Card, JSON-LD, manifest, favicon, robots, sitemap, and social preview assets.
 - Expanded GitHub Pages SEO config with canonical site URL, base URL, page descriptions, social image, Jekyll SEO tag, Jekyll sitemap, and robots output.
+- Replaced selector-style dashboard controls with custom React dropdown/listbox menus, including the encoder picker and live player overflow actions, while keeping native Video.js dropdowns disabled.
+- Expanded responsive dashboard support with safe-area spacing, intrinsic grids, mobile player controls, phone bottom-sheet menus, viewport-aware dropdown placement, and a Playwright viewport screenshot checker.
 
 ## 0.2.1 - 2026-04-18
 

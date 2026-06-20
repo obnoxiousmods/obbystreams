@@ -12,6 +12,9 @@ stream:
   encoder: auto # use gpu-only or cpu for strict dashboard toggles
   output_dir: /var/www/live.obnoxious.lol/stream
   ffmpeg_log_dir: ffmpegLogs
+  scrape_urls:
+    - https://icelz.to/ufc/aEWt.php
+  public_dash_url: https://live.obnoxious.lol/stream/ufc.mpd
   public_hls_url: https://live.obnoxious.lol/stream/ufc.m3u8
   auto_recover: true
   auto_restart_on_exit: true
@@ -24,15 +27,49 @@ stream:
   failure_score_threshold: -120
   confirmed_failure_samples: 2
   failure_ramp_seconds: 60
-  bitrate: 6M
+  bitrate: 8M
+  bitrate_720: 3500k
+  maxrate_720: 4500k
+  bufsize_720: 9000k
+  maxrate_1080: 12M
+  bufsize_1080: 24M
   audio_bitrate: 192k
+  include_auto_public_sources: true
+  source_manifest_path: /tmp/obbystreams-sources.json
+  soursignal_auto_recover: true
   restart_delay: 2
   max_restart_delay: 120
   rate_limit_delay: 180
   stop_after_failed_rounds: 2
+  sources:
+    - id: primary-hls
+      label: Primary HLS
+      type: hls
+      url: https://example.com/primary/live.m3u8
+      enabled: true
+      headers: {}
+    - id: sour-signal-main
+      label: Sour Signal
+      type: soursignal
+      url: https://soursignal.com/example
+      enabled: true
+      headers:
+        Referer: https://soursignal.com/
+        User-Agent: Mozilla/5.0
+  # Compatibility projection; source records are authoritative.
   links:
     - https://example.com/primary/live.m3u8
     - https://example.com/backup/live.m3u8
+
+# Pasted public internet streams shown on fight.nswfiles.com. These are not
+# ffmpeg inputs for the official managed stream; playback is proxied by
+# /api/proxy-hls to avoid browser CORS failures.
+public_sources:
+  - id: public-example
+    label: Public example
+    type: public-hls
+    url: https://example.com/public/live.m3u8
+    enabled: false
 
 arangodb:
   enabled: true

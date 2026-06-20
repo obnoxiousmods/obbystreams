@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""obbystreams - resilient stream transcoder to HLS."""
+"""obbystreams - resilient stream transcoder to DASH and HLS."""
 
 import argparse
 import contextlib
@@ -40,6 +40,50 @@ def ansi(text, code, args=None):
     if not want_color(args):
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+def load_source_headers(path):
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{APP_NAME}: could not load source config {path}: {exc}", file=sys.stderr)
+        return {}
+    headers_by_url = {}
+    for source in payload.get("sources", []) if isinstance(payload, dict) else []:
+        if not isinstance(source, dict):
+            continue
+        url = str(source.get("url") or "").strip()
+        raw_headers = source.get("headers") or {}
+        if not url or not isinstance(raw_headers, dict):
+            continue
+        headers = {}
+        for key, value in raw_headers.items():
+            name = str(key or "").strip()
+            if not name or any(ch in name for ch in "\r\n:"):
+                continue
+            headers[name] = str(value or "").strip()
+        if headers:
+            headers_by_url[url] = headers
+    return headers_by_url
+
+
+def header_value(headers, name, fallback=None):
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return fallback
+
+
+def ffmpeg_extra_headers(headers):
+    return "".join(
+        f"{name}: {value}\r\n"
+        for name, value in headers.items()
+        if name.lower() not in {"user-agent"}
+    )
 
 
 def icon(text, args=None):
@@ -278,7 +322,13 @@ def safe_file_size(path):
 
 def hls_probe(output_dir):
     playlist = os.path.join(output_dir, "ufc.m3u8")
-    segments = sorted(glob.glob(os.path.join(output_dir, "ufc*.ts")))
+    dash_manifest = os.path.join(output_dir, "ufc.mpd")
+    media_playlists = sorted(glob.glob(os.path.join(output_dir, "media_*.m3u8")))
+    segments = sorted(
+        glob.glob(os.path.join(output_dir, "ufc*.ts"))
+        + glob.glob(os.path.join(output_dir, "ufc*.m4s"))
+        + glob.glob(os.path.join(output_dir, "ufc*.mp4"))
+    )
     segment_names = []
     media_sequence = None
     target_duration = None
@@ -291,17 +341,35 @@ def hls_probe(output_dir):
                         media_sequence = line.split(":", 1)[1]
                     elif line.startswith("#EXT-X-TARGETDURATION:"):
                         target_duration = line.split(":", 1)[1]
-                    elif line and not line.startswith("#"):
+                    elif line and not line.startswith("#") and not line.endswith(".m3u8"):
                         segment_names.append(line)
         except OSError:
             segment_names = []
+    if not segment_names:
+        for media_playlist in media_playlists:
+            try:
+                with open(media_playlist, encoding="utf-8", errors="replace") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                            media_sequence = line.split(":", 1)[1]
+                        elif line.startswith("#EXT-X-TARGETDURATION:"):
+                            target_duration = line.split(":", 1)[1]
+                        elif line and not line.startswith("#") and not line.endswith(".m3u8"):
+                            segment_names.append(line)
+            except OSError:
+                continue
     playlist_mtime = os.path.getmtime(playlist) if os.path.exists(playlist) else None
+    dash_mtime = os.path.getmtime(dash_manifest) if os.path.exists(dash_manifest) else None
     last_segment = os.path.join(output_dir, segment_names[-1]) if segment_names else None
     return {
         "playlist_exists": os.path.exists(playlist),
+        "dash_manifest_exists": os.path.exists(dash_manifest),
         "playlist_ready": bool(segment_names),
         "playlist_age": max(0.0, time.time() - playlist_mtime) if playlist_mtime else None,
+        "dash_manifest_age": max(0.0, time.time() - dash_mtime) if dash_mtime else None,
         "playlist_modified_at": playlist_mtime,
+        "dash_manifest_modified_at": dash_mtime,
         "segment_count": len(segments),
         "bytes": sum(safe_file_size(path) for path in segments),
         "media_sequence": media_sequence,
@@ -455,7 +523,7 @@ def kill_instances(procs):
 
 
 def cleanup(stream_dir):
-    for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.tmp"):
+    for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.mpd", "ufc*.m4s", "ufc*.mp4", "media_*.m3u8", "*.tmp"):
         for f in glob.glob(os.path.join(stream_dir, pattern)):
             with contextlib.suppress(OSError):
                 os.remove(f)
@@ -670,6 +738,7 @@ def choose_encoder(args):
 def build_ffmpeg_cmd(args, url, encoder):
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     network_input = url.startswith(("http://", "https://", "rtmp://", "rtmps://"))
+    source_headers = getattr(args, "source_headers", {}).get(url, {})
 
     if not args.verbose:
         cmd += ["-loglevel", "warning"]
@@ -677,13 +746,16 @@ def build_ffmpeg_cmd(args, url, encoder):
 
     cmd += encoder.global_args
     if network_input:
+        extra_headers = ffmpeg_extra_headers(source_headers)
         cmd += [
-            "-user_agent", USER_AGENT,
+            "-user_agent", header_value(source_headers, "User-Agent", USER_AGENT),
             "-timeout", str(args.timeout * 1_000_000),
             "-rw_timeout", str(args.timeout * 1_000_000),
         ]
+        if extra_headers:
+            cmd += ["-headers", extra_headers]
 
-    fflags = "+genpts+discardcorrupt+nobuffer" if network_input else "+genpts+discardcorrupt"
+    fflags = "+genpts+discardcorrupt"
     cmd += [
         "-fflags", fflags,
         "-err_detect", "ignore_err",
@@ -701,26 +773,54 @@ def build_ffmpeg_cmd(args, url, encoder):
             "-reconnect_delay_max", str(args.reconnect_delay),
         ]
 
+    if network_input:
+        cmd += ["-re"]
+
     cmd += ["-i", url]
 
-    if encoder.key == "cpu":
-        cmd += ["-c:v", "libx264", "-preset", args.preset]
-    else:
-        cmd += encoder.video_args
+    video_codec = "h264_nvenc" if encoder.key == "nvenc" else "libx264"
+    if encoder.key not in ("cpu", "nvenc"):
+        print(warn(f"{APP_NAME}: ABR DASH/HLS output supports CPU/NVENC cleanly; using CPU encode instead of {encoder.key}.", args))
 
     cmd += [
-        "-b:v", args.video_bitrate,
-        "-maxrate", args.maxrate,
-        "-bufsize", args.bufsize,
-        "-g", str(args.gop),
-        "-keyint_min", str(args.gop),
-        "-force_key_frames", f"expr:gte(t,n_forced*{args.hls_time})",
+        "-filter_complex",
+        "[0:v]fps=60000/1001,split=2[v720in][v1080in];"
+        "[v720in]scale=w=1280:h=720:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p[v720];"
+        "[v1080in]scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p[v1080]",
+        "-map", "[v720]",
+        "-map", "[v1080]",
+        "-map", "0:a:0?",
+        "-c:v:0", video_codec,
+        "-c:v:1", video_codec,
     ]
 
-    if encoder.key in ("cpu", "nvenc"):
-        # Let the encoder choose the H.264 level. Forcing 4.1 makes NVENC fail
-        # hard on high frame-rate/resolution sources that exceed that level.
-        cmd += ["-profile:v", "high"]
+    if video_codec == "libx264":
+        cmd += ["-preset:v:0", args.preset, "-preset:v:1", args.preset, "-tune:v:0", "zerolatency", "-tune:v:1", "zerolatency"]
+    else:
+        cmd += ["-preset:v:0", "p4", "-preset:v:1", "p4", "-tune:v:0", "ll", "-tune:v:1", "ll", "-rc:v:0", "vbr", "-rc:v:1", "vbr"]
+
+    cmd += [
+        "-b:v:0", args.video_bitrate_720,
+        "-maxrate:v:0", args.maxrate_720,
+        "-bufsize:v:0", args.bufsize_720,
+        "-b:v:1", args.video_bitrate_1080,
+        "-maxrate:v:1", args.maxrate_1080,
+        "-bufsize:v:1", args.bufsize_1080,
+        "-g:v:0", str(args.gop),
+        "-g:v:1", str(args.gop),
+        "-keyint_min:v:0", str(args.gop),
+        "-keyint_min:v:1", str(args.gop),
+        "-force_key_frames:v:0", f"expr:gte(t,n_forced*{args.hls_time})",
+        "-force_key_frames:v:1", f"expr:gte(t,n_forced*{args.hls_time})",
+        "-profile:v:0", "high",
+        "-profile:v:1", "high",
+    ]
+
+    if video_codec == "libx264":
+        cmd += [
+            "-level:v:0", "4.1",
+            "-level:v:1", "4.1",
+        ]
 
     cmd += [
         "-c:a", "aac",
@@ -728,15 +828,21 @@ def build_ffmpeg_cmd(args, url, encoder):
         "-ac", "2",
         "-af", "aresample=async=1:first_pts=0",
         "-max_muxing_queue_size", "9999",
-        "-f", "hls",
-        "-hls_time", str(args.hls_time),
-        "-hls_list_size", str(args.hls_size),
-        "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
-        "-hls_delete_threshold", str(args.hls_delete_threshold),
-        "-hls_segment_type", "mpegts",
-        "-hls_segment_filename", os.path.join(args.output_dir, "ufc_%06d.ts"),
-        "-start_number", "1",
-        os.path.join(args.output_dir, "ufc.m3u8"),
+        "-f", "dash",
+        "-seg_duration", str(args.hls_time),
+        "-frag_duration", str(args.hls_time),
+        "-window_size", str(args.hls_size),
+        "-extra_window_size", str(args.hls_delete_threshold),
+        "-use_template", "1",
+        "-use_timeline", "1",
+        "-dash_segment_type", "mp4",
+        "-hls_playlist", "1",
+        "-hls_master_name", "ufc.m3u8",
+        "-master_m3u8_publish_rate", "1",
+        "-init_seg_name", "ufc_init_$RepresentationID$.$ext$",
+        "-media_seg_name", "ufc_chunk_$RepresentationID$_$Number%06d$.$ext$",
+        "-adaptation_sets", "id=0,streams=0,1 id=1,streams=2",
+        os.path.join(args.output_dir, "ufc.mpd"),
     ]
 
     return cmd
@@ -1046,7 +1152,7 @@ def keyboard_thread(state, health, args):
 def parser_for_args():
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Obbystreams transcoder - resilient HLS output with smart GPU and URL fallback.",
+        description="Obbystreams transcoder - resilient DASH/HLS output with smart GPU and URL fallback.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1055,6 +1161,8 @@ def parser_for_args():
                         help="Stream URL; repeat like --link URL1 --link URL2")
     parser.add_argument("--links", dest="links", metavar="URL", nargs="+",
                         help="One or more stream URLs after a single --links flag")
+    parser.add_argument("--source-config", dest="source_config", default="",
+                        help="JSON source manifest with per-source request headers")
 
     enc = parser.add_mutually_exclusive_group()
     enc.add_argument("--encoder", default="auto",
@@ -1079,14 +1187,20 @@ def parser_for_args():
     parser.add_argument("--preset", default="veryfast",
                         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
                         help="x264 preset (CPU only)")
-    parser.add_argument("--bitrate", "-b", default="6M", dest="video_bitrate", help="Video bitrate")
-    parser.add_argument("--maxrate", default="8M", help="Max video bitrate")
-    parser.add_argument("--bufsize", default="16M", help="Video buffer size")
+    parser.add_argument("--bitrate", "-b", default="8M", dest="video_bitrate", help="Video bitrate")
+    parser.add_argument("--maxrate", default="12M", help="Max video bitrate")
+    parser.add_argument("--bufsize", default="24M", help="Video buffer size")
+    parser.add_argument("--bitrate-720", default="3500k", dest="video_bitrate_720", help="720p rendition video bitrate")
+    parser.add_argument("--maxrate-720", default="4500k", dest="maxrate_720", help="720p rendition max video bitrate")
+    parser.add_argument("--bufsize-720", default="9000k", dest="bufsize_720", help="720p rendition video buffer size")
+    parser.add_argument("--bitrate-1080", default=None, dest="video_bitrate_1080", help="1080p rendition video bitrate")
+    parser.add_argument("--maxrate-1080", default=None, dest="maxrate_1080", help="1080p rendition max video bitrate")
+    parser.add_argument("--bufsize-1080", default=None, dest="bufsize_1080", help="1080p rendition video buffer size")
     parser.add_argument("--audio-bitrate", "-ab", default="192k", dest="audio_bitrate", help="Audio bitrate")
     parser.add_argument("--hls-time", default=4, type=int, help="HLS segment duration in seconds")
     parser.add_argument("--hls-size", default=10, type=int, help="HLS playlist size in segments")
     parser.add_argument("--hls-delete-threshold", default=4, type=int, help="Extra old HLS segments to keep")
-    parser.add_argument("--gop", default=60, type=int, help="GOP / keyframe interval")
+    parser.add_argument("--gop", default=120, type=int, help="GOP / keyframe interval")
     parser.add_argument("--output-dir", default=DEFAULT_STREAM_DIR, dest="output_dir", help="HLS output directory")
     parser.add_argument("--ffmpeg-log-dir", default=DEFAULT_FFMPEG_LOG_DIR, dest="ffmpeg_log_dir",
                         help="Directory for one persistent log file per ffmpeg process")
@@ -1149,10 +1263,14 @@ def main():
     os.umask(0o002)
     parser = parser_for_args()
     args = parser.parse_args()
+    args.video_bitrate_1080 = args.video_bitrate_1080 or args.video_bitrate
+    args.maxrate_1080 = args.maxrate_1080 or args.maxrate
+    args.bufsize_1080 = args.bufsize_1080 or args.bufsize
     args.reconnect = not args.no_reconnect
     args.min_assessment_seconds = max(15.0, float(args.min_assessment_seconds))
     args.confirmed_failure_samples = max(1, int(args.confirmed_failure_samples))
     args.failure_ramp_seconds = max(15.0, float(args.failure_ramp_seconds))
+    args.source_headers = load_source_headers(args.source_config)
 
     urls = list(args.url or []) + list(args.link or []) + list(args.links or [])
     if not urls:

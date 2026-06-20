@@ -14,7 +14,13 @@ export interface PublicConfig {
     ffmpeg_log_dir?: string;
     public_hls_url?: string;
     bitrate?: string;
+    bitrate_720?: string;
+    maxrate_720?: string;
+    bufsize_720?: string;
+    maxrate_1080?: string;
+    bufsize_1080?: string;
     audio_bitrate?: string;
+    include_auto_public_sources?: boolean;
     auto_recover?: boolean;
     auto_restart_on_exit?: boolean;
     watchdog_restart_cooldown?: number;
@@ -27,6 +33,9 @@ export interface PublicConfig {
     confirmed_failure_samples?: number;
     failure_ramp_seconds?: number;
     links?: string[];
+    source_manifest_path?: string;
+    soursignal_auto_recover?: boolean;
+    sources?: SourceConfig[];
   };
   arangodb?: {
     enabled?: boolean;
@@ -34,6 +43,42 @@ export interface PublicConfig {
     database?: string;
     username?: string;
   };
+  public_sources?: PublicStreamSource[];
+}
+
+export interface SourceConfig {
+  id?: string;
+  label?: string;
+  type?: string;
+  url?: string;
+  enabled?: boolean;
+  headers?: Record<string, string>;
+  notes?: string;
+}
+
+export interface SourceStatus extends SourceConfig {
+  preferred?: boolean;
+  in_process?: boolean;
+  health?: string;
+  health_message?: string;
+  checked_at?: number | null;
+  viewer_count?: number;
+  playback_url?: string;
+}
+
+export interface PublicStreamSource {
+  id?: string;
+  label?: string;
+  type?: string;
+  url?: string;
+  enabled?: boolean;
+  description?: string;
+  playback_url?: string;
+}
+
+export interface ViewerCounts {
+  total?: number;
+  sources?: Record<string, number>;
 }
 
 export interface FeedEvent {
@@ -154,6 +199,10 @@ export interface RuntimeStats {
   app_started_at?: number;
   app_uptime_seconds?: number;
   arango_queue_depth?: number;
+  stream_desired_state?: "running" | "stopped";
+  configured_link_count?: number;
+  auto_public_source_count?: number;
+  active_link_pool_count?: number;
 }
 
 export interface StatusPayload {
@@ -168,6 +217,8 @@ export interface StatusPayload {
   errors?: LogEntry[];
   server_time?: number;
   runtime?: RuntimeStats;
+  sources?: SourceStatus[];
+  viewers?: ViewerCounts;
 }
 
 export interface ArangoStatus {

@@ -122,6 +122,8 @@ Some changes restart a running stream automatically.
 
 ## Links
 
+`links` are now a compatibility view over structured stream `sources`. New cockpit features should use source endpoints.
+
 Add:
 
 ```http
@@ -143,6 +145,51 @@ x-obbystreams-token: <token>
 ```
 
 Links must be HTTP(S), are deduplicated, and are normalized before being written to config.
+
+## Sources
+
+Sources are guarded cockpit records with stable IDs, labels, type, URL, enabled state, and optional private headers. Headers are used by the proxy/ffmpeg path and are not returned by public endpoints.
+
+List configured source status:
+
+```http
+GET /api/sources
+x-obbystreams-token: <token>
+```
+
+Switch the running cockpit preference to a source:
+
+```http
+POST /api/sources/activate
+content-type: application/json
+x-obbystreams-token: <token>
+
+{"id":"source-2"}
+```
+
+Recover a sour-signal source by scraping a replacement playlist:
+
+```http
+POST /api/sources/recover-soursignal
+content-type: application/json
+x-obbystreams-token: <token>
+
+{"id":"sour-signal-main"}
+```
+
+Public watcher endpoints:
+
+```http
+GET /api/public-configured-sources
+GET /api/public-streams
+GET /api/live
+GET /api/viewers
+POST /api/viewers
+```
+
+`/api/public-configured-sources` returns the synthetic `server-1` managed source for the official ffmpeg output.
+
+`/api/public-streams` returns separately managed pasted public internet streams. Each item includes `url` plus a CORS-safe `playback_url` that points through `/api/proxy-hls`. These records are not official ffmpeg sources and do not affect `stream.sources`.
 
 ## Stream Actions
 
