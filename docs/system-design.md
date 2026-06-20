@@ -29,6 +29,8 @@ The preferred source is the first enabled configured source. Pressing `Switch` m
 
 Sour-signal sources are recoverable. The cockpit keeps their stable source ID/label, attempts to scrape a replacement HLS URL, updates the source, and restarts the stream when appropriate.
 
+Private IPTV automation is an official-source feeder, not a public-source scraper. When `private_iptv.enabled` is true, the cockpit fetches the authenticated provider page or direct M3U playlist, parses `#EXTINF` rows, scores UFC/MMA/fight-day records, rejects placeholders and stale/non-event rows, probes likely candidates for real playback evidence, and writes accepted entries into `stream.sources` with the `private-iptv-` prefix. If no accepted fight-day source remains and `disable_stream_when_inactive` is true, the cockpit disables those auto-created private sources and stops the managed ffmpeg process. This is intentionally separate from 24/7 public viewer sources.
+
 Public pasted sources are top-level `public_sources`, not `stream.sources`. They are third-party internet stream URLs pasted for viewers to watch through the public client. They are not ffmpeg inputs for the official managed stream. They are exposed through `/api/public-streams` with `playback_url` values that point at `/api/proxy-hls`, so browser CORS never depends on the third-party origin. Some records require `headers` such as `Referer`, `Origin`, or browser user-agent values; the proxy applies those headers server-side and rewrites nested playlists back through itself. The current source inventory is documented in `public_srcs.md`.
 
 The proxy path must be treated as a fan-out service. It uses backend coalescing,
@@ -51,6 +53,7 @@ The watcher consumes only public and redacted endpoints:
 Obbystreams should contain:
 
 - Source CRUD, switching, sour-signal recovery, source health checks.
+- Private IPTV playlist discovery, fight-day candidate scoring, playback probing, and official-source auto-disable.
 - ffmpeg process lifecycle and restart logic.
 - HLS/DASH output configuration.
 - Private source headers and source manifest generation for the CLI.
@@ -74,7 +77,9 @@ Source headers are stored in cockpit config and passed through a temporary sourc
 
 The public cockpit API returns a synthetic `server-1` managed HLS source for the official stream, and `/api/public-streams` returns the separate pasted public source inventory. This keeps private official source headers and sour-signal management separate while still letting `s.obby.ca` proxy public streams for CORS.
 
-Health probes are intentionally lightweight. Direct HLS sources are fetched through the proxy path; page and sour-signal sources are checked as reachable/recoverable pages because they are not necessarily HLS playlists themselves.
+Health probes balance speed and evidence. Direct HLS sources are checked for playlist shape, media/variant URLs, and readable segments so HTML block pages and empty playlists do not look healthy. Page and sour-signal sources are still checked as reachable/recoverable pages because they are not necessarily HLS playlists themselves.
+
+The private IPTV scorer is heuristic rather than magic. It combines row metadata, configured keywords/reject terms, date-window inference, playlist structure, and segment probing. That catches common bad-valid cases without pretending the app can know event schedules perfectly. Operators can tune keywords and thresholds in config when provider naming changes.
 
 ## Verification Expectations
 

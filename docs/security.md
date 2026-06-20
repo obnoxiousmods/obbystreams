@@ -16,6 +16,7 @@ The live config contains:
 - session token
 - ArangoDB password
 - stream source URLs
+- private IPTV provider cookies and playlist keys
 
 Keep `/etc/obbystreams/obbystreams.yaml` mode `640` or tighter.
 
@@ -39,6 +40,12 @@ Guarded API routes require the session token. Do not run production with an empt
 - Run as an unprivileged user.
 - Restrict write paths in systemd.
 - Rotate tokens after exposure.
+
+## Private IPTV Secrets
+
+`private_iptv.cookies`, provider playlist keys, `Cookie`, `Authorization`, and token-like headers are operational secrets. They are required only on the server side and are redacted from public config/status responses.
+
+Do not commit the live provider cookie, direct private playlist key, or generated source manifest. Keep `/tmp/obbystreams-sources.json` readable only by the service user because it may contain per-source request headers.
 
 ## Reporting
 

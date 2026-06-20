@@ -14,6 +14,7 @@ Obbystreams runs a production HLS stream from a browser-accessible control plane
 - [Installation](installation.md): host setup, frontend build, service install, nginx, ArangoDB, verification, and rollback.
 - [Configuration](configuration.md): every YAML section and practical production defaults.
 - [Operations](operations.md): start/stop/restart, watchdog behavior, HLS health, process telemetry, and deploy routines.
+- [Private IPTV Automation](private-iptv-automation.md): official source discovery from the authenticated provider playlist, fight-day scoring, probing, and inactive-day disable behavior.
 - [API](api.md): authentication, endpoint payloads, health checks, HLS proxy behavior, and examples.
 - [Frontend](frontend.md): React, Tailwind, Video.js controls, build pipeline, and local UI workflow.
 - [Release](release.md): versioning, artifacts, GitHub Releases, GitHub Pages, and wiki publishing.

@@ -16,6 +16,7 @@ import type {
   HlsMetrics,
   LogEntry,
   ManagedProcess,
+  PrivateIptvRuntime,
   PublicStreamSource,
   SourceStatus,
   StatusPayload,
@@ -1307,6 +1308,57 @@ function SourcesPanel({
   );
 }
 
+function PrivateIptvPanel({
+  runtime,
+  pending,
+  onRefresh,
+}: {
+  runtime?: PrivateIptvRuntime;
+  pending: boolean;
+  onRefresh: () => Promise<void>;
+}) {
+  const state = runtime?.state || "idle";
+  const tone: Tone = state === "active" ? "ok" : state === "error" ? "bad" : state === "inactive" ? "warn" : "neutral";
+  const accepted = runtime?.accepted_count || 0;
+  const candidates = runtime?.candidate_count || 0;
+  const entries = runtime?.playlist_entries || 0;
+  return (
+    <Panel title="Private IPTV Automation" meta={<Badge tone={tone}>{state}</Badge>} className="linksPanel privateIptvPanel">
+      <div className="automationSummary">
+        <span>{runtime?.enabled ? "Enabled" : "Disabled"}</span>
+        <span>{accepted}/{candidates} accepted</span>
+        <span>{entries} entries</span>
+        <span>Checked {fmtClock(runtime?.last_checked_at)}</span>
+      </div>
+      <p className="panelMessage">{runtime?.message || "Waiting for private IPTV automation."}</p>
+      {runtime?.active_source_ids?.length ? (
+        <p className="sourceMeta">Active {runtime.active_source_ids.join(", ")}</p>
+      ) : null}
+      <div className="linkActions">
+        <button type="button" className="compactButton streamNow" disabled={pending} onClick={onRefresh}>
+          {pending ? "Refreshing..." : "Refresh"}
+        </button>
+      </div>
+      {runtime?.reasons?.length ? (
+        <div className="linksList automationEvidence">
+          {runtime.reasons.slice(0, 4).map((item, index) => (
+            <div className="linkItem sourceItem" key={`${item.title || item.error || "reason"}-${index}`}>
+              <div className="linkTop">
+                <strong>{item.title || item.error || `Candidate ${index + 1}`}</strong>
+                <div className="sourceBadges">
+                  {item.score != null ? <Badge>match {item.score}</Badge> : null}
+                  {item.probe_score != null ? <Badge>probe {item.probe_score}</Badge> : null}
+                </div>
+              </div>
+              {item.reasons?.length ? <p className="sourceMeta">{item.reasons.join(", ")}</p> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
 function PublicStreamsPanel({
   sources,
   pending,
@@ -1499,6 +1551,7 @@ export default function App() {
   const [pendingAction, setPendingAction] = useState("");
   const [pendingEncoder, setPendingEncoder] = useState(false);
   const [pendingLinks, setPendingLinks] = useState(false);
+  const [pendingPrivateIptv, setPendingPrivateIptv] = useState(false);
   const [sourceOverride, setSourceOverride] = useState<string | null>(null);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceMsg, setSourceMsg] = useState<string | null>(null);
@@ -1769,6 +1822,19 @@ export default function App() {
     return { count: data.links.length };
   }
 
+  async function refreshPrivateIptv() {
+    setPendingPrivateIptv(true);
+    try {
+      await api("/api/private-iptv/refresh", { method: "POST", body: JSON.stringify({}) });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`private IPTV error: ${errorMessage(err)}`);
+    } finally {
+      setPendingPrivateIptv(false);
+    }
+  }
+
   if (!authenticated && !authChecked) return <main className="loginShell" />;
   if (!authenticated) return <LoginScreen onLogin={login} />;
 
@@ -1809,6 +1875,7 @@ export default function App() {
       </section>
       <section className="lowerGrid">
         <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} />
+        <PrivateIptvPanel runtime={status?.private_iptv} pending={pendingPrivateIptv} onRefresh={refreshPrivateIptv} />
         <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} />
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>

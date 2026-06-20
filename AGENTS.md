@@ -13,6 +13,7 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 - Keep structured source config authoritative; keep legacy `links` synchronized for compatibility.
 - Support explicit source switching through `Switch`, not order-management UX.
 - Recover sour-signal links by finding a replacement stream URL while preserving the source identity.
+- Run private IPTV automation as an official-source feeder: parse the authenticated provider playlist, score/probe UFC/fight-day rows, update `stream.sources`, and stop managed ffmpeg on inactive days when configured.
 - Store and apply private per-source headers for proxy/ffmpeg use.
 - Maintain a separate `public_sources` inventory for pasted public internet stream URLs, including per-public-source request headers when needed.
 - Expose safe public managed Server 1 status, viewer telemetry, and proxied public-source playback for ObbyWatcher.
@@ -28,6 +29,8 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 - `GET /hls/ufc.m3u8`
 
 Never expose private official source headers, dashboard credentials, Arango credentials, or raw cockpit config through public endpoints. Keep official ffmpeg sources in `stream.sources`; keep pasted public internet sources in top-level `public_sources`. See `public_srcs.md` before changing, deleting, or reclassifying public source records.
+
+Private IPTV provider cookies and direct playlist keys belong only in live server config. Commit placeholders and docs, never live cookies.
 
 The `/api/proxy-hls` path is a hot fan-out path. Preserve backend cache
 coalescing, stale fallback, pooled upstream fetches, and the nginx buffered

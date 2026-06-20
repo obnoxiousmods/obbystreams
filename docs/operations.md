@@ -40,6 +40,28 @@ The watchdog runs inside the Starlette service. When `stream.auto_recover` is tr
 
 The watchdog respects `watchdog_restart_cooldown` to avoid rapid restart loops. If no links are configured, it skips restart and records a warning.
 
+## Private IPTV Automation
+
+When `private_iptv.enabled` is true, the service periodically refreshes the authenticated provider playlist. The cockpit panel shows:
+
+- current automation state
+- playlist entry count
+- matched candidate count
+- accepted source count
+- last checked time
+- probe evidence for recent candidates
+
+Use `Refresh` in the cockpit or `POST /api/private-iptv/refresh` to force a pass after provider lineup changes.
+
+Expected behavior:
+
+- UFC/fight-day candidates are written to `stream.sources` with the `private-iptv-` prefix.
+- Manual official sources remain in `stream.sources` and are not deleted by automation.
+- Pasted public viewer streams remain in top-level `public_sources`.
+- If no validated fight-day source remains, auto-created private IPTV sources are disabled and managed ffmpeg is stopped when `disable_stream_when_inactive` is true.
+
+If automation reports `inactive`, inspect the evidence rows first. Common causes are provider placeholders, stale event dates, HTML/block pages, dead variant playlists, or unreadable media segments.
+
 ## HLS Health
 
 The app reads the configured output directory and checks:

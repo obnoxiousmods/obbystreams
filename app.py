@@ -17,8 +17,10 @@ import time
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import psutil
@@ -67,6 +69,7 @@ _AUTO_SOURCES_AT: float = 0.0
 _AUTO_SOURCES_LOCK: asyncio.Lock | None = None  # initialised in lifespan
 _AUTO_SCRAPE_INTERVAL = 300  # seconds between refreshes
 _AUTO_SCRAPE_TASK = None
+PRIVATE_IPTV_TASK = None
 
 SOURCE_HEALTH_TASK = None
 SOURCE_HEALTH_INTERVAL = 15
@@ -283,6 +286,47 @@ DEFAULT_CONFIG = {
         "failure_ramp_seconds": 60,
         "links": [],
         "sources": [],
+    },
+    "private_iptv": {
+        "enabled": False,
+        "provider_url": "https://iptorrents.com/iptv",
+        "playlist_url": "",
+        "playlist_link_selector": "m3uDownloadBtn",
+        "timezone": "Canada/Pacific",
+        "refresh_interval_seconds": 900,
+        "max_candidates": 12,
+        "min_score": 70,
+        "probe_candidates": True,
+        "probe_timeout_seconds": 10,
+        "disable_stream_when_inactive": True,
+        "auto_start_when_active": True,
+        "auto_source_prefix": "private-iptv",
+        "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://iptorrents.com/t",
+        },
+        "cookies": {},
+        "keywords": [
+            "ufc",
+            "mma",
+            "fight night",
+            "prelims",
+            "main card",
+            "ppv main card",
+        ],
+        "reject_keywords": [
+            "no event",
+            "no scheduled event",
+            "replay",
+            "classic",
+            "24/7",
+            "post fight press conference",
+            "pre show",
+        ],
+        "date_window_hours": 30,
+        "require_date_window_match": True,
     },
     "public_sources": [],
     "arangodb": {
@@ -511,6 +555,54 @@ def normalize_public_sources(raw_sources):
     return sources
 
 
+def normalize_string_list(raw_values):
+    values = raw_values if isinstance(raw_values, list) else []
+    normalized = []
+    seen = set()
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def normalize_private_iptv(raw_config):
+    defaults = json.loads(json.dumps(DEFAULT_CONFIG["private_iptv"]))
+    if isinstance(raw_config, dict):
+        defaults.update(raw_config)
+    defaults["enabled"] = bool(defaults.get("enabled", False))
+    defaults["provider_url"] = str(defaults.get("provider_url") or "").strip()
+    defaults["playlist_url"] = str(defaults.get("playlist_url") or "").strip()
+    defaults["playlist_link_selector"] = str(defaults.get("playlist_link_selector") or "m3uDownloadBtn").strip()
+    defaults["timezone"] = str(defaults.get("timezone") or "Canada/Pacific").strip()
+    defaults["refresh_interval_seconds"] = safe_int(defaults.get("refresh_interval_seconds"), 900, minimum=120)
+    defaults["max_candidates"] = safe_int(defaults.get("max_candidates"), 12, minimum=1)
+    defaults["min_score"] = safe_int(defaults.get("min_score"), 70, minimum=1)
+    defaults["probe_candidates"] = bool(defaults.get("probe_candidates", True))
+    defaults["probe_timeout_seconds"] = safe_number(defaults.get("probe_timeout_seconds"), 10, minimum=3)
+    defaults["disable_stream_when_inactive"] = bool(defaults.get("disable_stream_when_inactive", True))
+    defaults["auto_start_when_active"] = bool(defaults.get("auto_start_when_active", True))
+    defaults["auto_source_prefix"] = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
+    defaults["headers"] = normalize_source_headers(defaults.get("headers"))
+    cookies = {}
+    if isinstance(defaults.get("cookies"), dict):
+        for key, value in defaults["cookies"].items():
+            name = str(key or "").strip()
+            if name and not any(ch in name for ch in "\r\n;="):
+                cookies[name] = str(value or "").strip()
+    defaults["cookies"] = cookies
+    defaults["keywords"] = normalize_string_list(defaults.get("keywords")) or list(DEFAULT_CONFIG["private_iptv"]["keywords"])
+    defaults["reject_keywords"] = normalize_string_list(defaults.get("reject_keywords"))
+    defaults["date_window_hours"] = safe_number(defaults.get("date_window_hours"), 30, minimum=1)
+    defaults["require_date_window_match"] = bool(defaults.get("require_date_window_match", True))
+    return defaults
+
+
 def proxied_public_source(source):
     safe = {key: value for key, value in source.items() if key != "headers"}
     if source.get("headers"):
@@ -578,6 +670,7 @@ def normalize_config(config):
         if not isinstance(raw_section, dict):
             continue
         merged[section].update(raw_section)
+    merged["private_iptv"] = normalize_private_iptv(config.get("private_iptv", merged.get("private_iptv", {})))
     if "public_sources" in config:
         merged["public_sources"] = config.get("public_sources", [])
     merged["public_sources"] = normalize_public_sources(merged.get("public_sources", []))
@@ -678,11 +771,30 @@ def save_config(config):
     _CONFIG_CACHE = {"config": None, "mtime": 0.0, "at": 0.0}
 
 
+def redact_headers(headers):
+    safe = {}
+    for key, value in (headers or {}).items():
+        lowered = str(key or "").lower()
+        if any(token in lowered for token in ("cookie", "authorization", "token", "key", "secret", "pass")):
+            safe[key] = "***"
+        else:
+            safe[key] = value
+    return safe
+
+
 def public_config(config):
     safe = json.loads(json.dumps(config))
     safe.get("dashboard", {}).pop("password", None)
     safe.get("dashboard", {}).pop("session_token", None)
     safe.get("arangodb", {}).pop("password", None)
+    if isinstance(safe.get("private_iptv"), dict):
+        private = safe["private_iptv"]
+        if private.get("playlist_url"):
+            private["playlist_url"] = "***"
+        if private.get("cookies"):
+            private["cookies"] = {key: "***" for key in private.get("cookies", {})}
+        if private.get("headers"):
+            private["headers"] = redact_headers(private.get("headers", {}))
     for source in safe.get("stream", {}).get("sources", []) or []:
         source.pop("headers", None)
     safe["public_sources"] = [proxied_public_source(source) for source in public_stream_inventory(config)]
@@ -1857,6 +1969,7 @@ def status_payload():
             "active_link_pool_count": len(active_links),
             "proxy_cache": _PROXY_CACHE.stats(),
         },
+        "private_iptv": private_iptv_public_runtime(),
     }
     queue_arango_insert("metrics", {"ts": now_ms(), "payload": payload})
     return payload
@@ -1939,6 +2052,18 @@ async def put_config(request):
         if not isinstance(body["public_sources"], list):
             return JSONResponse({"ok": False, "error": "public_sources must be an array"}, status_code=400)
         config["public_sources"] = normalize_public_sources(body["public_sources"])
+    if "private_iptv" in body:
+        if not isinstance(body["private_iptv"], dict):
+            return JSONResponse({"ok": False, "error": "private_iptv must be an object"}, status_code=400)
+        existing_private = config.get("private_iptv", {})
+        merged_private = {**existing_private, **body["private_iptv"]}
+        # Redacted payloads from the UI must not erase live credentials.
+        if isinstance(merged_private.get("cookies"), dict):
+            merged_private["cookies"] = {
+                key: existing_private.get("cookies", {}).get(key, value) if value == "***" else value
+                for key, value in merged_private["cookies"].items()
+            }
+        config["private_iptv"] = normalize_private_iptv(merged_private)
     if "links" in body:
         links = body["links"]
         if not isinstance(links, list):
@@ -2020,6 +2145,16 @@ async def put_config(request):
     return JSONResponse({"ok": True, "config": public_config(config)})
 
 
+async def private_iptv_status(request):
+    return JSONResponse({"ok": True, "private_iptv": private_iptv_public_runtime(), "config": public_config(load_config()).get("private_iptv", {})})
+
+
+async def private_iptv_refresh(request):
+    result = await refresh_private_iptv_sources(reason="api")
+    status = 200 if result.get("ok") else 500
+    return JSONResponse(result, status_code=status)
+
+
 async def add_link(request):
     config = load_config()
     try:
@@ -2093,6 +2228,345 @@ _OPTION_VALUE_RE = re.compile(r"""<option[^>]+value=["']([^"']+)["']""", re.IGNO
 _MMA_LISTINGS_URL = "https://sportsurge.ws/mma/livestreams3"
 _SPORTSURGE_EVENT_RE = re.compile(r'href="(https://sportsurge\.ws/event/[^"]+)"')
 _UFC_CONTEXT_RE = re.compile(r"ufc", re.IGNORECASE)
+_M3U_ATTR_RE = re.compile(r'([a-zA-Z0-9_-]+)="([^"]*)"')
+_PRIVATE_IPTV_DOWNLOAD_RE = re.compile(r'<a[^>]+id=["\']m3uDownloadBtn["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE)
+_PRIVATE_IPTV_DATE_RE = re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}\b", re.IGNORECASE)
+_PRIVATE_IPTV_NUMERIC_DATE_RE = re.compile(r"\b(?:20\d{2})[ ._/-](\d{1,2})[ ._/-](\d{1,2})\b")
+
+PRIVATE_IPTV_RUNTIME = {
+    "enabled": False,
+    "state": "idle",
+    "last_checked_at": None,
+    "last_changed_at": None,
+    "playlist_url": "",
+    "playlist_entries": 0,
+    "candidate_count": 0,
+    "accepted_count": 0,
+    "active_source_ids": [],
+    "message": "Private IPTV automation has not run yet.",
+    "reasons": [],
+    "next_check_at": None,
+}
+
+
+def private_iptv_cookie_header(config):
+    cookies = config.get("cookies") or {}
+    parts = [f"{key}={value}" for key, value in cookies.items() if key and value]
+    return "; ".join(parts)
+
+
+def private_iptv_request_headers(config, referer=None):
+    headers = dict(config.get("headers") or {})
+    if referer and "Referer" not in headers:
+        headers["Referer"] = referer
+    cookie = private_iptv_cookie_header(config)
+    if cookie:
+        headers["Cookie"] = cookie
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = _SCRAPE_UA
+    return headers
+
+
+async def private_iptv_fetch_text(url, config, referer=None):
+    headers = private_iptv_request_headers(config, referer=referer)
+    client = _HTTPX_CLIENT
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0), follow_redirects=True)
+        close_client = True
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return response.text
+    except (httpx.HTTPError, httpx.DecodingError):
+        curl_args = ["curl", "-fsSL", "--compressed", "--max-time", "18", "-L"]
+        for name, value in headers.items():
+            curl_args += ["-H", f"{name}: {value}"]
+        curl_args.append(url)
+        proc = await asyncio.create_subprocess_exec(*curl_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=22)
+        if proc.returncode:
+            detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"private IPTV fetch failed: {detail or proc.returncode}")
+        return stdout.decode("utf-8", errors="replace")
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+def extract_private_iptv_playlist_url(provider_html, provider_url, configured_url=""):
+    if valid_stream_url(configured_url):
+        return configured_url
+    match = _PRIVATE_IPTV_DOWNLOAD_RE.search(provider_html or "")
+    if not match:
+        return ""
+    return urljoin(provider_url, html.unescape(match.group(1).strip()))
+
+
+def parse_m3u_entries(text):
+    entries = []
+    pending = None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            attrs = {key.lower(): html.unescape(value) for key, value in _M3U_ATTR_RE.findall(line)}
+            title = line.rsplit(",", 1)[-1].strip() if "," in line else attrs.get("tvg-name", "")
+            pending = {"title": html.unescape(title), "attrs": attrs, "url": ""}
+            continue
+        if line.startswith("#"):
+            continue
+        if not valid_stream_url(line):
+            pending = None
+            continue
+        if pending is None:
+            pending = {"title": "", "attrs": {}, "url": line}
+        else:
+            pending["url"] = line
+        entries.append(pending)
+        pending = None
+    return entries
+
+
+def private_iptv_entry_text(entry):
+    attrs = entry.get("attrs") or {}
+    parts = [
+        entry.get("title", ""),
+        attrs.get("tvg-name", ""),
+        attrs.get("group-title", ""),
+        attrs.get("tvg-id", ""),
+        entry.get("url", ""),
+    ]
+    return " ".join(str(part or "") for part in parts)
+
+
+def private_iptv_now(config):
+    try:
+        tz = ZoneInfo(config.get("timezone") or "Canada/Pacific")
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz)
+
+
+def infer_private_iptv_event_date(text, now):
+    lowered = text.lower()
+    if "today" in lowered:
+        return now
+    match = _PRIVATE_IPTV_NUMERIC_DATE_RE.search(text)
+    if match:
+        month, day = int(match.group(1)), int(match.group(2))
+        with contextlib.suppress(ValueError):
+            return now.replace(month=month, day=day)
+    match = _PRIVATE_IPTV_DATE_RE.search(text)
+    if match:
+        for fmt in ("%b %d", "%B %d"):
+            with contextlib.suppress(ValueError):
+                parsed = datetime.strptime(match.group(0), fmt)
+                return now.replace(month=parsed.month, day=parsed.day)
+    return None
+
+
+def score_private_iptv_entry(entry, config, now=None):
+    now = now or private_iptv_now(config)
+    text = private_iptv_entry_text(entry)
+    lowered = text.lower()
+    score = 0
+    reasons = []
+    for keyword in config.get("keywords") or []:
+        if keyword.lower() in lowered:
+            score += 35 if keyword.lower() in {"ufc", "mma"} else 20
+            reasons.append(f"keyword:{keyword}")
+    group_title = (entry.get("attrs") or {}).get("group-title", "").lower()
+    if "ppv" in group_title or "live event" in lowered:
+        score += 12
+        reasons.append("event group")
+    for keyword in config.get("reject_keywords") or []:
+        if keyword.lower() in lowered:
+            score -= 45
+            reasons.append(f"reject:{keyword}")
+    event_date = infer_private_iptv_event_date(text, now)
+    if event_date:
+        delta_hours = abs((event_date.date() - now.date()).days) * 24
+        if delta_hours <= float(config.get("date_window_hours", 30)):
+            score += 18
+            reasons.append("date window")
+        else:
+            score -= 30
+            reasons.append("stale/future date")
+    if re.search(r"\b(no event|no scheduled event)\b", lowered):
+        score -= 100
+    if re.search(r"\b(24/7|classic|replay)\b", lowered):
+        score -= 30
+    if not valid_stream_url(entry.get("url")):
+        score -= 100
+        reasons.append("invalid url")
+    return score, reasons
+
+
+def select_private_iptv_candidates(entries, config, now=None):
+    now = now or private_iptv_now(config)
+    scored = []
+    for index, entry in enumerate(entries):
+        score, reasons = score_private_iptv_entry(entry, config, now=now)
+        if config.get("require_date_window_match", True) and "date window" not in reasons:
+            continue
+        if score >= int(config.get("min_score", 70)):
+            scored.append({"entry": entry, "score": score, "reasons": reasons, "index": index})
+    scored.sort(key=lambda item: (-item["score"], item["index"]))
+    return scored[: int(config.get("max_candidates", 12))]
+
+
+def parse_hls_urls(text, base_url):
+    urls = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        urls.append(urljoin(base_url, line))
+    return urls
+
+
+def looks_like_html(body):
+    sample = body.lstrip()[:256].lower()
+    return sample.startswith(b"<!doctype html") or sample.startswith(b"<html") or b"<body" in sample
+
+
+async def fetch_small_head(url, headers, timeout=10.0):
+    client = _HTTPX_CLIENT
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=4.0), follow_redirects=True)
+        close_client = True
+    try:
+        response = await client.get(url, headers=headers, timeout=timeout)
+        return response.status_code, response.headers.get("content-type", ""), response.content[:128_000]
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+async def assess_playback_candidate(url, config, headers=None):
+    headers = headers or private_iptv_request_headers(config)
+    reasons = []
+    score = 0
+    try:
+        if "soursignal.com" in urlparse(url).netloc.lower() and ".m3u8" not in url.lower():
+            try:
+                probe_timeout = float(config.get("probe_timeout_seconds", 10))
+                status, content_type, body = await asyncio.wait_for(
+                    fetch_small_head(url, headers, timeout=probe_timeout),
+                    timeout=probe_timeout + 1,
+                )
+                text = body.decode("utf-8", errors="replace")
+            except Exception:
+                return {"ok": True, "score": 45, "reasons": ["soursignal deferred to transcoder"], "resolved_url": None}
+            if status >= 400:
+                return {"ok": False, "score": -80, "reasons": [f"http {status}"], "resolved_url": None}
+            links = _M3U8_RE.findall(text or "")
+            if links:
+                url = links[0]
+                reasons.append("soursignal resolved hls")
+            elif text:
+                score += 55
+                reasons.append("soursignal page reachable")
+                return {"ok": True, "score": score, "reasons": reasons, "resolved_url": None}
+        status, content_type, body = await fetch_small_head(url, headers, timeout=float(config.get("probe_timeout_seconds", 10)))
+    except Exception as exc:
+        return {"ok": False, "score": -100, "reasons": [f"probe error:{exc}"], "resolved_url": None}
+    if status >= 400:
+        return {"ok": False, "score": -80, "reasons": [f"http {status}"], "resolved_url": None}
+    if looks_like_html(body):
+        return {"ok": False, "score": -60, "reasons": ["html response"], "resolved_url": None}
+    text = body.decode("utf-8", errors="replace")
+    is_playlist = "#EXTM3U" in text[:2048] or "mpegurl" in content_type.lower() or url.split("?")[0].endswith(".m3u8")
+    if not is_playlist:
+        return {"ok": False, "score": -20, "reasons": ["not hls"], "resolved_url": None}
+    score += 30
+    nested = parse_hls_urls(text, url)
+    media_segments = [item for item in nested if not item.split("?", 1)[0].endswith(".m3u8")]
+    media_playlists = [item for item in nested if item.split("?", 1)[0].endswith(".m3u8")]
+    if media_segments:
+        score += 40
+        reasons.append("media segments")
+    elif media_playlists:
+        score += 20
+        reasons.append("master playlist")
+        nested_status, nested_ct, nested_body = await fetch_small_head(media_playlists[0], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
+        nested_text = nested_body.decode("utf-8", errors="replace")
+        nested_segments = [item for item in parse_hls_urls(nested_text, media_playlists[0]) if not item.split("?", 1)[0].endswith(".m3u8")]
+        if nested_status < 400 and nested_segments:
+            score += 35
+            reasons.append("variant segments")
+            media_segments = nested_segments
+        elif nested_status >= 400:
+            score -= 30
+            reasons.append(f"variant http {nested_status}")
+    else:
+        score -= 40
+        reasons.append("no media urls")
+    if "#EXT-X-ENDLIST" in text and len(media_segments) < 2:
+        score -= 20
+        reasons.append("ended or tiny vod")
+    if media_segments:
+        seg_status, seg_ct, seg_body = await fetch_small_head(media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
+        if seg_status < 400 and seg_body and not looks_like_html(seg_body):
+            score += 35
+            reasons.append("segment readable")
+        else:
+            score -= 35
+            reasons.append(f"segment bad:{seg_status}:{seg_ct}")
+    return {"ok": score >= 70, "score": score, "reasons": reasons, "resolved_url": url}
+
+
+def private_iptv_source_id(prefix, entry, index):
+    label = entry.get("title") or (entry.get("attrs") or {}).get("tvg-name") or f"Candidate {index + 1}"
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", label).strip("-").lower()[:52]
+    return f"{prefix}-{slug or index + 1}"
+
+
+def merge_private_iptv_sources(config, accepted):
+    stream = config.setdefault("stream", {})
+    auto_cfg = config.get("private_iptv", {})
+    prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
+    existing = normalize_sources(stream.get("sources", []), stream.get("links", []))
+    manual = [source for source in existing if not str(source.get("id", "")).startswith(prefix + "-")]
+    auto_sources = []
+    headers = {k: v for k, v in private_iptv_request_headers(auto_cfg).items() if k.lower() != "cookie"}
+    for index, item in enumerate(accepted):
+        entry = item["entry"]
+        source_id = private_iptv_source_id(prefix, entry, index)
+        label = entry.get("title") or (entry.get("attrs") or {}).get("tvg-name") or f"Private IPTV {index + 1}"
+        url = entry.get("url")
+        auto_sources.append(
+            {
+                "id": source_id,
+                "label": label,
+                "url": url,
+                "type": source_type_for_url(None, url),
+                "enabled": True,
+                "headers": headers,
+                "notes": f"Auto-selected from private IPTV playlist; score {item.get('score')}; {', '.join(item.get('reasons') or [])}",
+            }
+        )
+    stream["sources"] = normalize_sources([*auto_sources, *manual])
+    sync_links_from_sources(stream)
+    return [source["id"] for source in auto_sources]
+
+
+def disable_private_iptv_sources(config):
+    stream = config.setdefault("stream", {})
+    auto_cfg = config.get("private_iptv", {})
+    prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
+    changed = False
+    sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
+    for source in sources:
+        if str(source.get("id", "")).startswith(prefix + "-") and source.get("enabled", True):
+            source["enabled"] = False
+            changed = True
+    stream["sources"] = normalize_sources(sources)
+    sync_links_from_sources(stream)
+    return changed
 
 
 def source_headers_for_url(raw_url):
@@ -2360,6 +2834,146 @@ async def _auto_scrape_loop() -> None:
         except Exception as exc:
             logger.warning("auto scrape loop error: %s", exc)
         await asyncio.sleep(_AUTO_SCRAPE_INTERVAL)
+
+
+def private_iptv_public_runtime():
+    payload = json.loads(json.dumps(PRIVATE_IPTV_RUNTIME))
+    if payload.get("playlist_url"):
+        payload["playlist_url"] = "***"
+    return payload
+
+
+async def refresh_private_iptv_sources(reason="manual"):
+    global STREAM_DESIRED_STATE
+    config = load_config(fresh=True)
+    private_cfg = config.get("private_iptv", {})
+    PRIVATE_IPTV_RUNTIME.update(
+        {
+            "enabled": bool(private_cfg.get("enabled")),
+            "state": "running" if private_cfg.get("enabled") else "disabled",
+            "last_checked_at": now_ms(),
+            "message": "Private IPTV automation is disabled." if not private_cfg.get("enabled") else "Refreshing private IPTV playlist.",
+            "reasons": [],
+        }
+    )
+    if not private_cfg.get("enabled"):
+        return {"ok": True, "changed": False, "runtime": private_iptv_public_runtime()}
+
+    provider_url = private_cfg.get("provider_url")
+    playlist_url = private_cfg.get("playlist_url")
+    try:
+        provider_html = ""
+        if valid_stream_url(provider_url):
+            provider_html = await private_iptv_fetch_text(provider_url, private_cfg)
+        playlist_url = extract_private_iptv_playlist_url(provider_html, provider_url, configured_url=playlist_url)
+        if not valid_stream_url(playlist_url):
+            raise RuntimeError("private IPTV playlist URL was not found")
+        playlist_text = await private_iptv_fetch_text(playlist_url, private_cfg, referer=provider_url)
+        entries = parse_m3u_entries(playlist_text)
+        candidates = select_private_iptv_candidates(entries, private_cfg)
+        accepted = []
+        probe_reasons = []
+        if private_cfg.get("probe_candidates", True):
+            for candidate in candidates:
+                assessment = await assess_playback_candidate(candidate["entry"]["url"], private_cfg)
+                candidate["probe"] = assessment
+                probe_reasons.append(
+                    {
+                        "title": candidate["entry"].get("title"),
+                        "score": candidate.get("score"),
+                        "probe_score": assessment.get("score"),
+                        "reasons": [*candidate.get("reasons", []), *assessment.get("reasons", [])],
+                    }
+                )
+                if assessment.get("ok"):
+                    accepted.append(candidate)
+        else:
+            accepted = candidates
+            probe_reasons = [
+                {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])}
+                for item in candidates
+            ]
+
+        changed = False
+        if accepted:
+            old_links = effective_stream_links(config)
+            active_ids = merge_private_iptv_sources(config, accepted)
+            new_links = effective_stream_links(config)
+            changed = old_links != new_links
+            save_config(config)
+            PRIVATE_IPTV_RUNTIME.update(
+                {
+                    "state": "active",
+                    "last_changed_at": now_ms() if changed else PRIVATE_IPTV_RUNTIME.get("last_changed_at"),
+                    "playlist_url": playlist_url,
+                    "playlist_entries": len(entries),
+                    "candidate_count": len(candidates),
+                    "accepted_count": len(accepted),
+                    "active_source_ids": active_ids,
+                    "message": f"Accepted {len(accepted)} private IPTV fight source(s).",
+                    "reasons": probe_reasons[:8],
+                }
+            )
+            if changed:
+                event("private IPTV sources refreshed", "ok", {"count": len(accepted), "reason": reason})
+                restarted = await restart_managed_with_config("private IPTV sources refreshed")
+                if not restarted and private_cfg.get("auto_start_when_active", True):
+                    async with PROCESS_LOCK:
+                        if (not PROCESS or PROCESS.poll() is not None) and effective_stream_links(load_config(fresh=True)):
+                            start_managed_process(load_config(fresh=True), None, kill_existing=True)
+                            STREAM_DESIRED_STATE = "running"
+            return {"ok": True, "changed": changed, "runtime": private_iptv_public_runtime()}
+
+        disabled = disable_private_iptv_sources(config)
+        if disabled:
+            save_config(config)
+        PRIVATE_IPTV_RUNTIME.update(
+            {
+                "state": "inactive",
+                "last_changed_at": now_ms() if disabled else PRIVATE_IPTV_RUNTIME.get("last_changed_at"),
+                "playlist_url": playlist_url,
+                "playlist_entries": len(entries),
+                "candidate_count": len(candidates),
+                "accepted_count": 0,
+                "active_source_ids": [],
+                "message": "No validated fight-day private IPTV sources were accepted.",
+                "reasons": probe_reasons[:8],
+            }
+        )
+        event("private IPTV inactive", "warn", {"candidates": len(candidates), "reason": reason})
+        if private_cfg.get("disable_stream_when_inactive", True):
+            async with PROCESS_LOCK:
+                STREAM_DESIRED_STATE = "stopped"
+                await stop_managed_process("private IPTV inactive; managed ffmpeg stream disabled")
+        return {"ok": True, "changed": disabled, "runtime": private_iptv_public_runtime()}
+    except Exception as exc:
+        PRIVATE_IPTV_RUNTIME.update(
+            {
+                "state": "error",
+                "message": f"Private IPTV refresh failed: {exc}",
+                "reasons": [{"error": str(exc)}],
+            }
+        )
+        ERRORS.append({"ts": now_ms(), "level": "error", "line": f"private IPTV refresh failed: {exc}"})
+        event("private IPTV refresh failed", "bad")
+        return {"ok": False, "error": str(exc), "runtime": private_iptv_public_runtime()}
+
+
+async def private_iptv_loop():
+    while True:
+        try:
+            cfg = load_config()
+            private_cfg = cfg.get("private_iptv", {})
+            interval = int(private_cfg.get("refresh_interval_seconds", 900))
+            PRIVATE_IPTV_RUNTIME["next_check_at"] = now_ms() + interval * 1000
+            if private_cfg.get("enabled"):
+                await refresh_private_iptv_sources(reason="scheduled")
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("private IPTV loop error: %s", exc)
+            await asyncio.sleep(60)
 
 
 _GOOZ_ORIGIN = "https://gooz.aapmains.net"
@@ -2832,15 +3446,15 @@ async def probe_configured_source(source):
             state = "green" if text else "yellow"
             message = "Source page reachable" if text else "Source page did not respond"
         else:
-            body, content_type = await _proxy_fetch(url)
-            is_playlist = (
-                "mpegurl" in content_type.lower()
-                or "m3u" in content_type.lower()
-                or str(url).split("?")[0].endswith(".m3u8")
-                or body.lstrip()[:7] == b"#EXTM3U"
-            )
-            state = "green" if body and is_playlist else "yellow"
-            message = "Playlist reachable" if state == "green" else "Source responded but was not an HLS playlist"
+            assessment = await assess_playback_candidate(url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url))
+            if assessment.get("ok"):
+                state = "green"
+            elif assessment.get("score", 0) >= 20:
+                state = "yellow"
+            else:
+                state = "red"
+            reasons = assessment.get("reasons") or []
+            message = "Playback probe passed" if state == "green" else "Playback probe weak: " + ", ".join(reasons[:3])
     except Exception as exc:
         state, message = "red", str(exc)
     SOURCE_HEALTH[source.get("id") or source.get("url")] = {
@@ -3263,7 +3877,7 @@ def static_asset(name, media_type=None):
 
 @asynccontextmanager
 async def lifespan(app):
-    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK
+    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK
     _AUTO_SOURCES_LOCK = asyncio.Lock()
     ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
     _HTTPX_CLIENT = httpx.AsyncClient(
@@ -3276,6 +3890,7 @@ async def lifespan(app):
     event("obbystreams dashboard booted", "ok")
     WATCHDOG_TASK = asyncio.create_task(watchdog_loop())
     SOURCE_HEALTH_TASK = asyncio.create_task(source_health_loop())
+    PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
 
     async def _proxy_cache_cleanup_loop():
         while True:
@@ -3313,6 +3928,10 @@ async def lifespan(app):
             SOURCE_HEALTH_TASK.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await SOURCE_HEALTH_TASK
+        if PRIVATE_IPTV_TASK:
+            PRIVATE_IPTV_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await PRIVATE_IPTV_TASK
         if _PROXY_CACHE_TASK:
             _PROXY_CACHE_TASK.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -3342,6 +3961,8 @@ routes = [
     Route("/api/sources", guarded(list_sources), methods=["GET"]),
     Route("/api/sources/activate", guarded(activate_source), methods=["POST"]),
     Route("/api/sources/recover-soursignal", guarded(recover_soursignal_source), methods=["POST"]),
+    Route("/api/private-iptv", guarded(private_iptv_status), methods=["GET"]),
+    Route("/api/private-iptv/refresh", guarded(private_iptv_refresh), methods=["POST"]),
     Route("/api/config", guarded(get_config), methods=["GET"]),
     Route("/api/config", guarded(put_config), methods=["PUT"]),
     Route("/api/links", guarded(add_link), methods=["POST"]),

@@ -1,18 +1,23 @@
 import sys
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import (
     _extract_icelz_option_streams,
     StreamHealthScorer,
+    disable_private_iptv_sources,
     build_command,
     classify_stream_log,
     effective_stream_links,
     hls_content_type,
     hls_metrics,
+    merge_private_iptv_sources,
     normalize_config,
     normalize_links,
+    parse_m3u_entries,
     normalize_scrape_urls,
     public_stream_inventory,
     parse_nvidia_gpu_csv,
@@ -20,6 +25,8 @@ from app import (
     parse_nvidia_process_csv,
     rewrite_playlist,
     safe_hls_path,
+    score_private_iptv_entry,
+    select_private_iptv_candidates,
     should_watchdog_restart_exited_process,
     trusted_request_origin,
     valid_stream_url,
@@ -250,6 +257,69 @@ def test_public_stream_inventory_includes_manual_and_auto_sources():
         assert inventory[1]["origin"] == "auto"
     finally:
         obbystreams_app._AUTO_SOURCES = original_sources
+
+
+def test_private_iptv_parser_scores_ufc_rows_and_rejects_placeholders():
+    playlist = """#EXTM3U
+#EXTINF:-1 tvg-name="UFC PPV Main Card" group-title="PPV Live Events",UFC PPV Main Card
+https://soursignal.com/private/main
+#EXTINF:-1 tvg-name="PPV 18: No Scheduled Event" group-title="PPV Live Events",PPV 18: No Scheduled Event
+https://soursignal.com/private/no-event
+#EXTINF:-1 tvg-name="UFC : 24/7" group-title="PPV Live Events",UFC : 24/7
+https://soursignal.com/private/247
+"""
+    cfg = normalize_config({"private_iptv": {"min_score": 70, "require_date_window_match": False}})["private_iptv"]
+    entries = parse_m3u_entries(playlist)
+    assert len(entries) == 3
+    main_score, main_reasons = score_private_iptv_entry(entries[0], cfg)
+    no_event_score, _ = score_private_iptv_entry(entries[1], cfg)
+    always_on_score, _ = score_private_iptv_entry(entries[2], cfg)
+    assert main_score >= 70
+    assert "keyword:ufc" in main_reasons
+    assert no_event_score < 0
+    assert always_on_score < main_score
+    selected = select_private_iptv_candidates(entries, cfg)
+    assert [item["entry"]["url"] for item in selected] == ["https://soursignal.com/private/main"]
+
+
+def test_private_iptv_date_window_gate_blocks_generic_always_on_ufc_rows():
+    playlist = """#EXTM3U
+#EXTINF:-1 tvg-name="UFC PPV Main Card" group-title="PPV Live Events",UFC PPV Main Card
+https://soursignal.com/private/generic
+#EXTINF:-1 tvg-name="UFC Fight Night Jun 20 6PM" group-title="PPV Live Events",UFC Fight Night Jun 20 6PM
+https://soursignal.com/private/dated
+"""
+    cfg = normalize_config({"private_iptv": {"min_score": 70, "require_date_window_match": True}})["private_iptv"]
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=ZoneInfo("Canada/Pacific"))
+    entries = parse_m3u_entries(playlist)
+    selected = select_private_iptv_candidates(entries, cfg, now=now)
+    assert [item["entry"]["url"] for item in selected] == ["https://soursignal.com/private/dated"]
+
+
+def test_private_iptv_merge_and_disable_only_touch_auto_sources():
+    cfg = normalize_config(
+        {
+            "private_iptv": {"auto_source_prefix": "private-iptv"},
+            "stream": {
+                "sources": [
+                    {"id": "manual", "label": "Manual", "url": "https://manual.example/live.m3u8", "enabled": True}
+                ]
+            },
+        }
+    )
+    accepted = [
+        {
+            "entry": {"title": "UFC PPV Main Card", "attrs": {}, "url": "https://soursignal.com/private/main"},
+            "score": 95,
+            "reasons": ["keyword:ufc"],
+        }
+    ]
+    ids = merge_private_iptv_sources(cfg, accepted)
+    assert ids == ["private-iptv-ufc-ppv-main-card"]
+    assert effective_stream_links(cfg)[0] == "https://soursignal.com/private/main"
+    assert effective_stream_links(cfg)[1] == "https://manual.example/live.m3u8"
+    assert disable_private_iptv_sources(cfg) is True
+    assert effective_stream_links(cfg) == ["https://manual.example/live.m3u8"]
 
 
 def test_hls_metrics_reads_dash_generated_hls_media_playlists(tmp_path):

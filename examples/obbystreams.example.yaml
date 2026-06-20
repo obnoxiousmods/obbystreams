@@ -75,6 +75,42 @@ public_sources:
       Referer: https://example.com/
       User-Agent: Mozilla/5.0
 
+# Private official-source automation. This feeds stream.sources for the managed
+# ffmpeg output only. It is separate from public_sources.
+private_iptv:
+  enabled: false
+  provider_url: https://iptorrents.com/iptv
+  playlist_url: https://tv123.me/iptv/ACCOUNT/PRIVATE_KEY/Default
+  timezone: Canada/Pacific
+  refresh_interval_seconds: 900
+  max_candidates: 12
+  min_score: 70
+  probe_candidates: true
+  probe_timeout_seconds: 10
+  disable_stream_when_inactive: true
+  auto_start_when_active: true
+  auto_source_prefix: private-iptv
+  headers:
+    Referer: https://iptorrents.com/t
+    User-Agent: Mozilla/5.0
+  cookies:
+    uid: "change-me"
+    pass: "change-me"
+  keywords:
+    - ufc
+    - mma
+    - fight night
+    - prelims
+    - main card
+  reject_keywords:
+    - no event
+    - no scheduled event
+    - replay
+    - classic
+    - 24/7
+  date_window_hours: 30
+  require_date_window_match: true
+
 arangodb:
   enabled: true
   url: http://127.0.0.1:8529

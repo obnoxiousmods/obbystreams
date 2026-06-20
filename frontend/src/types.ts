@@ -43,6 +43,7 @@ export interface PublicConfig {
     database?: string;
     username?: string;
   };
+  private_iptv?: PrivateIptvConfig;
   public_sources?: PublicStreamSource[];
 }
 
@@ -77,6 +78,46 @@ export interface PublicStreamSource {
   origin?: "manual" | "auto" | string;
   read_only?: boolean;
   has_headers?: boolean;
+}
+
+export interface PrivateIptvConfig {
+  enabled?: boolean;
+  provider_url?: string;
+  playlist_url?: string;
+  timezone?: string;
+  refresh_interval_seconds?: number;
+  max_candidates?: number;
+  min_score?: number;
+  probe_candidates?: boolean;
+  disable_stream_when_inactive?: boolean;
+  auto_start_when_active?: boolean;
+  keywords?: string[];
+  reject_keywords?: string[];
+  cookies?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+export interface PrivateIptvReason {
+  title?: string;
+  score?: number;
+  probe_score?: number;
+  reasons?: string[];
+  error?: string;
+}
+
+export interface PrivateIptvRuntime {
+  enabled?: boolean;
+  state?: string;
+  last_checked_at?: number | null;
+  last_changed_at?: number | null;
+  playlist_url?: string;
+  playlist_entries?: number;
+  candidate_count?: number;
+  accepted_count?: number;
+  active_source_ids?: string[];
+  message?: string;
+  reasons?: PrivateIptvReason[];
+  next_check_at?: number | null;
 }
 
 export interface ViewerCounts {
@@ -222,6 +263,7 @@ export interface StatusPayload {
   runtime?: RuntimeStats;
   sources?: SourceStatus[];
   viewers?: ViewerCounts;
+  private_iptv?: PrivateIptvRuntime;
 }
 
 export interface ArangoStatus {

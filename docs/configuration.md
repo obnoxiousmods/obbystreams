@@ -90,6 +90,63 @@ Important keys:
 
 Changing links, encoder, bitrate, audio bitrate, output directory, public HLS URL, ffmpeg log directory, assessment thresholds, or transcoder restart parameters restarts a running managed stream so the new settings take effect.
 
+## private_iptv
+
+`private_iptv` is the automation lane for the official/private ffmpeg source. It fetches the provider page or direct M3U playlist, scores fight-day entries, probes likely playback candidates, writes accepted entries into `stream.sources`, and can stop the managed ffmpeg stream when no validated fight source is active.
+
+It does not populate `public_sources`. Public pasted internet streams are a separate 24/7 viewer inventory.
+
+```yaml
+private_iptv:
+  enabled: false
+  provider_url: https://iptorrents.com/iptv
+  playlist_url: https://tv123.me/iptv/ACCOUNT/PRIVATE_KEY/Default
+  timezone: Canada/Pacific
+  refresh_interval_seconds: 900
+  max_candidates: 12
+  min_score: 70
+  probe_candidates: true
+  probe_timeout_seconds: 10
+  disable_stream_when_inactive: true
+  auto_start_when_active: true
+  auto_source_prefix: private-iptv
+  headers:
+    Referer: https://iptorrents.com/t
+    User-Agent: Mozilla/5.0
+  cookies:
+    uid: "private"
+    pass: "private"
+  keywords:
+    - ufc
+    - mma
+    - fight night
+    - prelims
+    - main card
+  reject_keywords:
+    - no event
+    - no scheduled event
+    - replay
+    - classic
+    - 24/7
+  date_window_hours: 30
+  require_date_window_match: true
+```
+
+Important keys:
+
+- `enabled`: starts the scheduled automation loop.
+- `provider_url`: authenticated HTML page used to discover the playlist download link when `playlist_url` is omitted.
+- `playlist_url`: direct M3U playlist URL. Prefer setting this in production so refreshes do not depend on provider-page markup.
+- `cookies`: private provider cookies. These are redacted from API/config responses and must not be committed.
+- `keywords` and `reject_keywords`: scoring vocabulary for event rows. UFC/fight rows score up; placeholders like “No Scheduled Event”, 24/7 channels, replays, and stale preshows score down.
+- `date_window_hours`: rows with an inferred date outside this window are penalized.
+- `require_date_window_match`: requires at least one current dated event signal before accepting a row. Keep this enabled for providers that always list generic UFC/PPV channels.
+- `probe_candidates`: fetches candidate URLs and rejects bad-but-HTTP-valid responses such as HTML block pages, empty playlists, dead variant playlists, unreadable segments, or tiny ended VOD windows.
+- `disable_stream_when_inactive`: disables auto-created private IPTV sources and stops managed ffmpeg when no accepted source remains.
+- `auto_start_when_active`: starts managed ffmpeg after automation finds accepted sources and the process is not already running.
+
+Auto-created source IDs start with `auto_source_prefix`, default `private-iptv-`. Manual official sources are preserved.
+
 ## arangodb
 
 ```yaml

@@ -177,6 +177,38 @@ x-obbystreams-token: <token>
 {"id":"sour-signal-main"}
 ```
 
+## Private IPTV Automation
+
+Private IPTV routes are guarded cockpit routes. They manage automatic discovery of the official/private ffmpeg source from the authenticated provider playlist. They do not create public watcher sources.
+
+Read runtime state:
+
+```http
+GET /api/private-iptv
+x-obbystreams-token: <token>
+```
+
+Force an immediate refresh:
+
+```http
+POST /api/private-iptv/refresh
+content-type: application/json
+x-obbystreams-token: <token>
+
+{}
+```
+
+The refresh flow:
+
+1. Fetches `private_iptv.provider_url` or uses `private_iptv.playlist_url`.
+2. Parses M3U `#EXTINF` rows.
+3. Scores UFC/MMA/fight-day candidates and rejects placeholders such as “No Scheduled Event”, 24/7, replay, and stale rows.
+4. Probes candidate playback for bad-but-valid responses: HTML block pages, empty playlists, dead variants, ended tiny windows, and unreadable segments.
+5. Writes accepted private entries to `stream.sources` using the configured auto-source prefix.
+6. Stops managed ffmpeg when inactive if `disable_stream_when_inactive` is true.
+
+Provider cookies and sensitive headers are redacted from config/status responses.
+
 Public watcher endpoints:
 
 ```http

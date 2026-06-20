@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from app import _ProxyCache, _proxy_url, _rewrite_m3u8, _split_curl_headers_body
+from app import _ProxyCache, _proxy_url, _rewrite_m3u8, _split_curl_headers_body, assess_playback_candidate, normalize_config
 
 
 @pytest.mark.asyncio
@@ -142,3 +142,38 @@ def test_split_curl_headers_body_uses_final_header_block_after_redirects():
     body, content_type = _split_curl_headers_body(raw)
     assert body.startswith(b"#EXTM3U")
     assert content_type == "application/vnd.apple.mpegurl"
+
+
+@pytest.mark.asyncio
+async def test_assess_playback_candidate_rejects_html_playlist_response(monkeypatch):
+    async def fake_fetch(url, headers, timeout=10.0):
+        return 200, "application/vnd.apple.mpegurl", b"<html><body>blocked</body></html>"
+
+    import app as obbystreams_app
+
+    monkeypatch.setattr(obbystreams_app, "fetch_small_head", fake_fetch)
+    cfg = normalize_config({})["private_iptv"]
+    result = await assess_playback_candidate("https://example.com/live.m3u8", cfg)
+    assert result["ok"] is False
+    assert "html response" in result["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_assess_playback_candidate_accepts_media_playlist(monkeypatch):
+    async def fake_fetch(url, headers, timeout=10.0):
+        if url.endswith(".ts"):
+            return 200, "video/mp2t", b"\x47" * 188
+        return (
+            200,
+            "application/vnd.apple.mpegurl",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n",
+        )
+
+    import app as obbystreams_app
+
+    monkeypatch.setattr(obbystreams_app, "fetch_small_head", fake_fetch)
+    cfg = normalize_config({})["private_iptv"]
+    result = await assess_playback_candidate("https://example.com/live.m3u8", cfg)
+    assert result["ok"] is True
+    assert "media segments" in result["reasons"]
+    assert "segment readable" in result["reasons"]

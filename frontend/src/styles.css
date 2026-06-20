@@ -660,6 +660,27 @@
     grid-template-columns: minmax(120px, 0.35fr) minmax(180px, 1fr) auto;
   }
 
+  .automationSummary {
+    @apply grid grid-cols-2 gap-2 px-3 pt-3 text-xs text-obby-muted;
+  }
+
+  .automationSummary span {
+    @apply min-w-0 rounded border border-obby-line bg-obby-tile px-2 py-1;
+  }
+
+  .privateIptvPanel .panelMessage {
+    @apply px-3 pt-2;
+  }
+
+  .privateIptvPanel > .sourceMeta {
+    @apply px-3 font-sans text-xs text-obby-muted;
+    overflow-wrap: anywhere;
+  }
+
+  .automationEvidence {
+    @apply pt-0;
+  }
+
   .scrapeForm {
     @apply border-b border-obby-line pb-0;
   }
