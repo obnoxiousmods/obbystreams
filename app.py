@@ -99,41 +99,96 @@ class _ProxyCache:
     an internal lock so concurrent async tasks cannot corrupt the dicts.
     """
 
-    def __init__(self, max_size: int = 500, playlist_ttl: float = 2.5, segment_ttl: float = 90.0):
-        self._cache: dict[str, tuple[float, bytes, str]] = {}
+    def __init__(self, max_size: int = 5000, playlist_ttl: float = 2.5, segment_ttl: float = 120.0, stale_ttl: float = 600.0):
+        self._cache: dict[str, dict] = {}
         self._inflight: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
         self._max_size = max(max_size, 1)
         self._playlist_ttl = playlist_ttl
         self._segment_ttl = segment_ttl
+        self._stale_ttl = max(stale_ttl, 0.0)
+        self._stats = {
+            "hits": 0,
+            "stale_hits": 0,
+            "misses": 0,
+            "sets": 0,
+            "evictions": 0,
+            "upstream_fetches": 0,
+            "upstream_errors": 0,
+            "bytes": 0,
+        }
 
     async def get(self, raw_url: str, now: float) -> tuple[bytes, str] | None:
         cached = self._cache.get(raw_url)
-        if cached and cached[0] > now:
-            return cached[1], cached[2]
+        if cached and cached["expires_at"] > now:
+            self._stats["hits"] += 1
+            return cached["body"], cached["content_type"]
         # Eagerly drop this single expired entry if we see it.
-        if cached:
+        if cached and cached["stale_until"] <= now:
             async with self._lock:
-                self._cache.pop(raw_url, None)
+                removed = self._cache.pop(raw_url, None)
+                if removed:
+                    self._stats["bytes"] = max(0, self._stats["bytes"] - len(removed["body"]))
+                    self._stats["evictions"] += 1
+        self._stats["misses"] += 1
+        return None
+
+    async def get_stale(self, raw_url: str, now: float) -> tuple[bytes, str] | None:
+        cached = self._cache.get(raw_url)
+        if cached and cached["stale_until"] > now:
+            self._stats["stale_hits"] += 1
+            return cached["body"], cached["content_type"]
         return None
 
     def lock(self, raw_url: str) -> asyncio.Lock:
         return self._inflight.setdefault(raw_url, asyncio.Lock())
 
-    async def set(self, raw_url: str, body: bytes, ct: str, ttl: float, now: float) -> None:
+    async def set(self, raw_url: str, body: bytes, ct: str, ttl: float, now: float, stale_ttl: float | None = None) -> None:
+        stale_ttl = self._stale_ttl if stale_ttl is None else max(stale_ttl, 0.0)
         async with self._lock:
-            self._cache[raw_url] = (now + ttl, body, ct)
+            previous = self._cache.get(raw_url)
+            if previous:
+                self._stats["bytes"] = max(0, self._stats["bytes"] - len(previous["body"]))
+            self._cache[raw_url] = {
+                "expires_at": now + ttl,
+                "stale_until": now + ttl + stale_ttl,
+                "body": body,
+                "content_type": ct,
+            }
+            self._stats["sets"] += 1
+            self._stats["bytes"] += len(body)
             if len(self._cache) > self._max_size:
                 await self._cleanup_unlocked(now)
                 # If we are still over the limit, evict the oldest half.
                 if len(self._cache) > self._max_size:
-                    keys = list(self._cache.keys())
+                    keys = sorted(self._cache.keys(), key=lambda key: self._cache[key]["stale_until"])
                     for k in keys[: max(1, len(keys) // 2)]:
-                        self._cache.pop(k, None)
+                        removed = self._cache.pop(k, None)
+                        if removed:
+                            self._stats["bytes"] = max(0, self._stats["bytes"] - len(removed["body"]))
+                            self._stats["evictions"] += 1
 
-    async def release_lock(self, raw_url: str) -> None:
+    async def release_lock(self, raw_url: str, lock: asyncio.Lock) -> None:
         async with self._lock:
-            self._inflight.pop(raw_url, None)
+            if self._inflight.get(raw_url) is lock and not lock.locked():
+                self._inflight.pop(raw_url, None)
+
+    def record_upstream_fetch(self) -> None:
+        self._stats["upstream_fetches"] += 1
+
+    def record_upstream_error(self) -> None:
+        self._stats["upstream_errors"] += 1
+
+    def stats(self) -> dict:
+        return {
+            **self._stats,
+            "entries": len(self._cache),
+            "inflight": len(self._inflight),
+            "max_size": self._max_size,
+            "playlist_ttl": self._playlist_ttl,
+            "segment_ttl": self._segment_ttl,
+            "stale_ttl": self._stale_ttl,
+        }
 
     async def cleanup(self) -> None:
         async with self._lock:
@@ -144,8 +199,11 @@ class _ProxyCache:
         # if another task mutates the cache while we clean.
         for k in list(self._cache.keys()):
             entry = self._cache.get(k)
-            if entry and entry[0] <= now:
-                self._cache.pop(k, None)
+            if entry and entry["stale_until"] <= now:
+                removed = self._cache.pop(k, None)
+                if removed:
+                    self._stats["bytes"] = max(0, self._stats["bytes"] - len(removed["body"]))
+                    self._stats["evictions"] += 1
         for k in list(self._inflight.keys()):
             lock = self._inflight.get(k)
             if lock and not lock.locked():
@@ -1797,6 +1855,7 @@ def status_payload():
             "configured_source_count": len(sources),
             "auto_public_source_count": len(auto_links),
             "active_link_pool_count": len(active_links),
+            "proxy_cache": _PROXY_CACHE.stats(),
         },
     }
     queue_arango_insert("metrics", {"ts": now_ms(), "payload": payload})
@@ -2313,7 +2372,7 @@ def _proxy_url(raw_url: str) -> str:
 
 
 async def _proxy_fetch(raw_url: str) -> tuple[bytes, str]:
-    """Fetch a URL via the upstream with gooz origin headers, using shared cache."""
+    """Fetch a URL via the upstream with shared cache and coalescing."""
     now = time.monotonic()
 
     cached = await _PROXY_CACHE.get(raw_url, now)
@@ -2330,41 +2389,100 @@ async def _proxy_fetch(raw_url: str) -> tuple[bytes, str]:
             if cached:
                 return cached
 
-            # Use curl (same as _scrape_fetch) — httpx fails against hereisman.net
-            curl_args = [
-                "curl", "-s", "--compressed", "--max-time", "15", "-L",
-                "-D", "-",  # dump headers to stdout so we can parse Content-Type
-            ]
-            for name, value in proxy_request_headers(raw_url).items():
-                curl_args += ["-H", f"{name}: {value}"]
-            curl_args.append(raw_url)
-            proc = await asyncio.create_subprocess_exec(
-                *curl_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            raw_out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-            # Split HTTP header block from body (curl -D - outputs headers then blank line)
-            header_end = raw_out.find(b"\r\n\r\n")
-            if header_end == -1:
-                header_end = raw_out.find(b"\n\n")
-                body = raw_out[header_end + 2:] if header_end != -1 else raw_out
-            else:
-                body = raw_out[header_end + 4:]
-            header_block = raw_out[:header_end] if header_end != -1 else b""
-            ct = ""
-            for line in header_block.split(b"\n"):
-                if line.lower().startswith(b"content-type:"):
-                    ct = line.split(b":", 1)[1].strip().decode("utf-8", errors="replace")
-                    break
+            try:
+                body, ct = await _proxy_upstream_fetch(raw_url)
+            except Exception:
+                _PROXY_CACHE.record_upstream_error()
+                stale = await _PROXY_CACHE.get_stale(raw_url, time.monotonic())
+                if stale:
+                    return stale
+                raise
 
             ttl = _PROXY_CACHE.ttl_for(body, ct, raw_url)
-            await _PROXY_CACHE.set(raw_url, body, ct, ttl, now)
+            await _PROXY_CACHE.set(raw_url, body, ct, ttl, time.monotonic())
             return body, ct
     finally:
         # Drop the lock from the map after every code path, including cache hits
         # after acquiring it, so signed segment URLs cannot accumulate forever.
-        await _PROXY_CACHE.release_lock(raw_url)
+        await _PROXY_CACHE.release_lock(raw_url, lock)
+
+
+async def _proxy_upstream_fetch(raw_url: str) -> tuple[bytes, str]:
+    """Fetch through the pooled client; fall back to curl for hostile origins."""
+    global _HTTPX_CLIENT
+    headers = proxy_request_headers(raw_url)
+    client = _HTTPX_CLIENT
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=3.0),
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
+        )
+        close_client = True
+    try:
+        _PROXY_CACHE.record_upstream_fetch()
+        response = await client.get(raw_url, headers=headers)
+        response.raise_for_status()
+        return response.content, response.headers.get("content-type", "")
+    except (httpx.HTTPError, httpx.DecodingError) as exc:
+        logger.debug("httpx proxy fetch failed for %s, trying curl fallback: %s", raw_url, exc)
+        return await _proxy_upstream_fetch_curl(raw_url, headers)
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> tuple[bytes, str]:
+    curl_args = [
+        "curl",
+        "-sS",
+        "--compressed",
+        "--max-time",
+        "12",
+        "--connect-timeout",
+        "4",
+        "-L",
+        "-D",
+        "-",
+    ]
+    for name, value in headers.items():
+        curl_args += ["-H", f"{name}: {value}"]
+    curl_args.append(raw_url)
+    proc = await asyncio.create_subprocess_exec(
+        *curl_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        raw_out, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except TimeoutError:
+        proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.communicate()
+        raise
+    if proc.returncode:
+        detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"curl exited {proc.returncode}: {detail}")
+
+    return _split_curl_headers_body(raw_out)
+
+
+def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
+    header_end = raw_out.rfind(b"\r\n\r\n")
+    separator_len = 4
+    if header_end == -1:
+        header_end = raw_out.rfind(b"\n\n")
+        separator_len = 2
+    body = raw_out[header_end + separator_len:] if header_end != -1 else raw_out
+    header_block = raw_out[:header_end] if header_end != -1 else b""
+    last_header_block = header_block.split(b"\r\n\r\n")[-1].split(b"\n\n")[-1]
+    ct = ""
+    for line in last_header_block.splitlines():
+        if line.lower().startswith(b"content-type:"):
+            ct = line.split(b":", 1)[1].strip().decode("utf-8", errors="replace")
+            break
+    return body, ct
 
 
 
@@ -2419,7 +2537,6 @@ async def proxy_hls(request):
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
-        "Cache-Control": "no-cache",
     }
 
     if request.method == "OPTIONS":
@@ -2443,13 +2560,13 @@ async def proxy_hls(request):
         return Response(
             rewritten,
             media_type="application/vnd.apple.mpegurl",
-            headers=cors_headers,
+            headers={**cors_headers, "Cache-Control": "max-age=1, stale-while-revalidate=4"},
         )
 
     return Response(
         content=body,
         media_type=content_type or "video/MP2T",
-        headers=cors_headers,
+        headers={**cors_headers, "Cache-Control": "public, max-age=90, stale-while-revalidate=300"},
     )
 
 
@@ -3150,10 +3267,10 @@ async def lifespan(app):
     _AUTO_SOURCES_LOCK = asyncio.Lock()
     ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
     _HTTPX_CLIENT = httpx.AsyncClient(
-        timeout=httpx.Timeout(10.0),
+        timeout=httpx.Timeout(8.0, connect=3.0),
         follow_redirects=True,
-        headers={"User-Agent": "curl/8.0"},
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        headers={"User-Agent": _SCRAPE_UA},
+        limits=httpx.Limits(max_connections=512, max_keepalive_connections=128),
     )
     ARANGO_WORKER_TASK = asyncio.create_task(arango_worker_loop())
     event("obbystreams dashboard booted", "ok")

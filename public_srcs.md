@@ -113,3 +113,20 @@ Expected behavior:
 - Public playback uses `/api/proxy-hls`, never raw frontend requests to the
   third-party source.
 - Official source switching/recovery remains limited to `stream.sources`.
+
+## Proxy Performance Contract
+
+The public HLS proxy is designed for fan-out:
+
+- App cache coalesces concurrent misses for the same playlist or segment.
+- Playlist responses have a short fresh TTL and stale fallback.
+- Segment responses have a longer fresh TTL and stale fallback.
+- Upstream fetches use a pooled async HTTP client; curl is only a fallback.
+- Nginx has a dedicated `/api/proxy-hls` location with buffering enabled, while
+  backend cache/stale handling remains the canonical shared cache.
+- Public API responses redact stored request headers; only the proxy applies
+  those headers server-side.
+
+When validating a deployment, check `runtime.proxy_cache` in authenticated
+`/api/status`. Repeated segment requests should increase backend cache hits and
+avoid repeated upstream fetches.

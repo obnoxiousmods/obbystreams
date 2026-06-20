@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from app import _ProxyCache, _proxy_url, _rewrite_m3u8
+from app import _ProxyCache, _proxy_url, _rewrite_m3u8, _split_curl_headers_body
 
 
 @pytest.mark.asyncio
@@ -59,9 +59,42 @@ async def test_proxy_cache_inflight_lock_released():
     lock = cache.lock("url1")
     async with lock:
         pass
-    await cache.release_lock("url1")
+    await cache.release_lock("url1", lock)
     await cache.cleanup()
     # After release and cleanup the lock should be gone.
+    assert "url1" not in cache._inflight
+
+
+@pytest.mark.asyncio
+async def test_proxy_cache_keeps_stale_entry_after_fresh_ttl():
+    cache = _ProxyCache(max_size=10, playlist_ttl=1.0, segment_ttl=2.0, stale_ttl=10.0)
+    await cache.set("url1", b"body", "video/mp2t", 1.0, 0.0)
+    assert await cache.get("url1", 2.0) is None
+    assert await cache.get_stale("url1", 2.0) == (b"body", "video/mp2t")
+    assert await cache.get_stale("url1", 20.0) is None
+
+
+@pytest.mark.asyncio
+async def test_proxy_cache_does_not_release_lock_acquired_by_waiter():
+    cache = _ProxyCache(max_size=10, playlist_ttl=1.0, segment_ttl=2.0)
+    lock = cache.lock("url1")
+    await lock.acquire()
+
+    waiter_acquired = asyncio.Event()
+
+    async def waiter():
+        async with lock:
+            waiter_acquired.set()
+            await asyncio.sleep(0.02)
+
+    task = asyncio.create_task(waiter())
+    await asyncio.sleep(0)
+    lock.release()
+    await waiter_acquired.wait()
+    await cache.release_lock("url1", lock)
+    assert cache.lock("url1") is lock
+    await task
+    await cache.release_lock("url1", lock)
     assert "url1" not in cache._inflight
 
 
@@ -98,3 +131,14 @@ def test_rewrite_m3u8_preserves_existing_proxy_urls():
     raw_url = "https://example.com/live/playlist.m3u8"
     rewritten = _rewrite_m3u8(playlist, raw_url)
     assert rewritten.count("/api/proxy-hls") == 1
+
+
+def test_split_curl_headers_body_uses_final_header_block_after_redirects():
+    raw = (
+        b"HTTP/1.1 302 Found\r\nlocation: https://cdn.example/live.m3u8\r\n\r\n"
+        b"HTTP/2 200\r\ncontent-type: application/vnd.apple.mpegurl\r\n\r\n"
+        b"#EXTM3U\n#EXTINF:4,\nseg.ts\n"
+    )
+    body, content_type = _split_curl_headers_body(raw)
+    assert body.startswith(b"#EXTM3U")
+    assert content_type == "application/vnd.apple.mpegurl"

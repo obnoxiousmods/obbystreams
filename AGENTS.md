@@ -29,6 +29,10 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 
 Never expose private official source headers, dashboard credentials, Arango credentials, or raw cockpit config through public endpoints. Keep official ffmpeg sources in `stream.sources`; keep pasted public internet sources in top-level `public_sources`. See `public_srcs.md` before changing, deleting, or reclassifying public source records.
 
+The `/api/proxy-hls` path is a hot fan-out path. Preserve backend cache
+coalescing, stale fallback, pooled upstream fetches, and the nginx buffered
+location when changing public playback.
+
 ## Operator UI Guidance
 
 The cockpit should be dense, operational, and source-focused. `Up`/`Down` link ordering controls are not useful here. Prefer source rows with health, type, viewer count, `Switch`, `Recover` where applicable, `Open`, and `Remove`.
