@@ -21,6 +21,7 @@ import type {
   SourceStatus,
   StatusPayload,
   Tone,
+  WatcherNewsEntry,
 } from "./types";
 
 type EncoderMode = "auto" | "gpu-only" | "cpu";
@@ -1460,6 +1461,144 @@ function PublicStreamsPanel({
   );
 }
 
+function WatcherNewsPanel({
+  entries,
+  pending,
+  onSave,
+  onRemove,
+}: {
+  entries: WatcherNewsEntry[];
+  pending: boolean;
+  onSave: (entry: WatcherNewsEntry) => Promise<void>;
+  onRemove: (entry: WatcherNewsEntry) => Promise<void>;
+}) {
+  const emptyDraft: WatcherNewsEntry = {
+    title: "",
+    body: "",
+    tone: "info",
+    visible: true,
+    pinned: false,
+    link_url: "",
+    link_label: "",
+  };
+  const [draft, setDraft] = useState<WatcherNewsEntry>(emptyDraft);
+  const editing = Boolean(draft.id);
+
+  function updateDraft(patch: Partial<WatcherNewsEntry>) {
+    setDraft((current) => ({ ...current, ...patch }));
+  }
+
+  function edit(entry: WatcherNewsEntry) {
+    setDraft({
+      id: entry.id,
+      title: entry.title || "",
+      body: entry.body || "",
+      tone: entry.tone || "info",
+      visible: entry.visible !== false,
+      pinned: Boolean(entry.pinned),
+      link_url: entry.link_url || "",
+      link_label: entry.link_label || "",
+    });
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!String(draft.title || "").trim() && !String(draft.body || "").trim()) return;
+    await onSave(draft);
+    setDraft(emptyDraft);
+  }
+
+  return (
+    <Panel title="Watcher News" meta={<Badge>{entries.filter((entry) => entry.visible !== false).length} visible</Badge>} className="linksPanel watcherNewsPanel">
+      <form className="newsForm" onSubmit={submit}>
+        <input
+          value={draft.title || ""}
+          onChange={(event) => updateDraft({ title: event.target.value })}
+          placeholder="Headline"
+          maxLength={140}
+        />
+        <textarea
+          value={draft.body || ""}
+          onChange={(event) => updateDraft({ body: event.target.value })}
+          placeholder="Message shown on fight.nswfiles.com"
+          rows={4}
+          maxLength={4000}
+        />
+        <div className="newsOptions">
+          <select value={draft.tone || "info"} onChange={(event) => updateDraft({ tone: event.target.value })}>
+            <option value="info">Info</option>
+            <option value="ok">Good</option>
+            <option value="warn">Warning</option>
+            <option value="bad">Urgent</option>
+            <option value="neutral">Neutral</option>
+          </select>
+          <label>
+            <input type="checkbox" checked={draft.visible !== false} onChange={(event) => updateDraft({ visible: event.target.checked })} />
+            Visible
+          </label>
+          <label>
+            <input type="checkbox" checked={Boolean(draft.pinned)} onChange={(event) => updateDraft({ pinned: event.target.checked })} />
+            Pinned
+          </label>
+        </div>
+        <div className="newsLinkRow">
+          <input
+            value={draft.link_label || ""}
+            onChange={(event) => updateDraft({ link_label: event.target.value })}
+            placeholder="Link label"
+            maxLength={80}
+          />
+          <input
+            value={draft.link_url || ""}
+            onChange={(event) => updateDraft({ link_url: event.target.value })}
+            type="url"
+            placeholder="https://optional-link.example"
+          />
+        </div>
+        <div className="linkActions newsFormActions">
+          <button type="submit" className="streamNow" disabled={pending || (!String(draft.title || "").trim() && !String(draft.body || "").trim())}>
+            {pending ? "Saving..." : editing ? "Update news" : "Publish news"}
+          </button>
+          {editing ? (
+            <button type="button" className="secondary compactButton" disabled={pending} onClick={() => setDraft(emptyDraft)}>
+              Cancel edit
+            </button>
+          ) : null}
+        </div>
+      </form>
+
+      <div className="linksList newsList">
+        {entries.length ? (
+          entries.map((entry) => (
+            <div className="linkItem sourceItem newsItem" key={entry.id}>
+              <div className="linkTop">
+                <strong>{entry.title || "Untitled update"}</strong>
+                <div className="sourceBadges">
+                  <Badge tone={(entry.tone as Tone) || "info"}>{entry.tone || "info"}</Badge>
+                  <Badge tone={entry.visible === false ? "warn" : "ok"}>{entry.visible === false ? "hidden" : "visible"}</Badge>
+                  {entry.pinned ? <Badge>pinned</Badge> : null}
+                </div>
+              </div>
+              {entry.body ? <p className="newsBody">{entry.body}</p> : null}
+              {entry.link_url ? <p className="sourceMeta">{entry.link_label || "Open"} {entry.link_url}</p> : null}
+              <div className="linkActions">
+                <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => edit(entry)}>
+                  Edit
+                </button>
+                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(entry)}>
+                  Remove
+                </button>
+              </div>
+            </div>
+          ))
+        ) : (
+          <EmptyLine>No watcher news configured.</EmptyLine>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
 function TelemetryPanel({
   hls,
   errors,
@@ -1552,12 +1691,14 @@ export default function App() {
   const [pendingEncoder, setPendingEncoder] = useState(false);
   const [pendingLinks, setPendingLinks] = useState(false);
   const [pendingPrivateIptv, setPendingPrivateIptv] = useState(false);
+  const [pendingNews, setPendingNews] = useState(false);
   const [sourceOverride, setSourceOverride] = useState<string | null>(null);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceMsg, setSourceMsg] = useState<string | null>(null);
   const authenticated = !locked;
   const configuredSources = useMemo<SourceStatus[]>(() => (status?.sources || status?.config.stream?.sources || []) as SourceStatus[], [status?.config.stream?.sources, status?.sources]);
   const publicStreams = useMemo<PublicStreamSource[]>(() => status?.config.public_sources || [], [status?.config.public_sources]);
+  const watcherNews = useMemo<WatcherNewsEntry[]>(() => status?.config.watcher_news || [], [status?.config.watcher_news]);
 
   const logout = useCallback(() => {
     setLocked(true);
@@ -1835,6 +1976,39 @@ export default function App() {
     }
   }
 
+  async function saveWatcherNews(entry: WatcherNewsEntry) {
+    setPendingNews(true);
+    try {
+      await api("/api/news", {
+        method: "POST",
+        body: JSON.stringify(entry),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`news error: ${errorMessage(err)}`);
+    } finally {
+      setPendingNews(false);
+    }
+  }
+
+  async function removeWatcherNews(entry: WatcherNewsEntry) {
+    if (!entry.id) return;
+    setPendingNews(true);
+    try {
+      await api("/api/news/remove", {
+        method: "POST",
+        body: JSON.stringify({ id: entry.id }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`news error: ${errorMessage(err)}`);
+    } finally {
+      setPendingNews(false);
+    }
+  }
+
   if (!authenticated && !authChecked) return <main className="loginShell" />;
   if (!authenticated) return <LoginScreen onLogin={login} />;
 
@@ -1877,6 +2051,7 @@ export default function App() {
         <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} />
         <PrivateIptvPanel runtime={status?.private_iptv} pending={pendingPrivateIptv} onRefresh={refreshPrivateIptv} />
         <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} />
+        <WatcherNewsPanel entries={watcherNews} pending={pendingNews} onSave={saveWatcherNews} onRemove={removeWatcherNews} />
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>
       <FooterStatus hls={hls} sessionState={sessionState} />

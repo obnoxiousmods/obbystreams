@@ -33,6 +33,8 @@ Private IPTV automation is an official-source feeder, not a public-source scrape
 
 Public pasted sources are top-level `public_sources`, not `stream.sources`. They are third-party internet stream URLs pasted for viewers to watch through the public client. They are not ffmpeg inputs for the official managed stream. They are exposed through `/api/public-streams` with `playback_url` values that point at `/api/proxy-hls`, so browser CORS never depends on the third-party origin. Some records require `headers` such as `Referer`, `Origin`, or browser user-agent values; the proxy applies those headers server-side and rewrites nested playlists back through itself. The current source inventory is documented in `public_srcs.md`.
 
+Watcher news/changelog entries are top-level `watcher_news` records. They are operator-authored plain-text announcements for the public client, not stream sources. The cockpit exposes visible entries through `GET /api/news`, includes them in `/api/live`, and keeps hidden drafts available only through authenticated config/status responses.
+
 The proxy path must be treated as a fan-out service. It uses backend coalescing,
 bounded fresh/stale cache, pooled upstream HTTP connections, curl fallback for
 hostile origins, browser cache headers, and a dedicated nginx `/api/proxy-hls`
@@ -43,6 +45,7 @@ The watcher consumes only public and redacted endpoints:
 
 - `GET /api/public-configured-sources`
 - `GET /api/public-streams`
+- `GET /api/news`
 - `GET /api/live`
 - `GET /hls/ufc.m3u8`
 - `GET /api/public-source` as a legacy optional supplement only
@@ -58,6 +61,7 @@ Obbystreams should contain:
 - HLS/DASH output configuration.
 - Private source headers and source manifest generation for the CLI.
 - Separate `public_sources` management and proxied public playback URLs.
+- Separate `watcher_news` management for public announcements/changelog entries.
 - Public read-only watcher APIs for managed Server 1 status/viewer telemetry with redacted fields.
 - Operator-only cockpit UI for managing sources and runtime health.
 
@@ -68,6 +72,7 @@ ObbyWatcher should contain:
 - SSE/polling subscription to cockpit public status.
 - Client-side failover between pasted public sources.
 - Public fallback display and user-facing diagnostics.
+- Read-only news/changelog display from `GET /api/news` and `/api/live`.
 
 ## Tradeoffs
 

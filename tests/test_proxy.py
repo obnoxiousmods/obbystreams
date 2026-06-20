@@ -6,7 +6,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from app import _ProxyCache, _proxy_url, _rewrite_m3u8, _split_curl_headers_body, assess_playback_candidate, normalize_config
+from app import (
+    _ProxyCache,
+    _proxy_url,
+    _rewrite_m3u8,
+    _split_curl_headers_body,
+    assess_playback_candidate,
+    normalize_config,
+    normalize_news_entries,
+    public_news_entries,
+)
 
 
 @pytest.mark.asyncio
@@ -102,6 +111,32 @@ def test_proxy_url_encodes_url():
     assert _proxy_url("https://example.com/stream.m3u8?token=a/b") == (
         "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Fstream.m3u8%3Ftoken%3Da%2Fb"
     )
+
+
+def test_normalize_news_entries_sanitizes_and_sorts():
+    entries = normalize_news_entries(
+        [
+            {"id": "Bad ID!", "title": "Later", "body": "Visible", "tone": "urgent", "updated_at": 10},
+            {"id": "pinned", "title": "Pinned", "body": "Top", "tone": "warn", "pinned": True, "updated_at": 2},
+            {"title": "", "body": ""},
+        ]
+    )
+    assert [entry["id"] for entry in entries] == ["pinned", "bad-id"]
+    assert entries[0]["tone"] == "warn"
+    assert entries[1]["tone"] == "info"
+
+
+def test_public_news_entries_hides_hidden_items():
+    config = normalize_config(
+        {
+            "watcher_news": [
+                {"id": "visible", "title": "Visible", "body": "Shown", "visible": True},
+                {"id": "hidden", "title": "Hidden", "body": "Nope", "visible": False},
+            ]
+        }
+    )
+    assert [entry["id"] for entry in public_news_entries(config)] == ["visible"]
+    assert {entry["id"] for entry in public_news_entries(config, include_hidden=True)} == {"visible", "hidden"}
 
 
 def test_rewrite_m3u8_rewrites_relative_segments():

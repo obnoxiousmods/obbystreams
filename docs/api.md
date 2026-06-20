@@ -214,6 +214,7 @@ Public watcher endpoints:
 ```http
 GET /api/public-configured-sources
 GET /api/public-streams
+GET /api/news
 GET /api/live
 GET /api/viewers
 POST /api/viewers
@@ -222,6 +223,26 @@ POST /api/viewers
 `/api/public-configured-sources` returns the synthetic `server-1` managed source for the official ffmpeg output.
 
 `/api/public-streams` returns separately managed pasted public internet streams. Each item includes `url` plus a CORS-safe `playback_url` that points through `/api/proxy-hls`. These records are not official ffmpeg sources and do not affect `stream.sources`. Public records may carry server-side `headers` such as `Referer`, `Origin`, or `User-Agent`; the proxy applies those headers while keeping browser playback on `s.obby.ca`.
+
+`/api/news` returns visible ObbyWatcher news/changelog entries managed by the cockpit. Entries are plain text fields with `title`, `body`, `tone`, `pinned`, timestamps, and optional `link_url`; hidden entries stay available in cockpit config but are excluded from the public endpoint.
+
+Operator-only news management:
+
+```http
+POST /api/news
+content-type: application/json
+x-obbystreams-token: <token>
+
+{"title":"Main card live","body":"Use Server 1 first; public backups are available.","tone":"info","visible":true,"pinned":true}
+```
+
+```http
+POST /api/news/remove
+content-type: application/json
+x-obbystreams-token: <token>
+
+{"id":"news-1781990000000"}
+```
 
 The current production public source inventory and nested-playlist notes live in `public_srcs.md`.
 

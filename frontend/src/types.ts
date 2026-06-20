@@ -45,6 +45,7 @@ export interface PublicConfig {
   };
   private_iptv?: PrivateIptvConfig;
   public_sources?: PublicStreamSource[];
+  watcher_news?: WatcherNewsEntry[];
 }
 
 export interface SourceConfig {
@@ -78,6 +79,19 @@ export interface PublicStreamSource {
   origin?: "manual" | "auto" | string;
   read_only?: boolean;
   has_headers?: boolean;
+}
+
+export interface WatcherNewsEntry {
+  id?: string;
+  title?: string;
+  body?: string;
+  tone?: "info" | "ok" | "warn" | "bad" | "neutral" | string;
+  visible?: boolean;
+  pinned?: boolean;
+  created_at?: number;
+  updated_at?: number;
+  link_url?: string;
+  link_label?: string;
 }
 
 export interface PrivateIptvConfig {

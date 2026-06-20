@@ -111,6 +111,14 @@ private_iptv:
   date_window_hours: 30
   require_date_window_match: true
 
+watcher_news:
+  - id: welcome
+    title: Welcome
+    body: Server 1 is the official stream. Public backups are listed separately.
+    tone: info
+    visible: true
+    pinned: true
+
 arangodb:
   enabled: true
   url: http://127.0.0.1:8529

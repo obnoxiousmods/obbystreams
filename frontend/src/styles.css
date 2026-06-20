@@ -47,7 +47,9 @@
   }
 
   button,
-  input {
+  input,
+  select,
+  textarea {
     font: inherit;
   }
 
@@ -58,11 +60,23 @@
     @apply m-0;
   }
 
-  input {
+  input,
+  select,
+  textarea {
     @apply min-h-11 w-full rounded-lg border border-obby-line-strong bg-[#0b0910] px-3.5 py-3 text-obby-text outline-none;
   }
 
-  input:focus {
+  textarea {
+    @apply min-h-[112px] resize-y;
+  }
+
+  input[type="checkbox"] {
+    @apply min-h-0 w-auto accent-obby-accent;
+  }
+
+  input:focus,
+  select:focus,
+  textarea:focus {
     @apply border-obby-accent;
     box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
   }
@@ -689,6 +703,36 @@
     @apply px-3 pb-1 text-xs text-obby-muted;
   }
 
+  .newsForm {
+    @apply grid gap-2 border-b border-obby-line p-3;
+  }
+
+  .newsOptions {
+    @apply grid items-center gap-2;
+    grid-template-columns: minmax(130px, 1fr) auto auto;
+  }
+
+  .newsOptions label {
+    @apply inline-flex min-h-11 items-center gap-2 rounded-lg border border-obby-line bg-obby-tile px-3 text-xs font-extrabold text-obby-muted;
+  }
+
+  .newsLinkRow {
+    @apply grid gap-2;
+    grid-template-columns: minmax(120px, 0.36fr) minmax(180px, 1fr);
+  }
+
+  .newsFormActions {
+    @apply mt-0;
+  }
+
+  .newsList {
+    @apply pt-3;
+  }
+
+  .newsBody {
+    @apply whitespace-pre-wrap font-sans;
+  }
+
   .sourceChanger {
     @apply border-t border-obby-line;
   }
@@ -835,6 +879,11 @@
   }
 
   .addLink {
+    @apply grid-cols-1;
+  }
+
+  .newsOptions,
+  .newsLinkRow {
     @apply grid-cols-1;
   }
 }

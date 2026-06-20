@@ -329,6 +329,7 @@ DEFAULT_CONFIG = {
         "require_date_window_match": True,
     },
     "public_sources": [],
+    "watcher_news": [],
     "arangodb": {
         "enabled": True,
         "url": "http://127.0.0.1:8529",
@@ -571,6 +572,52 @@ def normalize_string_list(raw_values):
     return normalized
 
 
+def normalize_news_entries(raw_entries):
+    values = raw_entries if isinstance(raw_entries, list) else []
+    entries = []
+    seen_ids = set()
+    current_ms = now_ms()
+    for index, raw in enumerate(values):
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()[:140]
+        body = str(raw.get("body") or raw.get("message") or "").strip()[:4000]
+        if not title and not body:
+            continue
+        raw_id = str(raw.get("id") or "").strip()
+        entry_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", raw_id).strip("-").lower()
+        if not entry_id:
+            entry_id = f"news-{index + 1}"
+        base_id = entry_id
+        suffix = 2
+        while entry_id in seen_ids:
+            entry_id = f"{base_id}-{suffix}"
+            suffix += 1
+        tone = str(raw.get("tone") or raw.get("level") or "info").strip().lower()
+        if tone not in {"info", "ok", "warn", "bad", "neutral"}:
+            tone = "info"
+        created_at = safe_int(raw.get("created_at") or raw.get("published_at") or current_ms, current_ms, minimum=0)
+        updated_at = safe_int(raw.get("updated_at") or created_at, created_at, minimum=0)
+        entry = {
+            "id": entry_id,
+            "title": title,
+            "body": body,
+            "tone": tone,
+            "visible": bool(raw.get("visible", True)),
+            "pinned": bool(raw.get("pinned", False)),
+            "created_at": created_at,
+            "updated_at": max(created_at, updated_at),
+        }
+        link_url = str(raw.get("link_url") or raw.get("url") or "").strip()
+        if valid_stream_url(link_url):
+            entry["link_url"] = link_url
+            entry["link_label"] = str(raw.get("link_label") or "Open").strip()[:80] or "Open"
+        seen_ids.add(entry_id)
+        entries.append(entry)
+    entries.sort(key=lambda item: (not item.get("pinned"), -int(item.get("updated_at") or 0)))
+    return entries[:50]
+
+
 def normalize_private_iptv(raw_config):
     defaults = json.loads(json.dumps(DEFAULT_CONFIG["private_iptv"]))
     if isinstance(raw_config, dict):
@@ -674,6 +721,9 @@ def normalize_config(config):
     if "public_sources" in config:
         merged["public_sources"] = config.get("public_sources", [])
     merged["public_sources"] = normalize_public_sources(merged.get("public_sources", []))
+    if "watcher_news" in config:
+        merged["watcher_news"] = config.get("watcher_news", [])
+    merged["watcher_news"] = normalize_news_entries(merged.get("watcher_news", []))
     stream = merged["stream"]
     stream["sources"] = normalize_sources(stream.get("sources", []), stream.get("links", []))
     stream["links"] = sync_links_from_sources(stream)
@@ -799,6 +849,13 @@ def public_config(config):
         source.pop("headers", None)
     safe["public_sources"] = [proxied_public_source(source) for source in public_stream_inventory(config)]
     return safe
+
+
+def public_news_entries(config, include_hidden=False):
+    entries = normalize_news_entries(config.get("watcher_news", []))
+    if not include_hidden:
+        entries = [entry for entry in entries if entry.get("visible", True)]
+    return entries[:20]
 
 
 def public_cors_headers():
@@ -3219,6 +3276,71 @@ async def public_streams(request):
     return JSONResponse({"ok": True, "sources": sources, "count": len(sources)}, headers=cors)
 
 
+async def public_news(request):
+    cors = public_cors_headers()
+    if request.method == "OPTIONS":
+        return Response("", headers=cors)
+    config = load_config()
+    entries = public_news_entries(config)
+    return JSONResponse({"ok": True, "entries": entries, "count": len(entries), "updated_at": now_ms()}, headers=cors)
+
+
+async def upsert_news(request):
+    config = load_config()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    now_value = now_ms()
+    entries = normalize_news_entries(config.get("watcher_news", []))
+    entry_id = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(body.get("id") or "").strip()).strip("-").lower()
+    existing_index = next((index for index, entry in enumerate(entries) if entry.get("id") == entry_id), None) if entry_id else None
+    existing = entries[existing_index] if existing_index is not None else {}
+    candidate = {
+        **existing,
+        "id": entry_id or f"news-{now_value}",
+        "title": str(body.get("title", existing.get("title", ""))).strip(),
+        "body": str(body.get("body", existing.get("body", ""))).strip(),
+        "tone": str(body.get("tone", existing.get("tone", "info"))).strip(),
+        "visible": bool(body.get("visible", existing.get("visible", True))),
+        "pinned": bool(body.get("pinned", existing.get("pinned", False))),
+        "created_at": existing.get("created_at") or now_value,
+        "updated_at": now_value,
+        "link_url": str(body.get("link_url", existing.get("link_url", ""))).strip(),
+        "link_label": str(body.get("link_label", existing.get("link_label", "Open"))).strip(),
+    }
+    normalized = normalize_news_entries([candidate])
+    if not normalized:
+        return JSONResponse({"ok": False, "error": "title or body required"}, status_code=400)
+    next_entry = normalized[0]
+    if existing_index is None:
+        entries.insert(0, next_entry)
+        action = "added"
+    else:
+        entries[existing_index] = next_entry
+        action = "updated"
+    config["watcher_news"] = normalize_news_entries(entries)
+    save_config(config)
+    event(f"watcher news {action}", "ok", {"id": next_entry.get("id")})
+    return JSONResponse({"ok": True, "entry": next_entry, "entries": public_news_entries(config, include_hidden=True)})
+
+
+async def remove_news(request):
+    config = load_config()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    entry_id = str(body.get("id") or "").strip()
+    if not entry_id:
+        return JSONResponse({"ok": False, "error": "id required"}, status_code=400)
+    entries = normalize_news_entries(config.get("watcher_news", []))
+    config["watcher_news"] = [entry for entry in entries if entry.get("id") != entry_id]
+    save_config(config)
+    event("watcher news removed", "warn", {"id": entry_id})
+    return JSONResponse({"ok": True, "entries": public_news_entries(config, include_hidden=True)})
+
+
 async def add_public_stream(request):
     config = load_config()
     try:
@@ -3281,6 +3403,7 @@ async def live_public_events(request):
                 "hls": hls_metrics(config),
                 "sources": public_managed_sources(config, proc),
                 "viewers": viewer_counts_snapshot(),
+                "news": public_news_entries(config),
             }
             encoded = json.dumps(payload, separators=(",", ":"))
             if encoded != last_payload:
@@ -3973,6 +4096,9 @@ routes = [
     Route("/api/public-streams", public_streams, methods=["GET", "OPTIONS"]),
     Route("/api/public-streams", guarded(add_public_stream), methods=["POST"]),
     Route("/api/public-streams/remove", guarded(remove_public_stream), methods=["POST"]),
+    Route("/api/news", public_news, methods=["GET", "OPTIONS"]),
+    Route("/api/news", guarded(upsert_news), methods=["POST"]),
+    Route("/api/news/remove", guarded(remove_news), methods=["POST"]),
     Route("/api/public-configured-sources", public_configured_sources, methods=["GET", "OPTIONS"]),
     Route("/api/live", live_public_events, methods=["GET", "OPTIONS"]),
     Route("/api/viewers", viewer_counts, methods=["GET", "POST", "OPTIONS"]),
