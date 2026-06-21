@@ -1316,7 +1316,7 @@ function PrivateIptvPanel({
 }: {
   runtime?: PrivateIptvRuntime;
   pending: boolean;
-  onRefresh: () => Promise<void>;
+  onRefresh: (forceProbe?: boolean) => Promise<void>;
 }) {
   const state = runtime?.state || "idle";
   const tone: Tone = state === "active" ? "ok" : state === "error" ? "bad" : state === "inactive" ? "warn" : "neutral";
@@ -1330,14 +1330,25 @@ function PrivateIptvPanel({
         <span>{accepted}/{candidates} accepted</span>
         <span>{entries} entries</span>
         <span>Checked {fmtClock(runtime?.last_checked_at)}</span>
+        <span>Private slots {runtime?.stream_uses_private_slot ? "1" : "0"}/{runtime?.connection_limit ?? 2}</span>
+        <span>Probe {runtime?.probe_allowed ? "ready" : "reserved"}</span>
       </div>
       <p className="panelMessage">{runtime?.message || "Waiting for private IPTV automation."}</p>
+      {runtime?.probe_skipped_reason ? (
+        <p className="sourceMeta">Probe budget: {runtime.probe_skipped_reason}</p>
+      ) : null}
+      {runtime?.last_probe_mode ? (
+        <p className="sourceMeta">Last probe mode: {runtime.last_probe_mode}</p>
+      ) : null}
       {runtime?.active_source_ids?.length ? (
         <p className="sourceMeta">Active {runtime.active_source_ids.join(", ")}</p>
       ) : null}
       <div className="linkActions">
-        <button type="button" className="compactButton streamNow" disabled={pending} onClick={onRefresh}>
+        <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => onRefresh(false)}>
           {pending ? "Refreshing..." : "Refresh"}
+        </button>
+        <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onRefresh(true)}>
+          Force deep probe
         </button>
       </div>
       {runtime?.reasons?.length ? (
@@ -1963,10 +1974,10 @@ export default function App() {
     return { count: data.links.length };
   }
 
-  async function refreshPrivateIptv() {
+  async function refreshPrivateIptv(forceProbe = false) {
     setPendingPrivateIptv(true);
     try {
-      await api("/api/private-iptv/refresh", { method: "POST", body: JSON.stringify({}) });
+      await api("/api/private-iptv/refresh", { method: "POST", body: JSON.stringify({ force_probe: forceProbe }) });
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();

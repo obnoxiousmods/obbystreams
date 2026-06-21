@@ -21,6 +21,9 @@ The provider playlist contains many channels and event rows. On UFC/fight days, 
 - `private_iptv.keywords`: positive row-matching terms.
 - `private_iptv.reject_keywords`: placeholder/stale/non-event terms.
 - `private_iptv.require_date_window_match`: default true, prevents always-present generic UFC/PPV rows from keeping ffmpeg active on non-fight days.
+- `private_iptv.connection_limit`: sour-signal upstream connection limit. Default is `2`.
+- `private_iptv.reserve_spare_when_streaming`: default true, prevents scheduled probes from using the spare sour-signal slot while ffmpeg is healthy.
+- `private_iptv.keep_stream_live_when_inactive`: default true, keeps the current official stream running 24/7 even when automation finds no fight-day candidate.
 
 ## Flow
 
@@ -28,10 +31,10 @@ The provider playlist contains many channels and event rows. On UFC/fight days, 
 2. Extract the download link with `m3uDownloadBtn` or use configured `playlist_url`.
 3. Fetch and parse the M3U playlist into `title`, attributes, and URL.
 4. Score each row with metadata, keyword hits, reject terms, PPV/event grouping, and inferred date window.
-5. Probe top candidates for playback evidence.
+5. Probe top candidates for playback evidence only when the private connection budget allows it.
 6. Write accepted rows into `stream.sources` using the configured prefix.
 7. Restart/start the managed ffmpeg stream when accepted source changes require it.
-8. Disable auto-created private sources and stop ffmpeg when inactive if configured.
+8. Disable auto-created private sources when inactive. Keep ffmpeg running by default so the official stream remains 24/7.
 
 ## Bad-Valid Detection
 
@@ -46,6 +49,12 @@ Some upstreams answer with HTTP 200 but are not usable streams. Candidate probin
 - placeholder rows such as “No Scheduled Event”, 24/7 rows, replays, classics, preshows, and post-fight press conferences.
 
 The scorer is intentionally heuristic. It does not claim perfect schedule knowledge; it makes defensible decisions from provider metadata and playback evidence. Tune `keywords`, `reject_keywords`, `min_score`, `date_window_hours`, and `require_date_window_match` when provider naming changes. For the current provider shape, requiring a current date-window match is important because generic UFC/PPV rows can remain in the playlist even when there is no active fight.
+
+## Private Connection Budget
+
+Sour-signal/private URLs allow only two concurrent upstream readers. The managed ffmpeg stream owns the first slot. While ffmpeg is healthy, scheduled automation reserves the remaining slot and runs metadata-only refreshes rather than fetching candidate playlists or media segments. The cockpit can force a deep probe for recovery work, but that should be treated as spending the spare upstream slot.
+
+Source-health checks follow the same rule. Private source rows may show “probe paused” while the live stream is healthy; that is expected and protects the 24/7 stream from account-level “too many streams” failures.
 
 ## Source Ownership
 

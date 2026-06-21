@@ -52,6 +52,7 @@ PROCESS = None
 STARTED_AT = None
 READER_TASK = None
 PROCESS_LOCK = asyncio.Lock()
+PRIVATE_PROBE_LOCK = asyncio.Lock()
 WATCHDOG_TASK = None
 WATCHDOG_LAST_ACTION = 0.0
 STREAM_DESIRED_STATE = "running"
@@ -299,6 +300,9 @@ DEFAULT_CONFIG = {
         "probe_candidates": True,
         "probe_timeout_seconds": 10,
         "disable_stream_when_inactive": True,
+        "connection_limit": 2,
+        "reserve_spare_when_streaming": True,
+        "keep_stream_live_when_inactive": True,
         "auto_start_when_active": True,
         "auto_source_prefix": "private-iptv",
         "headers": {
@@ -443,6 +447,21 @@ def source_type_for_url(raw_type, url):
     if host.endswith("soursignal.com"):
         return "soursignal"
     return "hls"
+
+
+def is_soursignal_url(url):
+    return urlparse(str(url or "")).netloc.lower().endswith("soursignal.com")
+
+
+def is_private_soursignal_source(source, private_cfg=None):
+    private_cfg = private_cfg or {}
+    prefix = str(private_cfg.get("auto_source_prefix") or "private-iptv")
+    source_id = str(source.get("id") or "")
+    return (
+        str(source.get("type") or "").lower() == "soursignal"
+        or is_soursignal_url(source.get("url"))
+        or source_id.startswith(prefix + "-")
+    )
 
 
 def normalize_source_headers(raw_headers):
@@ -633,6 +652,12 @@ def normalize_private_iptv(raw_config):
     defaults["probe_candidates"] = bool(defaults.get("probe_candidates", True))
     defaults["probe_timeout_seconds"] = safe_number(defaults.get("probe_timeout_seconds"), 10, minimum=3)
     defaults["disable_stream_when_inactive"] = bool(defaults.get("disable_stream_when_inactive", True))
+    defaults["connection_limit"] = safe_int(defaults.get("connection_limit"), 2, minimum=1)
+    defaults["reserve_spare_when_streaming"] = bool(defaults.get("reserve_spare_when_streaming", True))
+    if "keep_stream_live_when_inactive" in defaults:
+        defaults["keep_stream_live_when_inactive"] = bool(defaults.get("keep_stream_live_when_inactive", True))
+    else:
+        defaults["keep_stream_live_when_inactive"] = not defaults["disable_stream_when_inactive"]
     defaults["auto_start_when_active"] = bool(defaults.get("auto_start_when_active", True))
     defaults["auto_source_prefix"] = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
     defaults["headers"] = normalize_source_headers(defaults.get("headers"))
@@ -894,6 +919,10 @@ def write_source_manifest(config):
 def public_source_status(source, index=0, proc=None):
     source_id = source.get("id") or f"source-{index + 1}"
     health = SOURCE_HEALTH.get(source_id, {})
+    active_managed = bool(proc and proc.get("managed") and index == 0)
+    health_state = health.get("state")
+    if active_managed and health_state in {None, "", "unknown"}:
+        health_state = "green"
     return {
         "id": source_id,
         "label": source.get("label") or f"Source {index + 1}",
@@ -901,8 +930,8 @@ def public_source_status(source, index=0, proc=None):
         "url": source.get("url"),
         "enabled": bool(source.get("enabled", True)),
         "preferred": index == 0,
-        "in_process": bool(proc and proc.get("managed") and index == 0),
-        "health": health.get("state") or ("green" if index == 0 and proc and proc.get("managed") else "unknown"),
+        "in_process": active_managed,
+        "health": health_state or "unknown",
         "health_message": health.get("message") or "",
         "checked_at": health.get("checked_at"),
         "viewer_count": viewer_counts_snapshot().get("by_source", {}).get(source_id, 0),
@@ -1997,6 +2026,8 @@ def status_payload():
     config = load_config()
     proc = process_metrics()
     hls = hls_metrics(config)
+    health_doc = stream_health(config, proc, hls)
+    update_private_probe_runtime(config, private_probe_budget(config, proc=proc, health_doc=health_doc))
     configured_links = normalize_links(config.get("stream", {}).get("links", []))
     auto_links = current_auto_sources()
     active_links = effective_stream_links(config)
@@ -2007,7 +2038,7 @@ def status_payload():
         "managed_process": proc,
         "existing_processes": stream_processes(),
         "hls": hls,
-        "health": stream_health(config, proc, hls),
+        "health": health_doc,
         "sources": sources,
         "viewers": viewer_counts_snapshot(),
         "events": list(EVENTS)[-80:],
@@ -2207,7 +2238,11 @@ async def private_iptv_status(request):
 
 
 async def private_iptv_refresh(request):
-    result = await refresh_private_iptv_sources(reason="api")
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    result = await refresh_private_iptv_sources(reason="api", force_probe=bool(body.get("force_probe")))
     status = 200 if result.get("ok") else 500
     return JSONResponse(result, status_code=status)
 
@@ -2303,7 +2338,61 @@ PRIVATE_IPTV_RUNTIME = {
     "message": "Private IPTV automation has not run yet.",
     "reasons": [],
     "next_check_at": None,
+    "connection_limit": 2,
+    "stream_uses_private_slot": False,
+    "probe_allowed": True,
+    "probe_skipped_reason": "",
+    "last_probe_mode": "none",
 }
+
+
+def private_soursignal_links(config):
+    private_cfg = config.get("private_iptv", {})
+    sources = normalize_sources(config.get("stream", {}).get("sources", []), config.get("stream", {}).get("links", []))
+    links = [source.get("url") for source in sources if source.get("enabled", True) and is_private_soursignal_source(source, private_cfg)]
+    if not links:
+        links = [url for url in effective_stream_links(config) if is_soursignal_url(url)]
+    return normalize_links(links)
+
+
+def private_probe_budget(config, proc=None, health_doc=None, force_probe=False):
+    private_cfg = config.get("private_iptv", {})
+    proc = proc or process_metrics()
+    stream_uses_private_slot = bool(proc.get("managed") and private_soursignal_links(config))
+    connection_limit = int(private_cfg.get("connection_limit", 2))
+    reserve_spare = bool(private_cfg.get("reserve_spare_when_streaming", True))
+    decision = str((health_doc or {}).get("decision") or "").lower()
+    allowed = True
+    reason = ""
+    if force_probe:
+        reason = "forced by operator"
+    elif connection_limit <= 1 and stream_uses_private_slot:
+        allowed = False
+        reason = "private stream is already using the only allowed upstream slot"
+    elif reserve_spare and stream_uses_private_slot and decision not in {"failed", "degraded", "stopped"}:
+        allowed = False
+        reason = "private stream is live; spare upstream slot reserved"
+    return {
+        "connection_limit": connection_limit,
+        "stream_uses_private_slot": stream_uses_private_slot,
+        "probe_allowed": allowed,
+        "probe_skipped_reason": reason,
+        "health_decision": decision or "unknown",
+    }
+
+
+def update_private_probe_runtime(config, budget=None, mode=None):
+    budget = budget or private_probe_budget(config)
+    PRIVATE_IPTV_RUNTIME.update(
+        {
+            "connection_limit": budget.get("connection_limit"),
+            "stream_uses_private_slot": budget.get("stream_uses_private_slot"),
+            "probe_allowed": budget.get("probe_allowed"),
+            "probe_skipped_reason": budget.get("probe_skipped_reason") or "",
+        }
+    )
+    if mode:
+        PRIVATE_IPTV_RUNTIME["last_probe_mode"] = mode
 
 
 def private_iptv_cookie_header(config):
@@ -2492,18 +2581,20 @@ def looks_like_html(body):
 async def fetch_small_head(url, headers, timeout=10.0):
     client = _HTTPX_CLIENT
     close_client = False
+    request_headers = dict(headers or {})
+    request_headers.setdefault("Range", "bytes=0-131071")
     if client is None:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=4.0), follow_redirects=True)
         close_client = True
     try:
-        response = await client.get(url, headers=headers, timeout=timeout)
+        response = await client.get(url, headers=request_headers, timeout=timeout)
         return response.status_code, response.headers.get("content-type", ""), response.content[:128_000]
     finally:
         if close_client:
             await client.aclose()
 
 
-async def assess_playback_candidate(url, config, headers=None):
+async def assess_playback_candidate(url, config, headers=None, deep=True):
     headers = headers or private_iptv_request_headers(config)
     reasons = []
     score = 0
@@ -2565,7 +2656,7 @@ async def assess_playback_candidate(url, config, headers=None):
     if "#EXT-X-ENDLIST" in text and len(media_segments) < 2:
         score -= 20
         reasons.append("ended or tiny vod")
-    if media_segments:
+    if media_segments and deep:
         seg_status, seg_ct, seg_body = await fetch_small_head(media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
         if seg_status < 400 and seg_body and not looks_like_html(seg_body):
             score += 35
@@ -2573,6 +2664,9 @@ async def assess_playback_candidate(url, config, headers=None):
         else:
             score -= 35
             reasons.append(f"segment bad:{seg_status}:{seg_ct}")
+    elif media_segments:
+        score += 15
+        reasons.append("segment probe deferred")
     return {"ok": score >= 70, "score": score, "reasons": reasons, "resolved_url": url}
 
 
@@ -2900,10 +2994,14 @@ def private_iptv_public_runtime():
     return payload
 
 
-async def refresh_private_iptv_sources(reason="manual"):
+async def refresh_private_iptv_sources(reason="manual", force_probe=False):
     global STREAM_DESIRED_STATE
     config = load_config(fresh=True)
     private_cfg = config.get("private_iptv", {})
+    proc = process_metrics()
+    health_doc = stream_health(config, proc, hls_metrics(config), force=True)
+    budget = private_probe_budget(config, proc=proc, health_doc=health_doc, force_probe=force_probe)
+    update_private_probe_runtime(config, budget, mode="pending")
     PRIVATE_IPTV_RUNTIME.update(
         {
             "enabled": bool(private_cfg.get("enabled")),
@@ -2930,9 +3028,24 @@ async def refresh_private_iptv_sources(reason="manual"):
         candidates = select_private_iptv_candidates(entries, private_cfg)
         accepted = []
         probe_reasons = []
-        if private_cfg.get("probe_candidates", True):
+        should_probe = bool(private_cfg.get("probe_candidates", True) and budget.get("probe_allowed"))
+        if private_cfg.get("probe_candidates", True) and not should_probe:
+            skipped = budget.get("probe_skipped_reason") or "private playback probe skipped by budget policy"
+            accepted = candidates
+            probe_reasons = [
+                {
+                    "title": item["entry"].get("title"),
+                    "score": item.get("score"),
+                    "reasons": [*item.get("reasons", []), skipped],
+                }
+                for item in candidates
+            ]
+            update_private_probe_runtime(config, budget, mode="metadata-only")
+        elif should_probe:
+            update_private_probe_runtime(config, budget, mode="deep-probe")
             for candidate in candidates:
-                assessment = await assess_playback_candidate(candidate["entry"]["url"], private_cfg)
+                async with PRIVATE_PROBE_LOCK:
+                    assessment = await assess_playback_candidate(candidate["entry"]["url"], private_cfg, deep=True)
                 candidate["probe"] = assessment
                 probe_reasons.append(
                     {
@@ -2946,6 +3059,7 @@ async def refresh_private_iptv_sources(reason="manual"):
                     accepted.append(candidate)
         else:
             accepted = candidates
+            update_private_probe_runtime(config, budget, mode="metadata-only")
             probe_reasons = [
                 {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])}
                 for item in candidates
@@ -2973,7 +3087,10 @@ async def refresh_private_iptv_sources(reason="manual"):
             )
             if changed:
                 event("private IPTV sources refreshed", "ok", {"count": len(accepted), "reason": reason})
-                restarted = await restart_managed_with_config("private IPTV sources refreshed")
+                can_restart_live = bool(force_probe or budget.get("probe_allowed") or not budget.get("stream_uses_private_slot"))
+                restarted = await restart_managed_with_config("private IPTV sources refreshed") if can_restart_live else False
+                if not can_restart_live:
+                    event("private IPTV source changes saved without restart; live private stream protected", "warn")
                 if not restarted and private_cfg.get("auto_start_when_active", True):
                     async with PROCESS_LOCK:
                         if (not PROCESS or PROCESS.poll() is not None) and effective_stream_links(load_config(fresh=True)):
@@ -2998,7 +3115,8 @@ async def refresh_private_iptv_sources(reason="manual"):
             }
         )
         event("private IPTV inactive", "warn", {"candidates": len(candidates), "reason": reason})
-        if private_cfg.get("disable_stream_when_inactive", True):
+        keep_live = bool(private_cfg.get("keep_stream_live_when_inactive", True))
+        if private_cfg.get("disable_stream_when_inactive", True) and not keep_live:
             async with PROCESS_LOCK:
                 STREAM_DESIRED_STATE = "stopped"
                 await stop_managed_process("private IPTV inactive; managed ffmpeg stream disabled")
@@ -3557,19 +3675,25 @@ async def recover_soursignal_source(request):
     return JSONResponse({"ok": True, "source": public_source_status(source, proc=process_metrics()), "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
 
 
-async def probe_configured_source(source):
+async def probe_configured_source(source, config=None, budget=None):
     state = "unknown"
     message = ""
     url = source.get("url")
+    config = config or load_config()
+    private_cfg = config.get("private_iptv", {})
     try:
         if not valid_stream_url(url):
             state, message = "red", "Invalid URL"
+        elif is_private_soursignal_source(source, private_cfg) and budget and not budget.get("probe_allowed"):
+            state, message = "unknown", budget.get("probe_skipped_reason") or "Private source probe paused"
         elif source.get("type") in {"soursignal", "page"}:
             text = await _scrape_fetch(url)
             state = "green" if text else "yellow"
             message = "Source page reachable" if text else "Source page did not respond"
         else:
-            assessment = await assess_playback_candidate(url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url))
+            deep = not is_private_soursignal_source(source, private_cfg)
+            async with PRIVATE_PROBE_LOCK:
+                assessment = await assess_playback_candidate(url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url), deep=deep)
             if assessment.get("ok"):
                 state = "green"
             elif assessment.get("score", 0) >= 20:
@@ -3591,9 +3715,13 @@ async def source_health_loop():
     while True:
         try:
             config = load_config()
+            proc = process_metrics()
+            health_doc = stream_health(config, proc, hls_metrics(config))
+            budget = private_probe_budget(config, proc=proc, health_doc=health_doc)
+            update_private_probe_runtime(config, budget)
             for source in config.get("stream", {}).get("sources", []):
                 if source.get("enabled", True):
-                    await probe_configured_source(source)
+                    await probe_configured_source(source, config=config, budget=budget)
         except asyncio.CancelledError:
             break
         except Exception as exc:

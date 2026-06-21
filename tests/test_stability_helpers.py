@@ -23,6 +23,7 @@ from app import (
     parse_nvidia_gpu_csv,
     parse_nvidia_pmon,
     parse_nvidia_process_csv,
+    private_probe_budget,
     rewrite_playlist,
     safe_hls_path,
     score_private_iptv_entry,
@@ -320,6 +321,47 @@ def test_private_iptv_merge_and_disable_only_touch_auto_sources():
     assert effective_stream_links(cfg)[1] == "https://manual.example/live.m3u8"
     assert disable_private_iptv_sources(cfg) is True
     assert effective_stream_links(cfg) == ["https://manual.example/live.m3u8"]
+
+
+def test_private_iptv_budget_defaults_reserve_live_stream_slot():
+    cfg = normalize_config(
+        {
+            "private_iptv": {"enabled": True},
+            "stream": {
+                "sources": [
+                    {"id": "private-iptv-main", "label": "Main", "url": "https://soursignal.com/private/main"}
+                ]
+            },
+        }
+    )
+
+    assert cfg["private_iptv"]["connection_limit"] == 2
+    assert cfg["private_iptv"]["reserve_spare_when_streaming"] is True
+    assert cfg["private_iptv"]["keep_stream_live_when_inactive"] is True
+
+    budget = private_probe_budget(
+        cfg,
+        proc={"managed": True},
+        health_doc={"decision": "healthy"},
+    )
+    assert budget["stream_uses_private_slot"] is True
+    assert budget["probe_allowed"] is False
+    assert "reserved" in budget["probe_skipped_reason"]
+
+
+def test_private_iptv_budget_allows_probe_during_confirmed_failure():
+    cfg = normalize_config(
+        {
+            "private_iptv": {"enabled": True},
+            "stream": {
+                "sources": [
+                    {"id": "private-iptv-main", "label": "Main", "url": "https://soursignal.com/private/main"}
+                ]
+            },
+        }
+    )
+    budget = private_probe_budget(cfg, proc={"managed": True}, health_doc={"decision": "failed"})
+    assert budget["probe_allowed"] is True
 
 
 def test_hls_metrics_reads_dash_generated_hls_media_playlists(tmp_path):

@@ -14,6 +14,7 @@ from app import (
     assess_playback_candidate,
     normalize_config,
     normalize_news_entries,
+    probe_configured_source,
     public_news_entries,
 )
 
@@ -212,3 +213,47 @@ async def test_assess_playback_candidate_accepts_media_playlist(monkeypatch):
     assert result["ok"] is True
     assert "media segments" in result["reasons"]
     assert "segment readable" in result["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_assess_playback_candidate_shallow_mode_defers_segment_fetch(monkeypatch):
+    fetched = []
+
+    async def fake_fetch(url, headers, timeout=10.0):
+        fetched.append(url)
+        if url.endswith(".ts"):
+            raise AssertionError("shallow private probe should not fetch media segments")
+        return (
+            200,
+            "application/vnd.apple.mpegurl",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n",
+        )
+
+    import app as obbystreams_app
+
+    monkeypatch.setattr(obbystreams_app, "fetch_small_head", fake_fetch)
+    cfg = normalize_config({})["private_iptv"]
+    result = await assess_playback_candidate("https://example.com/live.m3u8", cfg, deep=False)
+    assert result["ok"] is True
+    assert fetched == ["https://example.com/live.m3u8"]
+    assert "segment probe deferred" in result["reasons"]
+
+
+@pytest.mark.asyncio
+async def test_probe_configured_source_skips_private_probe_when_budget_reserved(monkeypatch):
+    import app as obbystreams_app
+
+    async def fail_probe(*args, **kwargs):
+        raise AssertionError("private source probe should be skipped")
+
+    monkeypatch.setattr(obbystreams_app, "assess_playback_candidate", fail_probe)
+    source = {"id": "private-iptv-main", "type": "soursignal", "url": "https://soursignal.com/private/main", "enabled": True}
+    cfg = normalize_config({"private_iptv": {"enabled": True}, "stream": {"sources": [source]}})
+    await probe_configured_source(
+        source,
+        config=cfg,
+        budget={"probe_allowed": False, "probe_skipped_reason": "private stream is live; spare upstream slot reserved"},
+    )
+    health = obbystreams_app.SOURCE_HEALTH["private-iptv-main"]
+    assert health["state"] == "unknown"
+    assert "reserved" in health["message"]

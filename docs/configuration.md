@@ -92,7 +92,7 @@ Changing links, encoder, bitrate, audio bitrate, output directory, public HLS UR
 
 ## private_iptv
 
-`private_iptv` is the automation lane for the official/private ffmpeg source. It fetches the provider page or direct M3U playlist, scores fight-day entries, probes likely playback candidates, writes accepted entries into `stream.sources`, and can stop the managed ffmpeg stream when no validated fight source is active.
+`private_iptv` is the automation lane for the official/private ffmpeg source. It fetches the provider page or direct M3U playlist, scores fight-day entries, probes likely playback candidates when the private connection budget allows it, and writes accepted entries into `stream.sources`. By default the managed ffmpeg stream stays live 24/7 even when no new fight-day source is accepted.
 
 It does not populate `public_sources`. Public pasted internet streams are a separate 24/7 viewer inventory.
 
@@ -108,6 +108,9 @@ private_iptv:
   probe_candidates: true
   probe_timeout_seconds: 10
   disable_stream_when_inactive: true
+  connection_limit: 2
+  reserve_spare_when_streaming: true
+  keep_stream_live_when_inactive: true
   auto_start_when_active: true
   auto_source_prefix: private-iptv
   headers:
@@ -141,8 +144,11 @@ Important keys:
 - `keywords` and `reject_keywords`: scoring vocabulary for event rows. UFC/fight rows score up; placeholders like “No Scheduled Event”, 24/7 channels, replays, and stale preshows score down.
 - `date_window_hours`: rows with an inferred date outside this window are penalized.
 - `require_date_window_match`: requires at least one current dated event signal before accepting a row. Keep this enabled for providers that always list generic UFC/PPV channels.
-- `probe_candidates`: fetches candidate URLs and rejects bad-but-HTTP-valid responses such as HTML block pages, empty playlists, dead variant playlists, unreadable segments, or tiny ended VOD windows.
-- `disable_stream_when_inactive`: disables auto-created private IPTV sources and stops managed ffmpeg when no accepted source remains.
+- `probe_candidates`: fetches candidate URLs and rejects bad-but-HTTP-valid responses such as HTML block pages, empty playlists, dead variant playlists, unreadable segments, or tiny ended VOD windows when probing is allowed by the private connection budget.
+- `connection_limit`: total sour-signal/private upstream readers allowed by the provider. Default `2`.
+- `reserve_spare_when_streaming`: keeps the spare private slot free while managed ffmpeg is healthy, so scheduled automation does not look like another viewer.
+- `keep_stream_live_when_inactive`: keeps the current managed ffmpeg stream running when automation finds no active fight-day source. Default `true`.
+- `disable_stream_when_inactive`: legacy switch for disabling auto-created private sources when inactive. It only stops ffmpeg when `keep_stream_live_when_inactive` is explicitly `false`.
 - `auto_start_when_active`: starts managed ffmpeg after automation finds accepted sources and the process is not already running.
 
 Auto-created source IDs start with `auto_source_prefix`, default `private-iptv-`. Manual official sources are preserved.

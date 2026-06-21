@@ -104,6 +104,9 @@ export interface PrivateIptvConfig {
   min_score?: number;
   probe_candidates?: boolean;
   disable_stream_when_inactive?: boolean;
+  connection_limit?: number;
+  reserve_spare_when_streaming?: boolean;
+  keep_stream_live_when_inactive?: boolean;
   auto_start_when_active?: boolean;
   keywords?: string[];
   reject_keywords?: string[];
@@ -132,6 +135,11 @@ export interface PrivateIptvRuntime {
   message?: string;
   reasons?: PrivateIptvReason[];
   next_check_at?: number | null;
+  connection_limit?: number;
+  stream_uses_private_slot?: boolean;
+  probe_allowed?: boolean;
+  probe_skipped_reason?: string;
+  last_probe_mode?: string;
 }
 
 export interface ViewerCounts {

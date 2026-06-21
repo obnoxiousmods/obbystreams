@@ -205,7 +205,9 @@ The refresh flow:
 3. Scores UFC/MMA/fight-day candidates and rejects placeholders such as “No Scheduled Event”, 24/7, replay, and stale rows.
 4. Probes candidate playback for bad-but-valid responses: HTML block pages, empty playlists, dead variants, ended tiny windows, and unreadable segments.
 5. Writes accepted private entries to `stream.sources` using the configured auto-source prefix.
-6. Stops managed ffmpeg when inactive if `disable_stream_when_inactive` is true.
+6. Disables auto-created private candidates when inactive. Managed ffmpeg stays live by default unless `keep_stream_live_when_inactive` is explicitly false.
+
+Private sour-signal playback probes are connection-budget aware. `POST /api/private-iptv/refresh` respects the budget unless the body includes `{"force_probe": true}`.
 
 Provider cookies and sensitive headers are redacted from config/status responses.
 

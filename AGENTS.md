@@ -13,7 +13,9 @@ Do not treat this repository as the public fight viewer. The public watcher/clie
 - Keep structured source config authoritative; keep legacy `links` synchronized for compatibility.
 - Support explicit source switching through `Switch`, not order-management UX.
 - Recover sour-signal links by finding a replacement stream URL while preserving the source identity.
-- Run private IPTV automation as an official-source feeder: parse the authenticated provider playlist, score/probe UFC/fight-day rows, update `stream.sources`, and stop managed ffmpeg on inactive days when configured.
+- Run private IPTV automation as an official-source feeder: parse the authenticated provider playlist, score UFC/fight-day rows, probe only when the private sour-signal connection budget allows it, and update `stream.sources`.
+- Protect the sour-signal upstream limit: private URLs allow two concurrent readers, the managed ffmpeg stream owns the first slot, and scheduled automation/source-health checks must reserve the spare slot while the stream is healthy.
+- Keep the official managed ffmpeg stream live 24/7 by default. Inactive private IPTV automation may disable auto-created candidate rows, but it must not stop ffmpeg unless `keep_stream_live_when_inactive` is explicitly false.
 - Store and apply private per-source headers for proxy/ffmpeg use.
 - Maintain a separate `public_sources` inventory for pasted public internet stream URLs, including per-public-source request headers when needed.
 - Expose safe public managed Server 1 status, viewer telemetry, and proxied public-source playback for ObbyWatcher.

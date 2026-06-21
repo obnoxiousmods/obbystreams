@@ -1237,14 +1237,28 @@ def parser_for_args():
     return parser
 
 
+def is_capacity_limited_error(error_summary):
+    lowered = (error_summary or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "429",
+            "too many requests",
+            "too many streams",
+            "too many connections",
+            "concurrent stream",
+            "concurrent connection",
+            "rate limit",
+        )
+    )
+
+
 def retry_backoff_delay(stream, args, error_summary, return_code, confirmed_failure=False):
     if return_code == 0:
         stream.backoff_until = 0.0
         return args.restart_delay
 
-    lowered = (error_summary or "").lower()
-    rate_limited = "429" in lowered or "too many requests" in lowered or "rate limit" in lowered
-    if rate_limited:
+    if is_capacity_limited_error(error_summary):
         base = max(args.rate_limit_delay, args.restart_delay)
     elif not confirmed_failure:
         base = args.restart_delay
@@ -1439,12 +1453,15 @@ def main():
             all_failed = False
             confirmed_failure = assessment["decision"] == "failed"
             still_assessing = assessment["decision"] == "assessing"
+            capacity_limited = is_capacity_limited_error(error_summary)
 
             if state["manual_rotate"]:
                 state["manual_rotate"] = False
                 msg += " - manual switch requested"
             elif still_assessing:
                 msg += f" - retrying same link until at least {args.min_assessment_seconds:.0f}s of evidence"
+            elif capacity_limited:
+                msg += " - upstream capacity limit; cooling down current link without rotating"
             elif confirmed_failure and len(health) > 1:
                 previous = state["url_index"]
                 state["url_index"], all_failed = next_stream_index(health, previous)

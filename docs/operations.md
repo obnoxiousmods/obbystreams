@@ -58,7 +58,8 @@ Expected behavior:
 - UFC/fight-day candidates are written to `stream.sources` with the `private-iptv-` prefix.
 - Manual official sources remain in `stream.sources` and are not deleted by automation.
 - Pasted public viewer streams remain in top-level `public_sources`.
-- If no validated fight-day source remains, auto-created private IPTV sources are disabled and managed ffmpeg is stopped when `disable_stream_when_inactive` is true.
+- If no validated fight-day source remains, auto-created private IPTV sources are disabled. Managed ffmpeg keeps running by default because `keep_stream_live_when_inactive` is true for the 24/7 official stream.
+- While a private sour-signal stream is healthy, scheduled probes reserve the spare upstream slot. Cockpit source rows may show a paused probe state rather than spending the second allowed connection.
 
 If automation reports `inactive`, inspect the evidence rows first. Common causes are provider placeholders, stale event dates, HTML/block pages, dead variant playlists, or unreadable media segments.
 

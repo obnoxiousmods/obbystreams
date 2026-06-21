@@ -88,6 +88,9 @@ private_iptv:
   probe_candidates: true
   probe_timeout_seconds: 10
   disable_stream_when_inactive: true
+  connection_limit: 2
+  reserve_spare_when_streaming: true
+  keep_stream_live_when_inactive: true
   auto_start_when_active: true
   auto_source_prefix: private-iptv
   headers:
