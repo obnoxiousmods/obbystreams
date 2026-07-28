@@ -1,24 +1,64 @@
 #!/usr/bin/env python3
+"""Obbystreams cockpit — the operator control plane for the live UFC stream.
+
+This single-module Starlette ASGI app powers ``https://s.obby.ca``. It:
+
+* Manages the live ffmpeg transcode (start/stop/restart, a health-scoring
+  watchdog, and DASH/HLS output) that feeds the public ObbyWatcher viewer at
+  ``fight.nswfiles.com`` / ``live.obnoxious.lol``.
+* Runs two background scrapers: the **private-IPTV** loop (authenticated provider
+  playlist → scored/probed UFC sources merged into ``stream.sources``) and the
+  **public** auto-scraper (sportsurge-style pages → the red backup tiles).
+* Serves the cockpit SPA plus a JSON/SSE API and a shared HLS reverse proxy that
+  the viewer app calls cross-origin.
+
+Two operator affordances layer on top of that core:
+
+* **Persistent Stop** — ``stream.operator_stopped`` is a persisted master kill
+  switch. While set, the managed ffmpeg AND both scrapers stay idle until an
+  explicit Start/Restart, surviving supervisor ticks and full restarts. See
+  :func:`operator_stopped` / :func:`set_operator_stopped`.
+* **Source blacklist** — ``source_blacklist`` persistently blocks a stream by
+  URL/id/channel/label so it can never be re-selected by a scraper or shown to
+  viewers. See :func:`is_blacklisted` and the funnel filters it guards.
+* **UFC auto-schedule** — the ``schedule`` section turns Stop into a *standby*:
+  the ``obbyschedule`` package arms the encode ~15min before a card (ESPN
+  scoreboard), stands it down once every bout is decided, and posts countdown /
+  go-live / wrap-up embeds to Discord. It reaches back in only through
+  :func:`schedule_start_stream` / :func:`schedule_stop_stream`, so this module
+  stays the only place that knows about ``PROCESS_LOCK`` and the Stop switch.
+  See ``docs/auto-schedule.md``.
+
+Config lives at ``/etc/obbystreams/obbystreams.yaml`` and hot-reloads on mtime
+change (``load_config`` has a 1s cache). Note: this module itself does NOT
+hot-reload — deploying code changes requires restarting ``obbystreams.service``,
+which interrupts the live encode. Tooling: ruff + ty (Astral) + pytest via uv.
+"""
+
 import asyncio
 import base64
 import contextlib
 import csv
 import glob
+import hashlib
 import html
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import time
-from collections import OrderedDict, deque
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -29,6 +69,8 @@ from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
+
+from obbyschedule import ScheduleSettings, StopReason, UfcScheduler
 
 logger = logging.getLogger("obbystreams")
 CONFIG_PATH = Path(os.environ.get("OBBYSTREAMS_CONFIG", "/etc/obbystreams/obbystreams.yaml"))
@@ -56,6 +98,9 @@ PRIVATE_PROBE_LOCK = asyncio.Lock()
 WATCHDOG_TASK = None
 WATCHDOG_LAST_ACTION = 0.0
 STREAM_DESIRED_STATE = "running"
+# UFC auto-schedule (obbyschedule.UfcScheduler); constructed in lifespan.
+SCHEDULER: UfcScheduler | None = None
+SCHEDULE_TASK = None
 NVIDIA_SMI_CACHE_SECONDS = 5.0
 NVIDIA_SMI_CACHE: dict = {"at": 0.0, "payload": None}
 NVIDIA_SMI_LOCK = asyncio.Lock()
@@ -72,15 +117,28 @@ _AUTO_SCRAPE_INTERVAL = 300  # seconds between refreshes
 _AUTO_SCRAPE_TASK = None
 PRIVATE_IPTV_TASK = None
 
+# Strong references to fire-and-forget background tasks, so the event loop does
+# not garbage-collect them mid-flight (see RUF006).
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_background(coro):
+    """Schedule a fire-and-forget coroutine while retaining a strong reference."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
 SOURCE_HEALTH_TASK = None
 SOURCE_HEALTH_INTERVAL = 15
 SOURCE_HEALTH: dict[str, dict] = {}
 VIEWER_SESSION_TTL = 45
-VIEWER_SESSIONS: dict[str, dict] = {}
+VIEWER_SESSIONS: dict[str, dict[str, Any]] = {}
 VIEWER_LOCK = asyncio.Lock()
 
 
-RUNTIME = {
+RUNTIME: dict[str, Any] = {
     "stream_starts": 0,
     "stream_restarts": 0,
     "watchdog_restarts": 0,
@@ -91,6 +149,9 @@ RUNTIME = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Proxy cache — bounded TTL cache for shared HLS proxy responses.
+# ---------------------------------------------------------------------------
 class _ProxyCache:
     """Bounded TTL cache for HLS proxy responses with coalesced fetches.
 
@@ -104,6 +165,7 @@ class _ProxyCache:
     """
 
     def __init__(self, max_size: int = 5000, playlist_ttl: float = 2.5, segment_ttl: float = 120.0, stale_ttl: float = 600.0):
+        """Initialize the cache with size cap and per-kind TTLs, plus a serializing lock and stats counters."""
         self._cache: dict[str, dict] = {}
         self._inflight: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
@@ -123,6 +185,7 @@ class _ProxyCache:
         }
 
     async def get(self, raw_url: str, now: float) -> tuple[bytes, str] | None:
+        """Return the fresh (body, content_type) for raw_url, or None on miss; eagerly drops a fully-expired entry."""
         cached = self._cache.get(raw_url)
         if cached and cached["expires_at"] > now:
             self._stats["hits"] += 1
@@ -138,6 +201,7 @@ class _ProxyCache:
         return None
 
     async def get_stale(self, raw_url: str, now: float) -> tuple[bytes, str] | None:
+        """Return a within-stale-window entry (past TTL but not yet evicted) for serving during upstream failures."""
         cached = self._cache.get(raw_url)
         if cached and cached["stale_until"] > now:
             self._stats["stale_hits"] += 1
@@ -145,9 +209,11 @@ class _ProxyCache:
         return None
 
     def lock(self, raw_url: str) -> asyncio.Lock:
+        """Return (creating if needed) the per-URL inflight lock used to coalesce concurrent upstream fetches."""
         return self._inflight.setdefault(raw_url, asyncio.Lock())
 
     async def set(self, raw_url: str, body: bytes, ct: str, ttl: float, now: float, stale_ttl: float | None = None) -> None:
+        """Store a response under the internal lock, updating byte stats and evicting the oldest half if over max_size."""
         stale_ttl = self._stale_ttl if stale_ttl is None else max(stale_ttl, 0.0)
         async with self._lock:
             previous = self._cache.get(raw_url)
@@ -173,17 +239,21 @@ class _ProxyCache:
                             self._stats["evictions"] += 1
 
     async def release_lock(self, raw_url: str, lock: asyncio.Lock) -> None:
+        """Drop the inflight lock for raw_url once unused, so signed segment URLs cannot accumulate forever."""
         async with self._lock:
             if self._inflight.get(raw_url) is lock and not lock.locked():
                 self._inflight.pop(raw_url, None)
 
     def record_upstream_fetch(self) -> None:
+        """Increment the upstream-fetch counter (one real origin request)."""
         self._stats["upstream_fetches"] += 1
 
     def record_upstream_error(self) -> None:
+        """Increment the upstream-error counter."""
         self._stats["upstream_errors"] += 1
 
     def stats(self) -> dict:
+        """Return a snapshot of counters plus current entry/inflight sizes and configured TTLs."""
         return {
             **self._stats,
             "entries": len(self._cache),
@@ -195,10 +265,12 @@ class _ProxyCache:
         }
 
     async def cleanup(self) -> None:
+        """Acquire the lock and prune all expired entries and unused inflight locks."""
         async with self._lock:
             await self._cleanup_unlocked(time.monotonic())
 
     async def _cleanup_unlocked(self, now: float) -> None:
+        """Prune expired cache entries and unused inflight locks; caller must already hold self._lock."""
         # Snapshot keys first to avoid "dictionary changed size during iteration"
         # if another task mutates the cache while we clean.
         for k in list(self._cache.keys()):
@@ -214,11 +286,9 @@ class _ProxyCache:
                 self._inflight.pop(k, None)
 
     def ttl_for(self, body: bytes, ct: str, raw_url: str) -> float:
+        """Pick the playlist TTL (short) vs segment TTL (long) by sniffing content-type, extension, and #EXTM3U magic."""
         is_playlist = (
-            "mpegurl" in ct.lower()
-            or "m3u" in ct.lower()
-            or raw_url.split("?")[0].endswith(".m3u8")
-            or body.lstrip()[:7] == b"#EXTM3U"
+            "mpegurl" in ct.lower() or "m3u" in ct.lower() or raw_url.split("?")[0].endswith(".m3u8") or body.lstrip()[:7] == b"#EXTM3U"
         )
         return self._playlist_ttl if is_playlist else self._segment_ttl
 
@@ -227,6 +297,7 @@ _PROXY_CACHE = _ProxyCache()
 
 
 def now_ms():
+    """Current wall-clock time in integer milliseconds since the epoch."""
     return int(time.time() * 1000)
 
 
@@ -252,7 +323,7 @@ ENCODER_CHOICES = {
 }
 
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "server": {"host": "127.0.0.1", "port": 8767, "workers": 1},
     "dashboard": {"password": "", "session_token": ""},
     "stream": {
@@ -276,6 +347,15 @@ DEFAULT_CONFIG = {
         "soursignal_auto_recover": True,
         "auto_recover": True,
         "auto_restart_on_exit": True,
+        # Persisted operator "master kill switch". When True, a human hit Stop:
+        # the managed ffmpeg stays down and BOTH scrapers pause until an explicit
+        # Start/Restart clears it. Survives supervisor ticks and full restarts.
+        "operator_stopped": False,
+        # Why the stream is down: "manual" (a human hit Stop) or "schedule" (the
+        # auto-scheduler stood it down after a card). Drives the cockpit banner —
+        # with auto-schedule on, a Stop reads as STANDBY rather than STOPPED.
+        "stop_reason": "",
+        "locked_source_id": "",
         "watchdog_restart_cooldown": 20,
         "startup_grace_seconds": 25,
         "playlist_stale_seconds": 25,
@@ -290,6 +370,7 @@ DEFAULT_CONFIG = {
     },
     "private_iptv": {
         "enabled": False,
+        "paused": False,
         "provider_url": "https://iptorrents.com/iptv",
         "playlist_url": "",
         "playlist_link_selector": "m3uDownloadBtn",
@@ -302,6 +383,7 @@ DEFAULT_CONFIG = {
         "disable_stream_when_inactive": True,
         "connection_limit": 2,
         "reserve_spare_when_streaming": True,
+        "protect_live_stream_on_refresh": True,
         "keep_stream_live_when_inactive": True,
         "auto_start_when_active": True,
         "auto_source_prefix": "private-iptv",
@@ -320,6 +402,7 @@ DEFAULT_CONFIG = {
             "main card",
             "ppv main card",
         ],
+        "required_keywords": ["ufc"],
         "reject_keywords": [
             "no event",
             "no scheduled event",
@@ -333,7 +416,17 @@ DEFAULT_CONFIG = {
         "require_date_window_match": True,
     },
     "public_sources": [],
+    # Persistent per-source blacklist. Any scraped/auto-selected or manually added
+    # source whose URL/id/channel/label matches an entry here is filtered out of
+    # every scraper cycle and every viewer-facing list, so a blocked stream can
+    # never reappear. Entry shape: {url, id, label, channel, reason, added_at}.
+    "source_blacklist": [],
     "watcher_news": [],
+    # UFC auto-schedule. While `enabled`, the operator Stop becomes a *standby*:
+    # the scheduler arms the encode `lead_minutes` before a card's first segment
+    # and stands it back down once every bout is decided. Backed by the public
+    # ESPN scoreboard; see the obbyschedule package.
+    "schedule": ScheduleSettings.from_config({}).to_config(),
     "arangodb": {
         "enabled": True,
         "url": "http://127.0.0.1:8529",
@@ -344,7 +437,11 @@ DEFAULT_CONFIG = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Value coercion — safe numeric parsing and nvidia-smi text/field helpers.
+# ---------------------------------------------------------------------------
 def safe_number(value, fallback, minimum=None):
+    """Coerce value to float, using fallback on failure and clamping to minimum when given."""
     try:
         n = float(value)
     except (TypeError, ValueError):
@@ -355,10 +452,12 @@ def safe_number(value, fallback, minimum=None):
 
 
 def safe_int(value, fallback, minimum=None):
+    """Coerce value to int via safe_number (fallback + optional minimum clamp)."""
     return int(safe_number(value, fallback, minimum=minimum))
 
 
 def safe_float_or_none(value):
+    """Coerce value to float, returning None instead of raising on invalid input."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -366,6 +465,7 @@ def safe_float_or_none(value):
 
 
 def smi_text(value):
+    """Normalize an nvidia-smi cell to a stripped string, mapping N/A / Not Supported / '-' placeholders to None."""
     text = str(value or "").strip()
     if text in {"", "N/A", "[N/A]", "Not Supported", "[Not Supported]", "-"}:
         return None
@@ -373,6 +473,7 @@ def smi_text(value):
 
 
 def smi_float(value):
+    """Parse an nvidia-smi cell to float, or None if empty/placeholder/unparseable."""
     text = smi_text(value)
     if text is None:
         return None
@@ -383,6 +484,7 @@ def smi_float(value):
 
 
 def smi_int(value):
+    """Parse an nvidia-smi cell to int (via smi_float), or None."""
     number = smi_float(value)
     if number is None:
         return None
@@ -390,12 +492,17 @@ def smi_int(value):
 
 
 def smi_percent(part, whole):
+    """Return part/whole as a percentage rounded to 1dp, or None when either side is missing/zero."""
     if part is None or whole in (None, 0):
         return None
     return round((float(part) / float(whole)) * 100, 1)
 
 
+# ---------------------------------------------------------------------------
+# URL validation & SSRF guard — structural checks plus DNS-based non-public filtering.
+# ---------------------------------------------------------------------------
 def valid_stream_url(value):
+    """True if value is a well-formed http(s) URL with a netloc (structural check only, no SSRF filtering)."""
     text = str(value or "").strip()
     if not text:
         return False
@@ -403,7 +510,76 @@ def valid_stream_url(value):
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+# --- SSRF guard -----------------------------------------------------------
+# proxy_hls fetches attacker-controlled URLs on behalf of anonymous callers.
+# Without these checks the endpoint is a blind SSRF / open proxy that can reach
+# loopback, RFC1918, link-local (169.254.169.254 cloud metadata), and other
+# internal services. We resolve the host and reject if ANY resolved address is
+# non-public, and we re-validate every redirect hop before following it.
+
+# Extra ranges not consistently covered by is_private across Python versions
+# (e.g. RFC 6598 CGNAT is only in is_private on 3.13+). Blocked explicitly so
+# the guard does not depend on the interpreter's stdlib version.
+_EXTRA_BLOCKED_NETS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "100.64.0.0/10",  # RFC 6598 CGNAT / shared address space
+        "192.0.0.0/24",  # IETF protocol assignments
+        "198.18.0.0/15",  # RFC 2544 benchmarking
+        "64:ff9b::/96",  # NAT64
+    )
+)
+
+
+def _ip_is_blocked(ip_str):
+    """True if ip_str is unparseable or falls in any private/loopback/link-local/reserved/CGNAT range (SSRF deny)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable address: refuse
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        return True
+    return any(ip in net for net in _EXTRA_BLOCKED_NETS)
+
+
+def host_resolves_public(host):
+    """True only if every A/AAAA record for host is a routable public address."""
+    if not host:
+        return False
+    host = host.strip().strip("[]")
+    # Reject bare IP literals that fall in blocked ranges without a DNS lookup.
+    try:
+        ipaddress.ip_address(host)
+        return not _ip_is_blocked(host)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    if not infos:
+        return False
+    return all(not _ip_is_blocked(info[4][0]) for info in infos)
+
+
+def url_is_safe_public(url):
+    """Structural validation plus DNS-resolution-based SSRF filtering."""
+    if not valid_stream_url(url):
+        return False
+    return host_resolves_public(urlparse(url).hostname)
+
+
+async def url_is_safe_public_async(url):
+    """Async wrapper for url_is_safe_public that runs the blocking getaddrinfo off the event loop."""
+    # getaddrinfo blocks; keep it off the event loop.
+    return await asyncio.to_thread(url_is_safe_public, url)
+
+
 def request_origin(request):
+    """Best-effort request origin: the Origin header, else scheme+host derived from Referer, else ''."""
     origin = (request.headers.get("origin") or "").strip()
     if origin:
         return origin
@@ -417,6 +593,7 @@ def request_origin(request):
 
 
 def trusted_request_origin(request):
+    """True only when the request's origin scheme+host exactly matches the request URL (same-origin write guard)."""
     candidate = request_origin(request)
     if not candidate:
         return False
@@ -425,7 +602,11 @@ def trusted_request_origin(request):
     return parsed.scheme == request_url.scheme and parsed.netloc == request_url.netloc
 
 
+# ---------------------------------------------------------------------------
+# URL / link / source normalization — canonicalize config lists into stable dicts.
+# ---------------------------------------------------------------------------
 def normalize_links(raw_links):
+    """De-duplicate raw_links into an ordered list of valid http(s) URLs (invalid entries dropped)."""
     links = []
     seen = set()
     for item in raw_links or []:
@@ -440,6 +621,7 @@ def normalize_links(raw_links):
 
 
 def source_type_for_url(raw_type, url):
+    """Return an explicit source type when recognized, else infer 'soursignal' from the host or default to 'hls'."""
     candidate = str(raw_type or "").strip().lower()
     if candidate in {"hls", "soursignal", "page", "external"}:
         return candidate
@@ -450,21 +632,22 @@ def source_type_for_url(raw_type, url):
 
 
 def is_soursignal_url(url):
+    """True if url's host ends with soursignal.com."""
     return urlparse(str(url or "")).netloc.lower().endswith("soursignal.com")
 
 
 def is_private_soursignal_source(source, private_cfg=None):
+    """True if a source is a private-IPTV soursignal feed (by type, host, or auto_source_prefix id)."""
     private_cfg = private_cfg or {}
     prefix = str(private_cfg.get("auto_source_prefix") or "private-iptv")
     source_id = str(source.get("id") or "")
     return (
-        str(source.get("type") or "").lower() == "soursignal"
-        or is_soursignal_url(source.get("url"))
-        or source_id.startswith(prefix + "-")
+        str(source.get("type") or "").lower() == "soursignal" or is_soursignal_url(source.get("url")) or source_id.startswith(prefix + "-")
     )
 
 
 def normalize_source_headers(raw_headers):
+    """Return a clean {name: value} header dict, dropping entries with empty or CR/LF/':'-injected names."""
     if not isinstance(raw_headers, dict):
         return {}
     headers = {}
@@ -477,6 +660,7 @@ def normalize_source_headers(raw_headers):
 
 
 def normalize_sources(raw_sources, fallback_links=None):
+    """Canonicalize ingest sources into de-duplicated dicts with unique slugified ids, appending fallback_links as bare sources."""
     sources = []
     seen_ids = set()
     seen_urls = set()
@@ -533,6 +717,7 @@ def normalize_sources(raw_sources, fallback_links=None):
 
 
 def normalize_public_sources(raw_sources):
+    """Canonicalize viewer-facing public sources into de-duplicated dicts (manual origin, unique ids, optional description)."""
     sources = []
     seen_ids = set()
     seen_urls = set()
@@ -575,7 +760,111 @@ def normalize_public_sources(raw_sources):
     return sources
 
 
+def _blacklist_keys_for(url, source_id="", label="", channel=""):
+    """Return every normalized key a source exposes to the blacklist matcher.
+
+    Keys are namespaced so different kinds never collide: the full normalized
+    URL and its query-stripped form (for CDN token rotation), the id as ``id:``,
+    and channel/label together as ``name:`` (human names match either a source's
+    title or its tvg-name). Keeping ``id:`` separate from ``name:`` prevents an
+    id-block (e.g. a positional ``auto-public-3``) from matching an unrelated
+    source whose label happens to equal that id.
+    """
+    keys: set[str] = set()
+    text = str(url or "").strip()
+    if valid_stream_url(text):
+        parsed = urlparse(text)
+        path = parsed.path.rstrip("/")
+        base = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+        keys.add(f"{base}?{parsed.query}" if parsed.query else base)
+        # Query-stripped key survives CDN token rotation, but only add it when the
+        # path itself is distinguishing — with an empty path it collapses to the
+        # bare host and would over-match every query-keyed stream on that host.
+        if path:
+            keys.add(base)
+    id_value = str(source_id or "").strip().lower()
+    if id_value:
+        keys.add(f"id:{id_value}")
+    for extra in (channel, label):
+        value = str(extra or "").strip().lower()
+        if value:
+            keys.add(f"name:{value}")
+    return keys
+
+
+def normalize_blacklist(raw_entries):
+    """Normalize the persisted ``source_blacklist`` into a stable, de-duplicated
+    list of ``{url, id, label, channel, reason, added_at}`` dicts."""
+    entries = []
+    seen = set()
+    values = raw_entries if isinstance(raw_entries, list) else []
+    for item in values:
+        if isinstance(item, str):
+            raw = {"url": item}
+        elif isinstance(item, dict):
+            raw = item
+        else:
+            continue
+        url = str(raw.get("url") or "").strip()
+        source_id = str(raw.get("id") or "").strip()
+        label = str(raw.get("label") or raw.get("title") or "").strip()
+        channel = str(raw.get("channel") or (raw.get("attrs") or {}).get("tvg-name") or "").strip()
+        if not (url or source_id or label or channel):
+            continue
+        dedupe_key = (url.lower(), source_id.lower(), label.lower(), channel.lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        entries.append(
+            {
+                "url": url,
+                "id": source_id,
+                "label": label,
+                "channel": channel,
+                "reason": str(raw.get("reason") or "").strip(),
+                "added_at": safe_int(raw.get("added_at"), 0),
+            }
+        )
+    return entries
+
+
+def blacklist_index(blacklist):
+    """Precompute the union of all blacklist match keys for O(1) membership
+    checks inside hot scraper loops."""
+    index: set[str] = set()
+    for entry in blacklist or []:
+        index |= _blacklist_keys_for(entry.get("url"), entry.get("id"), entry.get("label"), entry.get("channel"))
+    return index
+
+
+def is_blacklisted(entry_or_url, blacklist):
+    """True if a source matches any blacklist entry.
+
+    ``entry_or_url`` may be a URL string, a normalized source dict
+    (``{url,id,label,...}``), or a raw parsed m3u entry (``{url,title,attrs}``).
+    ``blacklist`` may be the raw list or a precomputed :func:`blacklist_index`
+    set (pass the set when checking many entries in a loop).
+    """
+    index = blacklist if isinstance(blacklist, set) else blacklist_index(blacklist)
+    if not index:
+        return False
+    if isinstance(entry_or_url, str):
+        keys = _blacklist_keys_for(entry_or_url)
+    elif isinstance(entry_or_url, dict):
+        attrs = entry_or_url.get("attrs") or {}
+        keys = _blacklist_keys_for(
+            entry_or_url.get("url"),
+            entry_or_url.get("id"),
+            entry_or_url.get("label") or entry_or_url.get("title"),
+            entry_or_url.get("channel") or attrs.get("tvg-name"),
+        )
+    else:
+        return False
+    return bool(keys & index)
+
+
 def normalize_string_list(raw_values):
+    """Return a list of trimmed non-empty strings with case-insensitive de-duplication, preserving order."""
     values = raw_values if isinstance(raw_values, list) else []
     normalized = []
     seen = set()
@@ -592,6 +881,7 @@ def normalize_string_list(raw_values):
 
 
 def normalize_news_entries(raw_entries):
+    """Canonicalize watcher_news items (unique ids, clamped title/body, validated tone, timestamps), sorted pinned-first, capped at 50."""
     values = raw_entries if isinstance(raw_entries, list) else []
     entries = []
     seen_ids = set()
@@ -638,10 +928,12 @@ def normalize_news_entries(raw_entries):
 
 
 def normalize_private_iptv(raw_config):
+    """Merge raw_config over the private_iptv defaults and coerce every field (bools, ints, headers, cookies, keyword lists)."""
     defaults = json.loads(json.dumps(DEFAULT_CONFIG["private_iptv"]))
     if isinstance(raw_config, dict):
         defaults.update(raw_config)
     defaults["enabled"] = bool(defaults.get("enabled", False))
+    defaults["paused"] = bool(defaults.get("paused", False))
     defaults["provider_url"] = str(defaults.get("provider_url") or "").strip()
     defaults["playlist_url"] = str(defaults.get("playlist_url") or "").strip()
     defaults["playlist_link_selector"] = str(defaults.get("playlist_link_selector") or "m3uDownloadBtn").strip()
@@ -654,12 +946,15 @@ def normalize_private_iptv(raw_config):
     defaults["disable_stream_when_inactive"] = bool(defaults.get("disable_stream_when_inactive", True))
     defaults["connection_limit"] = safe_int(defaults.get("connection_limit"), 2, minimum=1)
     defaults["reserve_spare_when_streaming"] = bool(defaults.get("reserve_spare_when_streaming", True))
+    defaults["protect_live_stream_on_refresh"] = bool(defaults.get("protect_live_stream_on_refresh", True))
     if "keep_stream_live_when_inactive" in defaults:
         defaults["keep_stream_live_when_inactive"] = bool(defaults.get("keep_stream_live_when_inactive", True))
     else:
         defaults["keep_stream_live_when_inactive"] = not defaults["disable_stream_when_inactive"]
     defaults["auto_start_when_active"] = bool(defaults.get("auto_start_when_active", True))
-    defaults["auto_source_prefix"] = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
+    defaults["auto_source_prefix"] = (
+        re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
+    )
     defaults["headers"] = normalize_source_headers(defaults.get("headers"))
     cookies = {}
     if isinstance(defaults.get("cookies"), dict):
@@ -669,6 +964,7 @@ def normalize_private_iptv(raw_config):
                 cookies[name] = str(value or "").strip()
     defaults["cookies"] = cookies
     defaults["keywords"] = normalize_string_list(defaults.get("keywords")) or list(DEFAULT_CONFIG["private_iptv"]["keywords"])
+    defaults["required_keywords"] = normalize_string_list(defaults.get("required_keywords")) or ["ufc"]
     defaults["reject_keywords"] = normalize_string_list(defaults.get("reject_keywords"))
     defaults["date_window_hours"] = safe_number(defaults.get("date_window_hours"), 30, minimum=1)
     defaults["require_date_window_match"] = bool(defaults.get("require_date_window_match", True))
@@ -676,6 +972,7 @@ def normalize_private_iptv(raw_config):
 
 
 def proxied_public_source(source):
+    """Strip a public source's headers (exposing only has_headers) and add a proxy playback_url for viewer use."""
     safe = {key: value for key, value in source.items() if key != "headers"}
     if source.get("headers"):
         safe["has_headers"] = True
@@ -686,6 +983,7 @@ def proxied_public_source(source):
 
 
 def auto_public_sources():
+    """Build read-only public source dicts from the current auto-scraped playlist URLs."""
     return [
         {
             "id": f"auto-public-{index + 1}",
@@ -702,23 +1000,29 @@ def auto_public_sources():
 
 
 def public_stream_inventory(config):
-    manual = normalize_public_sources(config.get("public_sources", []))
+    """Viewer-facing public source list: operator-added ``public_sources`` plus
+    de-duplicated auto-scraped tiles, with any blacklisted source removed."""
+    bl_index = blacklist_index(config.get("source_blacklist"))
+    manual = [s for s in normalize_public_sources(config.get("public_sources", [])) if not is_blacklisted(s, bl_index)]
     seen_urls = {source.get("url") for source in manual}
-    auto = [source for source in auto_public_sources() if source.get("url") not in seen_urls]
+    auto = [source for source in auto_public_sources() if source.get("url") not in seen_urls and not is_blacklisted(source, bl_index)]
     return [*manual, *auto]
 
 
 def enabled_source_links(config):
+    """Normalized URL list of all enabled ingest sources in config.stream.sources."""
     stream = config.get("stream", {})
     return normalize_links([s.get("url") for s in stream.get("sources", []) if s.get("enabled", True)])
 
 
 def sync_links_from_sources(stream):
+    """Rebuild stream['links'] from the enabled sources' URLs and return it (keeps the legacy links list in sync)."""
     stream["links"] = normalize_links([s.get("url") for s in stream.get("sources", []) if s.get("enabled", True)])
     return stream["links"]
 
 
 def normalize_scrape_urls(raw_urls):
+    """De-duplicate one-or-many raw scrape page URLs into an ordered list of valid http(s) URLs."""
     urls = []
     seen = set()
     values = raw_urls if isinstance(raw_urls, list) else [raw_urls]
@@ -734,6 +1038,7 @@ def normalize_scrape_urls(raw_urls):
 
 
 def normalize_config(config):
+    """Deep-merge config over DEFAULT_CONFIG and coerce every section/field to its canonical, validated form."""
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
     if not isinstance(config, dict):
         return merged
@@ -746,9 +1051,17 @@ def normalize_config(config):
     if "public_sources" in config:
         merged["public_sources"] = config.get("public_sources", [])
     merged["public_sources"] = normalize_public_sources(merged.get("public_sources", []))
+    if "source_blacklist" in config:
+        merged["source_blacklist"] = config.get("source_blacklist", [])
+    merged["source_blacklist"] = normalize_blacklist(merged.get("source_blacklist", []))
     if "watcher_news" in config:
         merged["watcher_news"] = config.get("watcher_news", [])
     merged["watcher_news"] = normalize_news_entries(merged.get("watcher_news", []))
+    # `schedule` is a top-level section, and this function rebuilds the config
+    # from DEFAULT_CONFIG on every save — without this line an operator's
+    # schedule settings would be silently erased the first time anything else
+    # calls save_config().
+    merged["schedule"] = ScheduleSettings.from_config(config.get("schedule", merged.get("schedule", {}))).to_config()
     stream = merged["stream"]
     stream["sources"] = normalize_sources(stream.get("sources", []), stream.get("links", []))
     stream["links"] = sync_links_from_sources(stream)
@@ -776,6 +1089,10 @@ def normalize_config(config):
     stream["soursignal_auto_recover"] = bool(stream.get("soursignal_auto_recover", True))
     stream["auto_recover"] = bool(stream.get("auto_recover", True))
     stream["auto_restart_on_exit"] = bool(stream.get("auto_restart_on_exit", True))
+    stream["operator_stopped"] = bool(stream.get("operator_stopped", False))
+    stop_reason = str(stream.get("stop_reason") or "").strip().lower()
+    stream["stop_reason"] = stop_reason if stop_reason in {member.value for member in StopReason} else ""
+    stream["locked_source_id"] = str(stream.get("locked_source_id") or "").strip()
     stream["watchdog_restart_cooldown"] = safe_number(stream.get("watchdog_restart_cooldown"), 20, minimum=5)
     stream["startup_grace_seconds"] = safe_number(stream.get("startup_grace_seconds"), 25, minimum=5)
     stream["playlist_stale_seconds"] = safe_number(stream.get("playlist_stale_seconds"), 25, minimum=10)
@@ -798,15 +1115,33 @@ def normalize_config(config):
 
 
 def current_auto_sources():
+    """Snapshot of the auto-scraped public source URLs, normalized."""
     return normalize_links(list(_AUTO_SOURCES))
 
 
-def effective_stream_links(config):
+def ordered_stream_sources(config):
+    """Enabled sources with the persistent operator lock first."""
     stream = config.setdefault("stream", {})
-    return enabled_source_links(config) or normalize_links(stream.get("links", []))
+    sources = [source for source in normalize_sources(stream.get("sources", []), stream.get("links", [])) if source.get("enabled", True)]
+    locked_id = str(stream.get("locked_source_id") or "")
+    if locked_id:
+        locked = next((source for source in sources if source.get("id") == locked_id), None)
+        if locked:
+            sources = [locked, *[source for source in sources if source.get("id") != locked_id]]
+    return sources
 
 
+def effective_stream_links(config):
+    """Active ingest link pool, with a locked source pinned first."""
+    stream = config.setdefault("stream", {})
+    return normalize_links([source.get("url") for source in ordered_stream_sources(config)]) or normalize_links(stream.get("links", []))
+
+
+# ---------------------------------------------------------------------------
+# Config load / save & public serialization — disk I/O, caching, redaction.
+# ---------------------------------------------------------------------------
 def load_config(fresh=False):
+    """Load and normalize the YAML config, served from a ~1s mtime-aware cache unless fresh=True; never raises (falls back to defaults)."""
     global _CONFIG_CACHE
     now = time.monotonic()
     try:
@@ -814,12 +1149,7 @@ def load_config(fresh=False):
     except OSError:
         mtime = 0.0
     cached = _CONFIG_CACHE
-    if (
-        not fresh
-        and cached["config"] is not None
-        and cached["mtime"] == mtime
-        and now - cached["at"] < _CONFIG_CACHE_TTL
-    ):
+    if not fresh and cached["config"] is not None and cached["mtime"] == mtime and now - cached["at"] < _CONFIG_CACHE_TTL:
         return cached["config"]
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -835,6 +1165,7 @@ def load_config(fresh=False):
 
 
 def save_config(config):
+    """Normalize and atomically write config to disk (tmp + os.replace), then invalidate the read cache."""
     tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
     normalized = normalize_config(config)
     with tmp.open("w", encoding="utf-8") as f:
@@ -847,6 +1178,7 @@ def save_config(config):
 
 
 def redact_headers(headers):
+    """Return a copy of headers with cookie/authorization/token/key/secret/pass values masked as '***'."""
     safe = {}
     for key, value in (headers or {}).items():
         lowered = str(key or "").lower()
@@ -858,6 +1190,7 @@ def redact_headers(headers):
 
 
 def public_config(config):
+    """Deep-copy config with all secrets stripped (passwords, tokens, playlist URL, cookies, source headers) for API/UI exposure."""
     safe = json.loads(json.dumps(config))
     safe.get("dashboard", {}).pop("password", None)
     safe.get("dashboard", {}).pop("session_token", None)
@@ -867,9 +1200,16 @@ def public_config(config):
         if private.get("playlist_url"):
             private["playlist_url"] = "***"
         if private.get("cookies"):
-            private["cookies"] = {key: "***" for key in private.get("cookies", {})}
+            private["cookies"] = dict.fromkeys(private.get("cookies", {}), "***")
         if private.get("headers"):
             private["headers"] = redact_headers(private.get("headers", {}))
+    schedule_section = safe.get("schedule")
+    if isinstance(schedule_section, dict):
+        notify_section = schedule_section.get("notify")
+        # The Discord webhook URL is a bearer credential — anyone holding it can
+        # post to the channel — so it must never leave the box in an API payload.
+        if isinstance(notify_section, dict) and notify_section.get("discord_webhook_url"):
+            notify_section["discord_webhook_url"] = "***"
     for source in safe.get("stream", {}).get("sources", []) or []:
         source.pop("headers", None)
     safe["public_sources"] = [proxied_public_source(source) for source in public_stream_inventory(config)]
@@ -877,6 +1217,7 @@ def public_config(config):
 
 
 def public_news_entries(config, include_hidden=False):
+    """Return normalized watcher_news entries (visible-only unless include_hidden), capped at 20."""
     entries = normalize_news_entries(config.get("watcher_news", []))
     if not include_hidden:
         entries = [entry for entry in entries if entry.get("visible", True)]
@@ -884,6 +1225,7 @@ def public_news_entries(config, include_hidden=False):
 
 
 def public_cors_headers():
+    """Standard permissive CORS + no-cache header set for the public viewer-facing endpoints."""
     return {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
@@ -893,19 +1235,21 @@ def public_cors_headers():
 
 
 def source_manifest(config):
+    """Build the {sources:[{url,headers}]} manifest of enabled ingest sources consumed by the ffmpeg wrapper."""
     return {
         "sources": [
             {
                 "url": source.get("url"),
                 "headers": source.get("headers") or {},
             }
-            for source in config.get("stream", {}).get("sources", [])
+            for source in ordered_stream_sources(config)
             if source.get("enabled", True) and source.get("url")
         ]
     }
 
 
 def write_source_manifest(config):
+    """Write the source manifest JSON to source_manifest_path; return the path, or None on OSError (logged to ERRORS)."""
     path = Path(config.get("stream", {}).get("source_manifest_path") or DEFAULT_CONFIG["stream"]["source_manifest_path"])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -917,6 +1261,7 @@ def write_source_manifest(config):
 
 
 def public_source_status(source, index=0, proc=None):
+    """Assemble a UI-facing status dict for one ingest source (health, preferred/in-process flags, viewer count)."""
     source_id = source.get("id") or f"source-{index + 1}"
     health = SOURCE_HEALTH.get(source_id, {})
     active_managed = bool(proc and proc.get("managed") and index == 0)
@@ -930,6 +1275,7 @@ def public_source_status(source, index=0, proc=None):
         "url": source.get("url"),
         "enabled": bool(source.get("enabled", True)),
         "preferred": index == 0,
+        "locked": bool(source.get("locked")),
         "in_process": active_managed,
         "health": health_state or "unknown",
         "health_message": health.get("message") or "",
@@ -939,13 +1285,17 @@ def public_source_status(source, index=0, proc=None):
 
 
 def source_statuses(config, proc=None):
-    return [
-        public_source_status(source, index=index, proc=proc)
-        for index, source in enumerate(config.get("stream", {}).get("sources", []))
-    ]
+    """Managed ingest sources with live health, blacklisted entries filtered out."""
+    bl_index = blacklist_index(config.get("source_blacklist"))
+    locked_id = str(config.get("stream", {}).get("locked_source_id") or "")
+    visible = [s for s in ordered_stream_sources(config) if not is_blacklisted(s, bl_index)]
+    for source in visible:
+        source["locked"] = bool(locked_id and source.get("id") == locked_id)
+    return [public_source_status(source, index=index, proc=proc) for index, source in enumerate(visible)]
 
 
 def public_managed_sources(config, proc=None):
+    """Return the single 'server-1' managed-HLS source descriptor (the default transcode output) for viewer clients."""
     public_hls = config.get("stream", {}).get("public_hls_url") or "/hls/ufc.m3u8"
     return [
         {
@@ -965,6 +1315,7 @@ def public_managed_sources(config, proc=None):
 
 
 def prune_viewer_sessions(now=None):
+    """Evict viewer sessions whose last heartbeat is older than VIEWER_SESSION_TTL."""
     now = now or time.time()
     expired = [sid for sid, session in VIEWER_SESSIONS.items() if now - float(session.get("at") or 0) > VIEWER_SESSION_TTL]
     for sid in expired:
@@ -972,6 +1323,7 @@ def prune_viewer_sessions(now=None):
 
 
 def viewer_counts_snapshot():
+    """Prune stale sessions, then return live viewer totals and per-source breakdown."""
     now = time.time()
     expired = [sid for sid, session in VIEWER_SESSIONS.items() if now - float(session.get("at") or 0) > VIEWER_SESSION_TTL]
     for sid in expired:
@@ -988,8 +1340,358 @@ def viewer_counts_snapshot():
     return counts
 
 
+# ---------------------------------------------------------------------------
+# Viewer highscores / analytics
+# Accrues watch time per client IP (stored only as a salted hash — never the raw
+# IP), tags each with a stable codename + coarse geolocation, and exposes an
+# anonymised leaderboard. Persisted to a JSON snapshot so it survives restarts.
+# ---------------------------------------------------------------------------
+VIEWER_STATS: dict[str, dict[str, Any]] = {}
+SOURCE_QOE: dict[str, dict] = {}  # source_id -> {watch_ms, buffering_ms, stalls, viewers:set}
+VIEWER_STATS_LOCK = asyncio.Lock()
+VIEWER_STATS_PATH = CONFIG_PATH.parent / "viewer_highscores.json"
+VIEWER_STATS_DIRTY = False
+VIEWER_WATCH_MAX_STEP = 90.0  # cap seconds credited per heartbeat gap
+_GEO_CACHE: dict[str, dict] = {}
+_GEO_INFLIGHT: set[str] = set()
+_IP_HASH_SALT = "obbyviewer.v1"
+
+_CODENAME_ADJ = [
+    "Swift",
+    "Silent",
+    "Crimson",
+    "Golden",
+    "Shadow",
+    "Iron",
+    "Electric",
+    "Frost",
+    "Solar",
+    "Rogue",
+    "Mighty",
+    "Cosmic",
+    "Turbo",
+    "Neon",
+    "Velvet",
+    "Savage",
+    "Lucky",
+    "Phantom",
+    "Atomic",
+    "Wild",
+    "Blazing",
+    "Midnight",
+    "Emerald",
+    "Thunder",
+]
+_CODENAME_NOUN = [
+    "Falcon",
+    "Tiger",
+    "Viper",
+    "Wolf",
+    "Panther",
+    "Cobra",
+    "Eagle",
+    "Rhino",
+    "Jaguar",
+    "Hawk",
+    "Bear",
+    "Fox",
+    "Shark",
+    "Lynx",
+    "Raven",
+    "Bison",
+    "Otter",
+    "Mantis",
+    "Stallion",
+    "Kraken",
+    "Puma",
+    "Falconer",
+    "Drake",
+    "Orca",
+]
+
+
+def _client_ip(request):
+    """Best-effort client IP: first X-Forwarded-For hop, else the socket peer host."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.client.host if request.client else "") or ""
+
+
+def _ip_hash(ip):
+    """Return a 16-char salted SHA-256 hash of an IP (the raw IP is never stored)."""
+    return hashlib.sha256(f"{_IP_HASH_SALT}:{ip}".encode()).hexdigest()[:16]
+
+
+def codename_for(ip_hash):
+    """Derive a stable 'Adjective Noun' codename from an IP hash for anonymised leaderboards."""
+    value = int(ip_hash[:8], 16)
+    adj = _CODENAME_ADJ[value % len(_CODENAME_ADJ)]
+    noun = _CODENAME_NOUN[(value // len(_CODENAME_ADJ)) % len(_CODENAME_NOUN)]
+    return f"{adj} {noun}"
+
+
+def mask_ip(ip):
+    """Return a partially-masked display form of an IP (first octet/hextet + last octet for IPv4)."""
+    if not ip:
+        return "•"
+    if ":" in ip:  # IPv6 — keep only the first hextet
+        return ip.split(":", 1)[0] + ":••"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return f"{parts[0]}.•.•.{parts[3]}"
+    return "•"
+
+
+def _flag_emoji(cc):
+    """Convert a 2-letter ISO country code into its regional-indicator flag emoji, or 🌐 when invalid."""
+    if not cc or len(cc) != 2 or not cc.isalpha():
+        return "🌐"
+    return chr(0x1F1E6 + ord(cc[0].upper()) - 65) + chr(0x1F1E6 + ord(cc[1].upper()) - 65)
+
+
+async def _resolve_geo(ip_hash, ip):
+    """Resolve coarse geo for an IP via ip-api.com (cached; private IPs mapped to 'Local network') and apply it to the viewer's stats."""
+    if not ip or ip in _GEO_CACHE or ip in _GEO_INFLIGHT:
+        return
+    try:
+        ipobj = ipaddress.ip_address(ip)
+        if ipobj.is_private or ipobj.is_loopback or ipobj.is_reserved:
+            geo = {"country": "Local network", "cc": "", "region": "", "city": "", "flag": "🏠"}
+            _GEO_CACHE[ip] = geo
+            await _apply_geo(ip_hash, geo)
+            return
+    except ValueError:
+        return
+    _GEO_INFLIGHT.add(ip)
+    geo = {"country": "", "cc": "", "region": "", "city": "", "flag": "🌐"}
+    try:
+        client = _HTTPX_CLIENT or httpx.AsyncClient(timeout=httpx.Timeout(6.0))
+        resp = await client.get(f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city")
+        data = resp.json()
+        if data.get("status") == "success":
+            cc = data.get("countryCode", "") or ""
+            geo = {
+                "country": data.get("country", "") or "",
+                "cc": cc,
+                "region": data.get("regionName", "") or "",
+                "city": data.get("city", "") or "",
+                "flag": _flag_emoji(cc),
+            }
+    except Exception:
+        pass
+    finally:
+        _GEO_INFLIGHT.discard(ip)
+    _GEO_CACHE[ip] = geo
+    await _apply_geo(ip_hash, geo)
+
+
+async def _apply_geo(ip_hash, geo):
+    """Attach a resolved geo dict to an existing viewer stats record under the stats lock, marking it dirty."""
+    global VIEWER_STATS_DIRTY
+    async with VIEWER_STATS_LOCK:
+        stats = VIEWER_STATS.get(ip_hash)
+        if stats is not None:
+            stats["geo"] = geo
+            VIEWER_STATS_DIRTY = True
+
+
+def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, label=None):
+    """Accumulate per-source quality-of-experience: watch/buffering ms, stall count, and the set of unique viewer hashes."""
+    stats = SOURCE_QOE.setdefault(source_id, {"watch_ms": 0.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set()})
+    stats["watch_ms"] += max(0.0, credit_seconds) * 1000.0
+    stats["buffering_ms"] += max(0.0, min(float(buffering_ms or 0), 60_000.0))
+    stats["stalls"] += max(0, int(stalls or 0))
+    if label:
+        stats["label"] = str(label)[:80]
+    if ip_hash:
+        viewers = stats["viewers"]
+        if isinstance(viewers, set):
+            viewers.add(ip_hash)
+
+
+async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, stalls=0, source_label=None):
+    """Credit watch time to a viewer (capped per heartbeat gap), update QoE, and kick off geo resolution for new/ungeo'd IPs."""
+    global VIEWER_STATS_DIRTY
+    credit = 0.0
+    if last_at is not None:
+        gap = now_t - float(last_at)
+        if 0 < gap <= VIEWER_SESSION_TTL * 2:
+            credit = min(gap, VIEWER_WATCH_MAX_STEP)
+    record_source_qoe(source_id, ip_hash, credit, buffering_ms, stalls, label=source_label)
+    new_ip = False
+    async with VIEWER_STATS_LOCK:
+        stats: dict[str, Any]
+        existing = VIEWER_STATS.get(ip_hash)
+        if existing is None:
+            new_ip = True
+            stats = {
+                "codename": codename_for(ip_hash),
+                "ip_masked": mask_ip(ip),
+                "total": 0.0,
+                "by_source": {},
+                "first": now_ms(),
+                "last": now_ms(),
+                "geo": _GEO_CACHE.get(ip),
+            }
+            VIEWER_STATS[ip_hash] = stats
+        else:
+            stats = existing
+        stats["last"] = now_ms()
+        if credit > 0:
+            stats["total"] = float(stats.get("total", 0.0)) + credit
+            stats["by_source"][source_id] = float(stats["by_source"].get(source_id, 0.0)) + credit
+        if not stats.get("geo") and ip in _GEO_CACHE:
+            stats["geo"] = _GEO_CACHE[ip]
+        VIEWER_STATS_DIRTY = True
+    if (new_ip or not (VIEWER_STATS.get(ip_hash) or {}).get("geo")) and ip:
+        _spawn_background(_resolve_geo(ip_hash, ip))
+
+
+async def viewer_highscores_snapshot(limit=25):
+    """Build the anonymised analytics payload: viewer leaderboard, top/best sources, per-source QoE, and top countries."""
+    async with VIEWER_STATS_LOCK:
+        rows = [dict(s) for s in VIEWER_STATS.values()]
+    rows.sort(key=lambda s: s.get("total", 0.0), reverse=True)
+    leaderboard = []
+    for index, stats in enumerate(rows[:limit]):
+        by_source = stats.get("by_source", {})
+        favorite = max(by_source.items(), key=lambda kv: kv[1])[0] if by_source else None
+        geo = stats.get("geo") or {}
+        location = ", ".join(part for part in (geo.get("region"), geo.get("country")) if part)
+        leaderboard.append(
+            {
+                "rank": index + 1,
+                "codename": stats.get("codename"),
+                "ip_masked": stats.get("ip_masked"),
+                "watch_seconds": int(stats.get("total", 0.0)),
+                "favorite_source": favorite,
+                "flag": geo.get("flag") or "🌐",
+                "location": location,
+                "country": geo.get("country") or "",
+                "first_seen": stats.get("first"),
+                "last_seen": stats.get("last"),
+            }
+        )
+    source_totals: dict[str, float] = {}
+    for stats in rows:
+        for source_id, seconds in stats.get("by_source", {}).items():
+            source_totals[source_id] = source_totals.get(source_id, 0.0) + seconds
+    top_sources = sorted(source_totals.items(), key=lambda kv: kv[1], reverse=True)
+    # Per-source QoE: smoothness = share of watch time NOT spent buffering (client-reported).
+    source_performance: list[dict[str, Any]] = []
+    for source_id, qoe in SOURCE_QOE.items():
+        watch_ms = float(qoe.get("watch_ms", 0.0))
+        buffering_ms = float(qoe.get("buffering_ms", 0.0))
+        viewers = len(qoe.get("viewers") or ())
+        buffer_ratio = (buffering_ms / watch_ms) if watch_ms > 0 else 0.0
+        source_performance.append(
+            {
+                "source_id": source_id,
+                "label": qoe.get("label") or source_id,
+                "watch_hours": round(watch_ms / 3_600_000.0, 2),
+                "smoothness": round(max(0.0, min(1.0, 1.0 - buffer_ratio)) * 100.0, 1),
+                "buffering_minutes": round(buffering_ms / 60_000.0, 1),
+                "stalls": int(qoe.get("stalls", 0)),
+                "viewers": viewers,
+            }
+        )
+    source_performance.sort(key=lambda s: s["watch_hours"], reverse=True)
+    best_sources = sorted(
+        (s for s in source_performance if s["watch_hours"] >= 0.02),
+        key=lambda s: (s["smoothness"], s["watch_hours"]),
+        reverse=True,
+    )[:5]
+    country_totals: dict[str, dict] = {}
+    for stats in rows:
+        geo = stats.get("geo") or {}
+        country = geo.get("country")
+        if country:
+            entry = country_totals.setdefault(country, {"country": country, "flag": geo.get("flag") or "🌐", "seconds": 0.0, "viewers": 0})
+            entry["seconds"] += stats.get("total", 0.0)
+            entry["viewers"] += 1
+    top_countries = sorted(country_totals.values(), key=lambda c: c["seconds"], reverse=True)
+    return {
+        "ok": True,
+        "updated_at": now_ms(),
+        "viewers_tracked": len(rows),
+        "total_watch_hours": round(sum(s.get("total", 0.0) for s in rows) / 3600.0, 1),
+        "leaderboard": leaderboard,
+        "top_sources": [{"source_id": sid, "watch_hours": round(sec / 3600.0, 2)} for sid, sec in top_sources[:8]],
+        "source_performance": source_performance[:10],
+        "best_sources": best_sources,
+        "top_countries": [
+            {"country": c["country"], "flag": c["flag"], "watch_hours": round(c["seconds"] / 3600.0, 2), "viewers": c["viewers"]}
+            for c in top_countries[:8]
+        ],
+    }
+
+
+def load_viewer_stats():
+    """Load persisted viewer stats and per-source QoE from the JSON snapshot (viewer sets rehydrated), defaulting to empty on any error."""
+    global VIEWER_STATS, SOURCE_QOE
+    try:
+        with VIEWER_STATS_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        loaded = data.get("stats", {})
+        if isinstance(loaded, dict):
+            VIEWER_STATS = loaded
+        source_qoe = data.get("source_qoe", {})
+        if isinstance(source_qoe, dict):
+            SOURCE_QOE = {
+                sid: {**{k: v for k, v in q.items() if k != "viewers"}, "viewers": set(q.get("viewers") or ())}
+                for sid, q in source_qoe.items()
+            }
+    except FileNotFoundError:
+        VIEWER_STATS = {}
+        SOURCE_QOE = {}
+    except Exception as exc:
+        logger.warning("viewer stats load failed: %s", exc)
+        VIEWER_STATS = {}
+        SOURCE_QOE = {}
+
+
+async def flush_viewer_stats(force=False):
+    """Atomically persist viewer stats + QoE (viewer sets serialized as sorted lists) when dirty or force=True."""
+    global VIEWER_STATS_DIRTY
+    async with VIEWER_STATS_LOCK:
+        if not VIEWER_STATS_DIRTY and not force:
+            return
+        source_qoe = {
+            sid: {**{k: v for k, v in q.items() if k != "viewers"}, "viewers": sorted(q.get("viewers") or ())}
+            for sid, q in SOURCE_QOE.items()
+        }
+        payload = {"saved_at": now_ms(), "stats": VIEWER_STATS, "source_qoe": source_qoe}
+        VIEWER_STATS_DIRTY = False
+    try:
+        tmp = VIEWER_STATS_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, VIEWER_STATS_PATH)
+    except Exception as exc:
+        logger.warning("viewer stats flush failed: %s", exc)
+
+
+async def viewer_highscores(request):
+    """Public GET /api/highscores handler: returns the anonymised leaderboard snapshot (clamped limit, CORS, short cache)."""
+    cors = public_cors_headers()
+    if request.method == "OPTIONS":
+        return Response("", headers=cors)
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "25"))))
+    except (TypeError, ValueError):
+        limit = 25
+    data = await viewer_highscores_snapshot(limit=limit)
+    return JSONResponse(data, headers={**cors, "Cache-Control": "max-age=5"})
+
+
+# ---------------------------------------------------------------------------
+# Stream health scorer — sample HLS output over time into a failure decision.
+# ---------------------------------------------------------------------------
 @dataclass
 class StreamHealthScorer:
+    """Stateful health judge for the managed encode: accumulates timed HLS samples and emits a decision (healthy/failed/…)."""
+
     pid: int | None = None
     started_at: int | None = None
     last_sample_at: float = 0.0
@@ -1000,6 +1702,7 @@ class StreamHealthScorer:
     last_assessment: dict | None = None
 
     def reset(self, pid=None, started_at=None):
+        """Clear all accumulated sample state, optionally re-seeding the tracked pid/started_at for a new process."""
         self.pid = pid
         self.started_at = started_at
         self.last_sample_at = 0.0
@@ -1010,6 +1713,11 @@ class StreamHealthScorer:
         self.last_assessment = None
 
     def assess(self, config, proc, hls, force=False):
+        """Score the current proc+HLS snapshot, update streak counters, and return the health assessment dict.
+
+        Auto-resets on process change; throttles to health_sample_interval unless force=True; requires
+        confirmed_failure_samples consecutive bad samples past min_assessment_seconds before deciding 'failed'.
+        """
         stream = config.get("stream", {})
         recent_errors = recent_stream_errors(limit=8, seconds=60)
         if not proc.get("managed"):
@@ -1048,7 +1756,9 @@ class StreamHealthScorer:
         failure_threshold = float(stream.get("failure_score_threshold", -120))
         confirmed_failure_samples = int(stream.get("confirmed_failure_samples", 2))
 
-        score, evidence, reasons = score_stream_snapshot(proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors)
+        score, evidence, reasons = score_stream_snapshot(
+            proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors
+        )
         bad_sample = elapsed >= min_assessment and score <= failure_threshold
         good_sample = score >= success_threshold
         if bad_sample:
@@ -1088,7 +1798,9 @@ class StreamHealthScorer:
             decision = "recovering"
             message = "Stream has some positive evidence, but not enough yet for a healthy decision."
 
-        confidence = confidence_for_assessment(score, elapsed, min_assessment, len(self.samples), self.consecutive_bad_samples, self.consecutive_good_samples)
+        confidence = confidence_for_assessment(
+            score, elapsed, min_assessment, len(self.samples), self.consecutive_bad_samples, self.consecutive_good_samples
+        )
         sample = {
             "ts": now_ms(),
             "score": round(score, 1),
@@ -1135,15 +1847,21 @@ STREAM_HEALTH_SCORER = StreamHealthScorer()
 
 
 def recent_stream_errors(limit=5, seconds=30):
+    """Return up to `limit` ffmpeg error records logged within the last `seconds`."""
     cutoff = time.time() - seconds
     return [item for item in list(ERRORS) if item.get("ts", 0) / 1000 >= cutoff][-limit:]
 
 
 def bounded_penalty(base, cap, ramp):
+    """Ramp-scaled penalty (base*ramp) clamped to a maximum of cap."""
     return min(cap, base * ramp)
 
 
 def score_stream_snapshot(proc, hls, previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors):
+    """Compute a health score for one snapshot from ffmpeg-child presence, playlist freshness, HLS progress deltas, and recent errors.
+
+    Returns (score, evidence, reasons). Penalties ramp up with elapsed time so early samples are judged leniently.
+    """
     score = 0.0
     reasons = []
     has_child = bool(proc.get("children"))
@@ -1161,11 +1879,15 @@ def score_stream_snapshot(proc, hls, previous_hls, elapsed, min_assessment, stal
     current_bytes = int(hls.get("bytes") or 0)
     previous_bytes = int(previous_hls.get("bytes") or 0) if previous_hls else 0
     bytes_delta = max(0, current_bytes - previous_bytes) if previous_hls else 0
-    playlist_moved = bool(previous_hls and hls.get("playlist_modified_at") and hls.get("playlist_modified_at") != previous_hls.get("playlist_modified_at"))
+    playlist_moved = bool(
+        previous_hls and hls.get("playlist_modified_at") and hls.get("playlist_modified_at") != previous_hls.get("playlist_modified_at")
+    )
 
     media_sequence = safe_float_or_none(hls.get("media_sequence"))
     previous_media_sequence = safe_float_or_none(previous_hls.get("media_sequence")) if previous_hls else None
-    media_sequence_advanced = media_sequence is not None and previous_media_sequence is not None and media_sequence > previous_media_sequence
+    media_sequence_advanced = (
+        media_sequence is not None and previous_media_sequence is not None and media_sequence > previous_media_sequence
+    )
     progress_seen = segment_delta > 0 or bytes_delta > 0 or playlist_moved or media_sequence_advanced
 
     if proc.get("managed"):
@@ -1232,6 +1954,7 @@ def score_stream_snapshot(proc, hls, previous_hls, elapsed, min_assessment, stal
 
 
 def confidence_for_assessment(score, elapsed, min_assessment, sample_count, bad_samples, good_samples):
+    """Return a 0-100 confidence blended from elapsed time, sample count, signal strength, and streak length (capped at 85 pre-assessment)."""
     elapsed_score = min(45, (elapsed / max(min_assessment, 1.0)) * 45)
     sample_score = min(30, sample_count * 5)
     signal_score = min(25, abs(score) / 8)
@@ -1242,7 +1965,11 @@ def confidence_for_assessment(score, elapsed, min_assessment, sample_count, bad_
     return confidence
 
 
+# ---------------------------------------------------------------------------
+# Event log & auth guards — operator event feed plus session/origin checks.
+# ---------------------------------------------------------------------------
 def event(message, level="info", extra=None):
+    """Append an operator event to the EVENTS ring and queue it for ArangoDB; returns the created item."""
     item = {"ts": now_ms(), "level": level, "message": message, "extra": extra or {}}
     EVENTS.append(item)
     queue_arango_insert("events", item)
@@ -1250,10 +1977,15 @@ def event(message, level="info", extra=None):
 
 
 def require_auth(request):
+    """True only if the request supplies the configured dashboard session_token (via header or cookie); fails closed when unset."""
     config = load_config()
     token = config.get("dashboard", {}).get("session_token", "")
     if not token:
-        return True
+        # Fail closed: an unset session_token must lock the guarded surface, not
+        # open it. Previously this returned True, exposing every write/admin
+        # endpoint whenever the token was blank.
+        logger.error("require_auth denied: no dashboard.session_token configured")
+        return False
     supplied = request.headers.get("x-obbystreams-token", "") or request.cookies.get("obbystreams_token", "")
     if not supplied:
         return False
@@ -1261,7 +1993,10 @@ def require_auth(request):
 
 
 def guarded(handler):
+    """Decorator that wraps a route handler with same-origin enforcement (for writes) and session-token auth."""
+
     async def wrapped(request):
+        """Enforce origin/token guards, then delegate to the wrapped handler (or return 401/403)."""
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             has_header_token = bool(request.headers.get("x-obbystreams-token", "").strip())
             if not trusted_request_origin(request) and not has_header_token:
@@ -1269,10 +2004,12 @@ def guarded(handler):
         if not require_auth(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return await handler(request)
+
     return wrapped
 
 
 async def parse_json_body(request):
+    """Parse a JSON request body into a dict; returns {} for empty bodies, raises ValueError for invalid/non-object JSON."""
     if request.headers.get("content-length", "0") == "0":
         return {}
     try:
@@ -1287,6 +2024,7 @@ async def parse_json_body(request):
 
 
 async def login(request):
+    """POST /api/auth/login: verify the dashboard password (same-origin only) and set the session-token cookie."""
     if not trusted_request_origin(request):
         return JSONResponse({"ok": False, "error": "forbidden origin"}, status_code=403)
     config = load_config()
@@ -1303,13 +2041,18 @@ async def login(request):
     return response
 
 
+# ---------------------------------------------------------------------------
+# ArangoDB — HTTP client, fire-and-forget insert queue, and retrying worker.
+# ---------------------------------------------------------------------------
 def arango_auth_header(config):
+    """Build the HTTP Basic Authorization header from the arangodb username/password."""
     arango = config.get("arangodb", {})
     raw = f"{arango.get('username')}:{arango.get('password')}".encode()
     return {"Authorization": "Basic " + base64.b64encode(raw).decode()}
 
 
 async def arango_request(method, path, payload=None):
+    """Issue an authenticated request to the configured ArangoDB database; returns None when Arango is disabled, raises on HTTP error."""
     config = load_config()
     arango = config.get("arangodb", {})
     if not arango.get("enabled", True):
@@ -1328,6 +2071,7 @@ async def arango_request(method, path, payload=None):
 
 
 async def arango_insert(collection, doc):
+    """Insert a document into a collection, swallowing all errors (returns None on failure)."""
     try:
         return await arango_request("POST", f"/_api/document/{collection}", doc)
     except Exception:
@@ -1335,6 +2079,7 @@ async def arango_insert(collection, doc):
 
 
 def queue_arango_insert(collection, doc):
+    """Enqueue a non-blocking insert for the background worker; counts a dropped write if the queue is full."""
     global ARANGO_QUEUE
     if ARANGO_QUEUE is None:
         return
@@ -1346,6 +2091,7 @@ def queue_arango_insert(collection, doc):
 
 
 async def arango_worker_loop():
+    """Background task: drain the insert queue, POSTing each doc with exponential-backoff retries up to ARANGO_RETRY_MAX_ATTEMPTS."""
     global ARANGO_QUEUE
     while True:
         try:
@@ -1387,6 +2133,7 @@ async def arango_worker_loop():
 
 
 async def arango_status(request):
+    """GET /api/arango: report ArangoDB connectivity and version (always 200; connected=False carries the error)."""
     try:
         data = await arango_request("GET", "/_api/version")
         return JSONResponse({"ok": True, "connected": True, "version": data})
@@ -1394,7 +2141,11 @@ async def arango_status(request):
         return JSONResponse({"ok": True, "connected": False, "error": str(exc)})
 
 
+# ---------------------------------------------------------------------------
+# Process discovery & operator-stop state — find/kill stray encodes, read stop switch.
+# ---------------------------------------------------------------------------
 def stream_processes():
+    """Scan the process table for unmanaged obbystreams/ufc encode processes (excluding this app and its managed child tree)."""
     found = []
     current_pid = os.getpid()
     excluded = {current_pid}
@@ -1422,17 +2173,20 @@ def stream_processes():
                 or "ufc_tool.py" in cmd
                 or "streamUFC" in cmd
             ):
-                found.append({
-                    "pid": proc.info["pid"],
-                    "cmd": cmd,
-                    "age": max(0, time.time() - proc.info.get("create_time", time.time())),
-                })
+                found.append(
+                    {
+                        "pid": proc.info["pid"],
+                        "cmd": cmd,
+                        "age": max(0, time.time() - proc.info.get("create_time", time.time())),
+                    }
+                )
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return found
 
 
 def kill_existing_streams():
+    """Terminate (then SIGKILL after a 2s grace) every stray encode found by stream_processes; return the list killed."""
     killed = []
     for item in stream_processes():
         try:
@@ -1447,24 +2201,87 @@ def kill_existing_streams():
             procs.append(psutil.Process(item["pid"]))
         except psutil.NoSuchProcess:
             continue
-    gone, alive = psutil.wait_procs(procs, timeout=2)
+    _gone, alive = psutil.wait_procs(procs, timeout=2)
     for proc in alive:
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
             proc.kill()
     return killed
 
 
+def operator_stopped(config):
+    """True when an operator has manually Stopped the cockpit.
+
+    This is the persisted master kill switch (``stream.operator_stopped`` in the
+    config YAML). While set, the watchdog, both scrapers, and every auto-start
+    path stay idle until an explicit Start/Restart clears it — the stop survives
+    supervisor ticks AND full service/host restarts.
+    """
+    return bool(config.get("stream", {}).get("operator_stopped", False))
+
+
+def set_operator_stopped(config, value, reason=""):
+    """Persist the operator Stop/Start intent into the config YAML.
+
+    Mutates ``config`` in place and writes it via :func:`save_config` so the
+    intent is durable. Callers are limited to the explicit
+    ``/api/stream/{start,stop,restart}`` endpoints and the auto-scheduler
+    (:func:`schedule_stop_stream` / :func:`schedule_start_stream`); no
+    process-lifecycle side effect ever calls this.
+
+    ``reason`` records *who* stopped it — :class:`StopReason` ``manual`` or
+    ``schedule`` — so the cockpit can tell a deliberate shutdown apart from a
+    scheduled standby. It is cleared whenever the stream is started.
+    """
+    stream = config.setdefault("stream", {})
+    stream["operator_stopped"] = bool(value)
+    stream["stop_reason"] = str(reason or "") if value else ""
+    save_config(config)
+
+
+def stop_reason(config):
+    """Why the stream is currently down ("manual", "schedule", or "" when running)."""
+    if not operator_stopped(config):
+        return ""
+    return str(config.get("stream", {}).get("stop_reason") or "")
+
+
+def _reconcile_operator_stopped(config):
+    """Stamp the currently-persisted operator Stop into ``config`` before saving.
+
+    Long-running writers (e.g. the private-IPTV refresh) snapshot the config, do
+    tens of seconds of network/ffprobe work, then save it back. Without this an
+    operator Stop that landed during that window would be clobbered by the stale
+    snapshot. Call this IMMEDIATELY before ``save_config`` with no ``await`` in
+    between so the read+write is atomic w.r.t. the (coroutine-scheduled) endpoints.
+    """
+    fresh = load_config(fresh=True)
+    stream = config.setdefault("stream", {})
+    stream["operator_stopped"] = operator_stopped(fresh)
+    stream["stop_reason"] = stop_reason(fresh)
+
+
 def should_watchdog_restart_exited_process(config, desired_state):
+    """Whether the watchdog may auto-restart a managed process that has exited.
+
+    Returns False when the operator has Stopped the stream, when auto-recovery is
+    disabled, or when there are no links to start — so a manual Stop is never
+    silently undone.
+    """
     stream = config.get("stream", {})
     return (
         desired_state == "running"
+        and not operator_stopped(config)
         and stream.get("auto_recover", True)
         and stream.get("auto_restart_on_exit", True)
         and bool(effective_stream_links(config))
     )
 
 
+# ---------------------------------------------------------------------------
+# HLS output & process metrics — read the transcode's playlist/segment state.
+# ---------------------------------------------------------------------------
 def safe_stat_size(path):
+    """Return path's size in bytes, or 0 if it cannot be stat'd."""
     try:
         return path.stat().st_size
     except OSError:
@@ -1472,6 +2289,7 @@ def safe_stat_size(path):
 
 
 def safe_stat_mtime(path):
+    """Return path's mtime, or None if it cannot be stat'd."""
     try:
         return path.stat().st_mtime
     except OSError:
@@ -1479,10 +2297,13 @@ def safe_stat_mtime(path):
 
 
 def classify_stream_log(line):
+    """Classify a wrapper/ffmpeg log line into a level: error, warn, info, or debug (by keyword heuristics)."""
     lowered = line.lower()
     if "starting" in lowered or "stream commander" in lowered or "status:" in lowered:
         return "info"
-    if "ffmpeg:" in lowered or any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")):
+    if "ffmpeg:" in lowered or any(
+        token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")
+    ):
         return "error"
     if "ffmpeg exited" in lowered or "restart" in lowered or "weak stream" in lowered or "every link failed" in lowered:
         return "warn"
@@ -1490,6 +2311,7 @@ def classify_stream_log(line):
 
 
 def _read_playlist(path):
+    """Read an m3u8 file into a list of lines, returning [] if missing or unreadable."""
     if not path.exists():
         return []
     try:
@@ -1499,6 +2321,7 @@ def _read_playlist(path):
 
 
 def _parse_playlist_lines(lines):
+    """Parse m3u8 lines into (media_sequence, target_duration, segment_names, segment_durations, nested_media_playlists)."""
     media_sequence = None
     target_duration = None
     segment_names = []
@@ -1521,16 +2344,13 @@ def _parse_playlist_lines(lines):
 
 
 def hls_metrics(config):
+    """Inspect the output dir and return a metrics dict: playlist/DASH freshness, segment counts/bytes, encode rate, and live lag."""
     stream = config.get("stream", {})
     output_dir = Path(stream.get("output_dir", "/var/www/live.obnoxious.lol/stream"))
     playlist = output_dir / "ufc.m3u8"
     dash_manifest = output_dir / "ufc.mpd"
     media_playlist_paths = [Path(p) for p in glob.glob(str(output_dir / "media_*.m3u8"))]
-    segments = [
-        Path(p)
-        for pattern in ("ufc*.ts", "ufc*.m4s", "ufc*.mp4")
-        for p in glob.glob(str(output_dir / pattern))
-    ]
+    segments = [Path(p) for pattern in ("ufc*.ts", "ufc*.m4s", "ufc*.mp4") for p in glob.glob(str(output_dir / pattern))]
     total_bytes = sum(safe_stat_size(p) for p in segments)
     playlist_age = None
     playlist_mtime = None
@@ -1551,9 +2371,7 @@ def hls_metrics(config):
         dash_manifest_age = max(0, time.time() - dash_manifest_mtime)
     media_sequence, target_duration, playlist_segment_names, segment_durations, media_playlist_names = _parse_playlist_lines(playlist_lines)
     if not playlist_segment_names:
-        candidate_paths = []
-        for name in media_playlist_names:
-            candidate_paths.append(output_dir / name)
+        candidate_paths = [output_dir / name for name in media_playlist_names]
         candidate_paths.extend(media_playlist_paths)
         seen = set()
         for media_playlist in candidate_paths:
@@ -1565,8 +2383,40 @@ def hls_metrics(config):
             target_duration = parsed_target or target_duration
             playlist_segment_names.extend(parsed_segments)
             segment_durations.extend(parsed_durations)
+    # Encode rate (the "1.0x / 0.9x" factor). Prefer ffmpeg's OWN reported speed=,
+    # which the wrapper publishes to .encode-progress.json each stats block; fall
+    # back to deriving it from HLS segment cadence when that file is missing/stale.
+    now_wall = time.time()
+    encode_rate = None
+    encode_rate_source = None
+    try:
+        prog_path = output_dir / ".encode-progress.json"
+        if prog_path.exists():
+            with prog_path.open("r", encoding="utf-8") as prog_file:
+                prog = json.load(prog_file)
+            speed_raw = str(prog.get("speed", "")).strip().rstrip("xX")
+            if (now_wall - float(prog.get("at", 0))) <= 12 and speed_raw and speed_raw.upper() != "N/A":
+                encode_rate = round(float(speed_raw), 2)
+                encode_rate_source = "ffmpeg"
+    except Exception:
+        pass
+    live_lag_seconds = None
+    playlist_seg_mtimes = sorted(m for m in (safe_stat_mtime(output_dir / name) for name in playlist_segment_names[-9:]) if m)
+    if encode_rate is None and len(playlist_seg_mtimes) >= 2 and len(segment_durations) >= 2:
+        wall_span = playlist_seg_mtimes[-1] - playlist_seg_mtimes[0]
+        content_seconds = sum(segment_durations[-(len(playlist_seg_mtimes)) :][1:])
+        if wall_span > 0 and content_seconds > 0:
+            encode_rate = round(content_seconds / wall_span, 2)
+            encode_rate_source = "derived"
+    if playlist_seg_mtimes:
+        live_lag_seconds = round(max(0.0, now_wall - playlist_seg_mtimes[-1]), 2)
+    elif segment_mtimes:
+        live_lag_seconds = round(max(0.0, now_wall - max(segment_mtimes)), 2)
     return {
         "output_dir": str(output_dir),
+        "encode_rate": encode_rate,
+        "encode_rate_source": encode_rate_source,
+        "live_lag_seconds": live_lag_seconds,
         "playlist": str(playlist),
         "dash_manifest": str(dash_manifest),
         "playlist_exists": playlist.exists(),
@@ -1597,11 +2447,25 @@ def hls_metrics(config):
     }
 
 
+_PROC_METRICS_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_PROC_METRICS_TTL = 2.0
+
+
 def process_metrics():
+    """Return the managed encode's live process metrics (pid, age, cpu, rss, child processes), served from a 2s TTL cache."""
+    # Cached: this does a recursive psutil children() scan (full /proc walk) that
+    # otherwise ran once per viewer per SSE/poll tick and pegged the single event
+    # loop, starving proxy_hls async reads. Shared TTL cache keeps it O(1/2s)
+    # regardless of viewer count.
     global PROCESS, STARTED_AT
+    _pm_now = time.monotonic()
+    if _PROC_METRICS_CACHE["data"] is not None and (_pm_now - _PROC_METRICS_CACHE["at"]) < _PROC_METRICS_TTL:
+        return _PROC_METRICS_CACHE["data"]
     pid = PROCESS.pid if PROCESS and PROCESS.poll() is None else None
     data = {"managed": bool(pid), "pid": pid, "started_at": STARTED_AT, "age": None, "cpu": None, "rss": None, "children": []}
     if not pid:
+        _PROC_METRICS_CACHE["data"] = data
+        _PROC_METRICS_CACHE["at"] = _pm_now
         return data
     try:
         proc = psutil.Process(pid)
@@ -1615,10 +2479,13 @@ def process_metrics():
         ]
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
+    _PROC_METRICS_CACHE["data"] = data
+    _PROC_METRICS_CACHE["at"] = _pm_now
     return data
 
 
 def stream_health(config, proc, hls, force=False):
+    """Convenience wrapper delegating to the module-global StreamHealthScorer.assess."""
     return STREAM_HEALTH_SCORER.assess(config, proc, hls, force=force)
 
 
@@ -1671,7 +2538,11 @@ NVIDIA_ENCODER_FIELDS = [
 NVIDIA_PROCESS_QUERY_FIELDS = ["gpu_uuid", "pid", "process_name", "used_memory"]
 
 
+# ---------------------------------------------------------------------------
+# NVIDIA GPU telemetry — run/parse/analyze nvidia-smi for encoder health.
+# ---------------------------------------------------------------------------
 def parse_smi_csv(text, fields):
+    """Parse nvidia-smi CSV output into a list of {field: cell} dicts, padding/truncating each row to the field list."""
     rows = []
     reader = csv.reader(io.StringIO(text or ""))
     for raw in reader:
@@ -1683,6 +2554,7 @@ def parse_smi_csv(text, fields):
 
 
 def parse_nvidia_gpu_csv(text):
+    """Parse --query-gpu CSV into per-GPU dicts with typed fields and derived memory/power utilization percentages."""
     gpus = []
     for row in parse_smi_csv(text, NVIDIA_GPU_FIELDS):
         total = smi_int(row.get("memory_total"))
@@ -1716,20 +2588,20 @@ def parse_nvidia_gpu_csv(text):
 
 
 def parse_nvidia_encoder_csv(text):
-    rows = []
-    for row in parse_smi_csv(text, NVIDIA_ENCODER_FIELDS):
-        rows.append(
-            {
-                "index": smi_int(row.get("index")),
-                "encoder_session_count": smi_int(row.get("encoder_session_count")),
-                "encoder_average_fps": smi_int(row.get("encoder_average_fps")),
-                "encoder_average_latency_ms": smi_int(row.get("encoder_average_latency_ms")),
-            }
-        )
-    return rows
+    """Parse the NVENC encoder-stats CSV (session count, average fps/latency) into per-GPU-index dicts."""
+    return [
+        {
+            "index": smi_int(row.get("index")),
+            "encoder_session_count": smi_int(row.get("encoder_session_count")),
+            "encoder_average_fps": smi_int(row.get("encoder_average_fps")),
+            "encoder_average_latency_ms": smi_int(row.get("encoder_average_latency_ms")),
+        }
+        for row in parse_smi_csv(text, NVIDIA_ENCODER_FIELDS)
+    ]
 
 
 def parse_nvidia_process_csv(text):
+    """Parse the --query-compute-apps CSV into per-process dicts (gpu_uuid, pid, name, used memory), skipping rows without a pid."""
     processes = []
     for row in parse_smi_csv(text, NVIDIA_PROCESS_QUERY_FIELDS):
         pid = smi_int(row.get("pid"))
@@ -1747,6 +2619,7 @@ def parse_nvidia_process_csv(text):
 
 
 def parse_nvidia_pmon(text):
+    """Parse `nvidia-smi pmon` whitespace output into per-process rows with sm/mem/enc/dec utilization percentages."""
     rows = []
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -1776,6 +2649,7 @@ def parse_nvidia_pmon(text):
 
 
 def merge_nvidia_processes(compute_processes, pmon_processes, gpus):
+    """Merge compute-app and pmon process rows (keyed by pid), tag each with gpu_index and an is_ffmpeg flag, sorted by gpu/pid."""
     uuid_to_index = {gpu.get("uuid"): gpu.get("index") for gpu in gpus if gpu.get("uuid")}
     merged = {}
     for proc in compute_processes:
@@ -1796,6 +2670,7 @@ def merge_nvidia_processes(compute_processes, pmon_processes, gpus):
 
 
 def run_nvidia_smi(args, timeout=3.5):
+    """Run `nvidia-smi args` with a timeout, returning a result dict (command, returncode, stdout, stderr, elapsed_ms); never raises."""
     cmd = ["nvidia-smi", *args]
     started = time.monotonic()
     try:
@@ -1828,6 +2703,7 @@ def run_nvidia_smi(args, timeout=3.5):
 
 
 def text_tail(text, max_chars=1200):
+    """Return the trailing max_chars of a stripped string (the tail is the useful part of command output)."""
     text = str(text or "").strip()
     if len(text) <= max_chars:
         return text
@@ -1835,6 +2711,7 @@ def text_tail(text, max_chars=1200):
 
 
 def nvidia_command_summary(result, include_stdout=False):
+    """Summarize an nvidia-smi result for the API (command, returncode, elapsed, truncated stderr; stdout on error or when asked)."""
     summary = {
         "command": " ".join(result.get("command", [])),
         "returncode": result.get("returncode"),
@@ -1847,16 +2724,19 @@ def nvidia_command_summary(result, include_stdout=False):
 
 
 def max_or_none(values):
+    """Return the max of the non-None values, or None if there are none."""
     filtered = [value for value in values if value is not None]
     return max(filtered) if filtered else None
 
 
 def sum_or_none(values):
+    """Return the sum (rounded to 1dp) of the non-None values, or None if there are none."""
     filtered = [value for value in values if value is not None]
     return round(sum(filtered), 1) if filtered else None
 
 
 def analyze_nvidia_smi(gpus, processes, commands):
+    """Reduce parsed GPU/process data into an availability verdict, level, message, diagnosis, and summary (hot/mem/NVENC checks)."""
     gpu_command = commands.get("gpus", {})
     available = gpu_command.get("returncode") == 0 and bool(gpus)
     errors = []
@@ -1903,11 +2783,7 @@ def analyze_nvidia_smi(gpus, processes, commands):
     else:
         diagnosis.append("No FFmpeg/NVENC process visible to nvidia-smi")
 
-    optional_failures = [
-        name
-        for name in ("encoder", "processes", "pmon")
-        if commands.get(name, {}).get("returncode") not in (None, 0)
-    ]
+    optional_failures = [name for name in ("encoder", "processes", "pmon") if commands.get(name, {}).get("returncode") not in (None, 0)]
     if optional_failures:
         diagnosis.append(f"Optional query failed: {', '.join(optional_failures)}")
 
@@ -1941,6 +2817,7 @@ def analyze_nvidia_smi(gpus, processes, commands):
 
 
 def collect_nvidia_smi():
+    """Run the full nvidia-smi query suite (gpus, encoder, compute-apps, pmon), merge and analyze it into one telemetry payload."""
     checked_at = now_ms()
     gpu_result = run_nvidia_smi(
         [
@@ -2003,6 +2880,7 @@ def collect_nvidia_smi():
 
 
 async def nvidia_smi_status(request):
+    """GET /api/nvidia-smi: return GPU telemetry from a shared ~5s cache, collecting off-thread on miss and recording it to Arango."""
     global NVIDIA_SMI_CACHE
     async with NVIDIA_SMI_LOCK:
         cache_age = time.monotonic() - float(NVIDIA_SMI_CACHE.get("at") or 0.0)
@@ -2022,7 +2900,11 @@ async def nvidia_smi_status(request):
         return JSONResponse(payload)
 
 
+# ---------------------------------------------------------------------------
+# HTTP route handlers — cockpit status, config, sources, and links APIs.
+# ---------------------------------------------------------------------------
 def status_payload():
+    """Assemble the full cockpit status document (config, process/HLS/health, sources, viewers, logs, runtime) and record it to Arango."""
     config = load_config()
     proc = process_metrics()
     hls = hls_metrics(config)
@@ -2051,6 +2933,8 @@ def status_payload():
             "app_uptime_seconds": round(max(0.0, time.time() - (APP_STARTED_AT / 1000)), 2) if APP_STARTED_AT else None,
             "arango_queue_depth": ARANGO_QUEUE.qsize() if ARANGO_QUEUE else 0,
             "stream_desired_state": STREAM_DESIRED_STATE,
+            "operator_stopped": operator_stopped(config),
+            "stop_reason": stop_reason(config),
             "configured_link_count": len(configured_links),
             "configured_source_count": len(sources),
             "auto_public_source_count": len(auto_links),
@@ -2058,21 +2942,25 @@ def status_payload():
             "proxy_cache": _PROXY_CACHE.stats(),
         },
         "private_iptv": private_iptv_public_runtime(),
+        "schedule": schedule_snapshot(),
     }
     queue_arango_insert("metrics", {"ts": now_ms(), "payload": payload})
     return payload
 
 
 async def status(request):
+    """GET /api/status (guarded): return the full cockpit status payload."""
     return JSONResponse(status_payload())
 
 
 async def list_sources(request):
+    """GET /api/sources (guarded): return ingest source statuses with live viewer counts."""
     config = load_config()
     return JSONResponse({"ok": True, "sources": source_statuses(config, process_metrics()), "viewers": viewer_counts_snapshot()})
 
 
 async def viewer_counts(request):
+    """GET/POST /api/viewers: return live viewer counts; POST also registers a viewer heartbeat and credits watch time."""
     cors = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors)
@@ -2083,10 +2971,26 @@ async def viewer_counts(request):
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400, headers=cors)
         session_id = str(body.get("session_id") or body.get("viewer_id") or secrets.token_urlsafe(16))
         source_id = str(body.get("source_id") or "server-1")
+        client_ip = _client_ip(request)
+        ip_hash = _ip_hash(client_ip) if client_ip else None
+        now_t = time.time()
         async with VIEWER_LOCK:
             prune_viewer_sessions()
-            VIEWER_SESSIONS[session_id] = {"source_id": source_id, "at": time.time()}
+            previous = VIEWER_SESSIONS.get(session_id)
+            last_at = float(previous.get("at", 0.0)) if previous else None
+            VIEWER_SESSIONS[session_id] = {"source_id": source_id, "at": now_t, "ip_hash": ip_hash}
             counts = viewer_counts_snapshot()
+        if ip_hash:
+            await record_watch(
+                ip_hash,
+                client_ip,
+                source_id,
+                now_t,
+                last_at,
+                buffering_ms=body.get("buffering_ms", 0),
+                stalls=body.get("stalls", 0),
+                source_label=body.get("source_label"),
+            )
         return JSONResponse({"ok": True, "session_id": session_id, "viewers": counts}, headers=cors)
     async with VIEWER_LOCK:
         counts = viewer_counts_snapshot()
@@ -2094,6 +2998,7 @@ async def viewer_counts(request):
 
 
 async def health(request):
+    """GET /api/health (public): report readiness with per-check details; returns 503 when the managed stream is down/unconfigured/failed."""
     config = load_config()
     proc = process_metrics()
     hls = hls_metrics(config)
@@ -2126,10 +3031,12 @@ async def health(request):
 
 
 async def get_config(request):
+    """GET /api/config (guarded): return the redacted public config."""
     return JSONResponse({"ok": True, "config": public_config(load_config())})
 
 
 async def put_config(request):
+    """PUT /api/config (guarded): validate and apply config edits, persist, and hot-restart the encode if stream-affecting keys changed."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -2140,6 +3047,10 @@ async def put_config(request):
         if not isinstance(body["public_sources"], list):
             return JSONResponse({"ok": False, "error": "public_sources must be an array"}, status_code=400)
         config["public_sources"] = normalize_public_sources(body["public_sources"])
+    if "source_blacklist" in body:
+        if not isinstance(body["source_blacklist"], list):
+            return JSONResponse({"ok": False, "error": "source_blacklist must be an array"}, status_code=400)
+        config["source_blacklist"] = normalize_blacklist(body["source_blacklist"])
     if "private_iptv" in body:
         if not isinstance(body["private_iptv"], dict):
             return JSONResponse({"ok": False, "error": "private_iptv must be an object"}, status_code=400)
@@ -2234,10 +3145,14 @@ async def put_config(request):
 
 
 async def private_iptv_status(request):
-    return JSONResponse({"ok": True, "private_iptv": private_iptv_public_runtime(), "config": public_config(load_config()).get("private_iptv", {})})
+    """GET /api/private-iptv (guarded): return the private-IPTV runtime state plus its redacted config."""
+    return JSONResponse(
+        {"ok": True, "private_iptv": private_iptv_public_runtime(), "config": public_config(load_config()).get("private_iptv", {})}
+    )
 
 
 async def private_iptv_refresh(request):
+    """POST /api/private-iptv/refresh (guarded): trigger an on-demand private-IPTV scrape (optionally forcing playback probes)."""
     try:
         body = await parse_json_body(request)
     except ValueError as exc:
@@ -2247,7 +3162,48 @@ async def private_iptv_refresh(request):
     return JSONResponse(result, status_code=status)
 
 
+async def private_iptv_control(request):
+    """Control only the scraper lifecycle; never stop or restart ffmpeg."""
+    global PRIVATE_IPTV_TASK
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    action = str(body.get("action") or "").lower().strip()
+    if action not in {"pause", "resume", "stop", "restart"}:
+        return JSONResponse({"ok": False, "error": "action must be pause, resume, stop, or restart"}, status_code=400)
+    config = load_config(fresh=True)
+    private_cfg = config.setdefault("private_iptv", {})
+    if action == "pause":
+        private_cfg["paused"] = True
+    elif action == "stop":
+        private_cfg["enabled"] = False
+        private_cfg["paused"] = False
+    else:
+        private_cfg["enabled"] = True
+        private_cfg["paused"] = False
+    _reconcile_operator_stopped(config)
+    save_config(config)
+    if action == "restart":
+        if PRIVATE_IPTV_TASK and not PRIVATE_IPTV_TASK.done():
+            PRIVATE_IPTV_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await PRIVATE_IPTV_TASK
+        PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
+    state = "paused" if action == "pause" else "stopped" if action == "stop" else "running"
+    PRIVATE_IPTV_RUNTIME.update(
+        {
+            "enabled": bool(private_cfg.get("enabled")),
+            "state": state,
+            "message": f"Private IPTV automation {state}; live ffmpeg was not touched.",
+        }
+    )
+    event(f"private IPTV automation {action}", "ok")
+    return JSONResponse({"ok": True, "action": action, "private_iptv": private_iptv_public_runtime()})
+
+
 async def add_link(request):
+    """POST /api/links (guarded): add a new ingest source URL, persist, and hot-restart the running encode."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -2283,6 +3239,7 @@ async def add_link(request):
 
 
 async def remove_link(request):
+    """POST /api/links/remove (guarded): remove an ingest source by url or id, persist, and hot-restart the running encode."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -2302,18 +3259,12 @@ async def remove_link(request):
     return JSONResponse({"ok": True, "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
 
 
-_SCRAPE_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
-)
+_SCRAPE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
 _SCRAPE_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _EMBED_HOSTS = {"gooz.aapmains.net"}
-_PLAYLIST_HOST_RE = re.compile(
-    r"https?://[a-zA-Z0-9-]+\.hereisman\.net/playlist/\d+/[^\s\"'<>&]+"
-)
+_PLAYLIST_HOST_RE = re.compile(r"https?://[a-zA-Z0-9-]+\.hereisman\.net/playlist/\d+/[^\s\"'<>&]+")
 # Captures embed IDs from: iframe src, changeStream() onclick, and js assignment
-_GOOZ_EMBED_RE = re.compile(
-    r"(?:gooz\.aapmains\.net/new-stream-embed/|changeStream\()(\d+)"
-)
+_GOOZ_EMBED_RE = re.compile(r"(?:gooz\.aapmains\.net/new-stream-embed/|changeStream\()(\d+)")
 _M3U8_RE = re.compile(r"https?://[^\s\"'<>&]+\.m3u8(?:[^\s\"'<>&]*)?")
 _CONST_SOURCE_RE = re.compile(r"""const\s+source\s*=\s*["']([^"']+)["']""")
 _OPTION_VALUE_RE = re.compile(r"""<option[^>]+value=["']([^"']+)["']""", re.IGNORECASE)
@@ -2324,8 +3275,13 @@ _M3U_ATTR_RE = re.compile(r'([a-zA-Z0-9_-]+)="([^"]*)"')
 _PRIVATE_IPTV_DOWNLOAD_RE = re.compile(r'<a[^>]+id=["\']m3uDownloadBtn["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE)
 _PRIVATE_IPTV_DATE_RE = re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}\b", re.IGNORECASE)
 _PRIVATE_IPTV_NUMERIC_DATE_RE = re.compile(r"\b(?:20\d{2})[ ._/-](\d{1,2})[ ._/-](\d{1,2})\b")
+# Bare MM.DD / MM/DD (no year), e.g. "(07.11 5:00PM ET)" / "(7.11 9:00 PM ET)".
+# Times use ':' so they won't match here.
+_PRIVATE_IPTV_SHORT_DATE_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})\b(?!\d)")
+# Clock time in a title, e.g. "5:00PM ET", "9:00 PM". Assumed US Eastern.
+_PRIVATE_IPTV_TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])\b")
 
-PRIVATE_IPTV_RUNTIME = {
+PRIVATE_IPTV_RUNTIME: dict[str, Any] = {
     "enabled": False,
     "state": "idle",
     "last_checked_at": None,
@@ -2346,7 +3302,11 @@ PRIVATE_IPTV_RUNTIME = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Private-IPTV scraper — authenticated provider playlist → scored/probed sources.
+# ---------------------------------------------------------------------------
 def private_soursignal_links(config):
+    """Return the enabled private-IPTV soursignal source URLs currently in the config (used to gauge upstream slot usage)."""
     private_cfg = config.get("private_iptv", {})
     sources = normalize_sources(config.get("stream", {}).get("sources", []), config.get("stream", {}).get("links", []))
     links = [source.get("url") for source in sources if source.get("enabled", True) and is_private_soursignal_source(source, private_cfg)]
@@ -2356,6 +3316,7 @@ def private_soursignal_links(config):
 
 
 def private_probe_budget(config, proc=None, health_doc=None, force_probe=False):
+    """Decide whether an ffprobe of private-IPTV candidates is allowed now, respecting the provider connection_limit and reserving a spare slot while a healthy private stream is live."""
     private_cfg = config.get("private_iptv", {})
     proc = proc or process_metrics()
     stream_uses_private_slot = bool(proc.get("managed") and private_soursignal_links(config))
@@ -2381,7 +3342,26 @@ def private_probe_budget(config, proc=None, health_doc=None, force_probe=False):
     }
 
 
+def should_protect_live_private_stream(config, budget, force_probe=False):
+    """Keep a working fight feed pinned during background refreshes.
+
+    A provider scan must never consume another playback connection, rewrite the
+    source list, or restart ffmpeg while the managed private feed is producing
+    usable output.  An explicit forced operator refresh is the only override;
+    confirmed degraded/failed states remain eligible for recovery.
+    """
+    private_cfg = config.get("private_iptv", {})
+    decision = str((budget or {}).get("health_decision") or "").lower()
+    return bool(
+        private_cfg.get("protect_live_stream_on_refresh", True)
+        and not force_probe
+        and (budget or {}).get("stream_uses_private_slot")
+        and decision not in {"failed", "degraded", "stopped"}
+    )
+
+
 def update_private_probe_runtime(config, budget=None, mode=None):
+    """Publish the current probe budget (and optional probe mode) into the PRIVATE_IPTV_RUNTIME status dict."""
     budget = budget or private_probe_budget(config)
     PRIVATE_IPTV_RUNTIME.update(
         {
@@ -2396,12 +3376,14 @@ def update_private_probe_runtime(config, budget=None, mode=None):
 
 
 def private_iptv_cookie_header(config):
+    """Build a Cookie header string from the private_iptv cookies map."""
     cookies = config.get("cookies") or {}
     parts = [f"{key}={value}" for key, value in cookies.items() if key and value]
     return "; ".join(parts)
 
 
 def private_iptv_request_headers(config, referer=None):
+    """Build the outbound request headers for provider fetches: configured headers plus Cookie, Referer, and a default User-Agent."""
     headers = dict(config.get("headers") or {})
     if referer and "Referer" not in headers:
         headers["Referer"] = referer
@@ -2414,6 +3396,7 @@ def private_iptv_request_headers(config, referer=None):
 
 
 async def private_iptv_fetch_text(url, config, referer=None):
+    """Fetch a provider/playlist URL as text via the shared httpx client, falling back to a curl subprocess on HTTP/decoding errors."""
     headers = private_iptv_request_headers(config, referer=referer)
     client = _HTTPX_CLIENT
     close_client = False
@@ -2433,7 +3416,7 @@ async def private_iptv_fetch_text(url, config, referer=None):
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=22)
         if proc.returncode:
             detail = (stderr or b"").decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"private IPTV fetch failed: {detail or proc.returncode}")
+            raise RuntimeError(f"private IPTV fetch failed: {detail or proc.returncode}") from None
         return stdout.decode("utf-8", errors="replace")
     finally:
         if close_client:
@@ -2441,6 +3424,7 @@ async def private_iptv_fetch_text(url, config, referer=None):
 
 
 def extract_private_iptv_playlist_url(provider_html, provider_url, configured_url=""):
+    """Return the m3u playlist URL: an explicit configured_url wins, else the m3uDownloadBtn href scraped from provider_html."""
     if valid_stream_url(configured_url):
         return configured_url
     match = _PRIVATE_IPTV_DOWNLOAD_RE.search(provider_html or "")
@@ -2450,6 +3434,7 @@ def extract_private_iptv_playlist_url(provider_html, provider_url, configured_ur
 
 
 def parse_m3u_entries(text):
+    """Parse an M3U playlist into a list of {title, attrs, url} entries (EXTINF attrs lower-cased and HTML-unescaped)."""
     entries = []
     pending = None
     for raw in (text or "").splitlines():
@@ -2476,6 +3461,7 @@ def parse_m3u_entries(text):
 
 
 def private_iptv_entry_text(entry):
+    """Flatten an m3u entry's title, tvg/group attrs, and URL into one searchable text blob for keyword scoring."""
     attrs = entry.get("attrs") or {}
     parts = [
         entry.get("title", ""),
@@ -2488,6 +3474,7 @@ def private_iptv_entry_text(entry):
 
 
 def private_iptv_now(config):
+    """Return the current datetime in the configured private_iptv timezone (falling back to UTC if unknown)."""
     try:
         tz = ZoneInfo(config.get("timezone") or "Canada/Pacific")
     except ZoneInfoNotFoundError:
@@ -2496,24 +3483,65 @@ def private_iptv_now(config):
 
 
 def infer_private_iptv_event_date(text, now):
+    """Best-effort parse of an event date from title text (today/tonight, month-name, numeric, or bare MM.DD), anchored to `now`; None if absent."""
     lowered = text.lower()
-    if "today" in lowered:
+    if "today" in lowered or "tonight" in lowered:
         return now
-    match = _PRIVATE_IPTV_NUMERIC_DATE_RE.search(text)
-    if match:
-        month, day = int(match.group(1)), int(match.group(2))
-        with contextlib.suppress(ValueError):
-            return now.replace(month=month, day=day)
+    # Month-name date first ("Jul 11", "JUL 11").
     match = _PRIVATE_IPTV_DATE_RE.search(text)
     if match:
         for fmt in ("%b %d", "%B %d"):
             with contextlib.suppress(ValueError):
                 parsed = datetime.strptime(match.group(0), fmt)
                 return now.replace(month=parsed.month, day=parsed.day)
+    # Year-prefixed numeric ("2026-07-11").
+    match = _PRIVATE_IPTV_NUMERIC_DATE_RE.search(text)
+    if match:
+        month, day = int(match.group(1)), int(match.group(2))
+        with contextlib.suppress(ValueError):
+            return now.replace(month=month, day=day)
+    # Bare MM.DD / MM/DD ("(07.11 5:00PM ET)") — the provider's dominant format.
+    match = _PRIVATE_IPTV_SHORT_DATE_RE.search(text)
+    if match:
+        month, day = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            with contextlib.suppress(ValueError):
+                return now.replace(month=month, day=day)
+    return None
+
+
+def infer_private_iptv_slot_start(text, now):
+    """Best-effort US-Eastern start time for this event portion so the managed
+    stream can follow the live phase. An explicit '(7:00 PM ET)' wins; otherwise
+    infer from the phase keyword (early prelims 5pm / prelims 7pm / main card 9pm).
+    Returns an ET-aware datetime, or None."""
+    try:
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        return None
+    now_et = now.astimezone(et)
+    lowered = text.lower()
+    match = _PRIVATE_IPTV_TIME_RE.search(text)
+    if match:
+        hour = int(match.group(1)) % 12
+        if match.group(3).lower() == "pm":
+            hour += 12
+        minute = int(match.group(2))
+    elif "early prelim" in lowered:
+        hour, minute = 17, 0
+    elif "prelim" in lowered:
+        hour, minute = 19, 0
+    elif "main card" in lowered or re.search(r"\bvs?\.?\b", lowered):
+        hour, minute = 21, 0
+    else:
+        return None
+    with contextlib.suppress(Exception):
+        return now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return None
 
 
 def score_private_iptv_entry(entry, config, now=None):
+    """Score one m3u entry for fight-day relevance (keywords, event group/slot, main-event, date window, live phase) → (score, reasons)."""
     now = now or private_iptv_now(config)
     text = private_iptv_entry_text(entry)
     lowered = text.lower()
@@ -2524,9 +3552,21 @@ def score_private_iptv_entry(entry, config, now=None):
             score += 35 if keyword.lower() in {"ufc", "mma"} else 20
             reasons.append(f"keyword:{keyword}")
     group_title = (entry.get("attrs") or {}).get("group-title", "").lower()
-    if "ppv" in group_title or "live event" in lowered:
-        score += 12
+    if "ppv" in group_title or "live event" in group_title:
+        # The provider's live event feeds all live in the "PPV Live Events" group;
+        # weight it strongly so a clear UFC entry clears the threshold even without
+        # a parseable date (content is verified later by the ffprobe tester).
+        score += 25
         reasons.append("event group")
+    if re.search(r"\b(?:ppv|live)\s*(?:event\s*)?\d{1,2}\b", lowered):
+        score += 15
+        reasons.append("event slot")
+    # Headline / main-event feeds ("... vs ...", "Main Card") carry no "prelims"
+    # keyword bonus, so weight them so the marquee fight is never buried under the
+    # prelims feeds when max_candidates is reached.
+    if "prelim" not in lowered and ("main card" in lowered or re.search(r"\bvs?\.?\b", lowered)):
+        score += 20
+        reasons.append("main event")
     for keyword in config.get("reject_keywords") or []:
         if keyword.lower() in lowered:
             score -= 45
@@ -2540,6 +3580,21 @@ def score_private_iptv_entry(entry, config, now=None):
         else:
             score -= 30
             reasons.append("stale/future date")
+    # Event-phase awareness: strongly prefer the portion that is live NOW, and
+    # demote portions that haven't started (they show a countdown/ads), so the
+    # managed stream auto-follows early prelims -> prelims -> main card.
+    slot_start = infer_private_iptv_slot_start(text, now)
+    if slot_start is not None:
+        delta_min = (now.astimezone(slot_start.tzinfo) - slot_start).total_seconds() / 60.0
+        if delta_min < -10:
+            score -= 40
+            reasons.append("slot upcoming")
+        elif delta_min <= 150:
+            score += 25
+            reasons.append("slot live")
+        else:
+            score += 5
+            reasons.append("slot earlier")
     if re.search(r"\b(no event|no scheduled event)\b", lowered):
         score -= 100
     if re.search(r"\b(24/7|classic|replay)\b", lowered):
@@ -2550,12 +3605,35 @@ def score_private_iptv_entry(entry, config, now=None):
     return score, reasons
 
 
-def select_private_iptv_candidates(entries, config, now=None):
+def select_private_iptv_candidates(entries, config, now=None, blacklist=None):
+    """Score and select fight-day private IPTV candidates.
+
+    ``config`` is the ``private_iptv`` sub-config. ``blacklist`` (raw list or a
+    precomputed :func:`blacklist_index` set) drops blocked entries up front so
+    they never reach the expensive ffprobe stage or get re-selected each cycle.
+    """
     now = now or private_iptv_now(config)
+    bl_index = blacklist if isinstance(blacklist, set) else blacklist_index(blacklist or [])
     scored = []
     for index, entry in enumerate(entries):
+        # Persistent blacklist: a blocked stream can never be re-selected.
+        if bl_index and is_blacklisted(entry, bl_index):
+            continue
         score, reasons = score_private_iptv_entry(entry, config, now=now)
-        if config.get("require_date_window_match", True) and "date window" not in reasons:
+        required_keywords = config.get("required_keywords") or ["ufc"]
+        if not any(
+            re.search(rf"\b{re.escape(keyword.lower())}\b", private_iptv_entry_text(entry).lower()) for keyword in required_keywords
+        ):
+            continue
+        # Require an actual fight keyword (ufc/mma/prelims/...) so the group/slot/
+        # main-event bonuses can't drag unrelated PPV entries (other sports) over
+        # the threshold.
+        if not any(r.startswith("keyword:") for r in reasons):
+            continue
+        # Recall over precision at selection time: keep dateless entries (many valid
+        # event feeds omit a parseable date) and drop only clearly out-of-window ones.
+        # The ffprobe tester downstream verifies which actually carry video.
+        if "stale/future date" in reasons:
             continue
         if score >= int(config.get("min_score", 70)):
             scored.append({"entry": entry, "score": score, "reasons": reasons, "index": index})
@@ -2564,6 +3642,7 @@ def select_private_iptv_candidates(entries, config, now=None):
 
 
 def parse_hls_urls(text, base_url):
+    """Extract non-comment URLs from an m3u8 body, resolving each against base_url."""
     urls = []
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -2574,11 +3653,13 @@ def parse_hls_urls(text, base_url):
 
 
 def looks_like_html(body):
+    """Heuristic: True if the leading bytes of body look like an HTML document (doctype/<html>/<body>)."""
     sample = body.lstrip()[:256].lower()
-    return sample.startswith(b"<!doctype html") or sample.startswith(b"<html") or b"<body" in sample
+    return sample.startswith((b"<!doctype html", b"<html")) or b"<body" in sample
 
 
 async def fetch_small_head(url, headers, timeout=10.0):
+    """GET the first ~128KB of url (via a Range header) and return (status, content_type, body) for cheap content probing."""
     client = _HTTPX_CLIENT
     close_client = False
     request_headers = dict(headers or {})
@@ -2594,31 +3675,71 @@ async def fetch_small_head(url, headers, timeout=10.0):
             await client.aclose()
 
 
+async def ffprobe_video(url, config, timeout=12.0):
+    """Real content test: ffprobe the URL (following soursignal's 302 -> raw-TS CDN)
+    and report the first video stream. Uses one upstream connection, so callers must
+    hold PRIVATE_PROBE_LOCK to stay within the provider connection_limit."""
+    headers = private_iptv_request_headers(config)
+    ua = headers.get("User-Agent", _SCRAPE_UA)
+    hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items() if k.lower() in ("referer", "cookie"))
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-user_agent",
+        ua,
+        *(["-headers", hdr_lines] if hdr_lines else []),
+        "-analyzeduration",
+        "4000000",
+        "-probesize",
+        "4000000",
+        "-show_entries",
+        "stream=codec_type,codec_name,width,height",
+        "-of",
+        "json",
+        url,
+    ]
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        if proc is not None:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.communicate()
+        return {"video": False, "reason": "ffprobe timeout"}
+    except Exception as exc:
+        return {"video": False, "reason": f"ffprobe error:{exc}"[:80]}
+    try:
+        data = json.loads(out or b"{}")
+    except Exception:
+        data = {}
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video" and stream.get("codec_name"):
+            return {"video": True, "codec": stream.get("codec_name"), "width": stream.get("width"), "height": stream.get("height")}
+    tail = (err or b"").decode("utf-8", "replace").strip().splitlines()
+    return {"video": False, "reason": (tail[-1] if tail else "no video stream")[:80]}
+
+
 async def assess_playback_candidate(url, config, headers=None, deep=True):
+    """Probe a candidate URL for real playable content — ffprobe for soursignal TS feeds, else HLS playlist/segment inspection — returning {ok, score, reasons, resolved_url}."""
     headers = headers or private_iptv_request_headers(config)
     reasons = []
     score = 0
+    if "soursignal.com" in urlparse(url).netloc.lower() and ".m3u8" not in url.lower():
+        # soursignal 302-redirects to a raw MPEG-TS CDN (not an HLS playlist), so
+        # playlist-parsing probes can't see the content. Decode real video with
+        # ffprobe instead; retry once because a live TS can start mid-packet.
+        ff_timeout = max(float(config.get("probe_timeout_seconds", 10)), 12.0)
+        info = await ffprobe_video(url, config, timeout=ff_timeout)
+        if not info.get("video"):
+            info = await ffprobe_video(url, config, timeout=ff_timeout)
+        if info.get("video"):
+            res = f"{info.get('width')}x{info.get('height')}"
+            return {"ok": True, "score": 95, "reasons": [f"ffprobe video {info.get('codec')} {res}"], "resolved_url": None}
+        return {"ok": False, "score": -80, "reasons": [f"ffprobe:{info.get('reason')}"], "resolved_url": None}
     try:
-        if "soursignal.com" in urlparse(url).netloc.lower() and ".m3u8" not in url.lower():
-            try:
-                probe_timeout = float(config.get("probe_timeout_seconds", 10))
-                status, content_type, body = await asyncio.wait_for(
-                    fetch_small_head(url, headers, timeout=probe_timeout),
-                    timeout=probe_timeout + 1,
-                )
-                text = body.decode("utf-8", errors="replace")
-            except Exception:
-                return {"ok": True, "score": 45, "reasons": ["soursignal deferred to transcoder"], "resolved_url": None}
-            if status >= 400:
-                return {"ok": False, "score": -80, "reasons": [f"http {status}"], "resolved_url": None}
-            links = _M3U8_RE.findall(text or "")
-            if links:
-                url = links[0]
-                reasons.append("soursignal resolved hls")
-            elif text:
-                score += 55
-                reasons.append("soursignal page reachable")
-                return {"ok": True, "score": score, "reasons": reasons, "resolved_url": None}
         status, content_type, body = await fetch_small_head(url, headers, timeout=float(config.get("probe_timeout_seconds", 10)))
     except Exception as exc:
         return {"ok": False, "score": -100, "reasons": [f"probe error:{exc}"], "resolved_url": None}
@@ -2640,7 +3761,9 @@ async def assess_playback_candidate(url, config, headers=None, deep=True):
     elif media_playlists:
         score += 20
         reasons.append("master playlist")
-        nested_status, nested_ct, nested_body = await fetch_small_head(media_playlists[0], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
+        nested_status, _nested_ct, nested_body = await fetch_small_head(
+            media_playlists[0], headers, timeout=float(config.get("probe_timeout_seconds", 10))
+        )
         nested_text = nested_body.decode("utf-8", errors="replace")
         nested_segments = [item for item in parse_hls_urls(nested_text, media_playlists[0]) if not item.split("?", 1)[0].endswith(".m3u8")]
         if nested_status < 400 and nested_segments:
@@ -2657,7 +3780,9 @@ async def assess_playback_candidate(url, config, headers=None, deep=True):
         score -= 20
         reasons.append("ended or tiny vod")
     if media_segments and deep:
-        seg_status, seg_ct, seg_body = await fetch_small_head(media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
+        seg_status, seg_ct, seg_body = await fetch_small_head(
+            media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10))
+        )
         if seg_status < 400 and seg_body and not looks_like_html(seg_body):
             score += 35
             reasons.append("segment readable")
@@ -2671,21 +3796,33 @@ async def assess_playback_candidate(url, config, headers=None, deep=True):
 
 
 def private_iptv_source_id(prefix, entry, index):
+    """Build a stable, slugified source id for an accepted private-IPTV entry (prefix + label slug)."""
     label = entry.get("title") or (entry.get("attrs") or {}).get("tvg-name") or f"Candidate {index + 1}"
     slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", label).strip("-").lower()[:52]
     return f"{prefix}-{slug or index + 1}"
 
 
 def merge_private_iptv_sources(config, accepted):
+    """Replace the auto-prefixed private sources in config with the accepted candidates (blacklisted ones dropped), keeping manual sources; returns the new source ids."""
     stream = config.setdefault("stream", {})
     auto_cfg = config.get("private_iptv", {})
     prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
     existing = normalize_sources(stream.get("sources", []), stream.get("links", []))
-    manual = [source for source in existing if not str(source.get("id", "")).startswith(prefix + "-")]
+    locked_id = str(stream.get("locked_source_id") or "")
+    bl_index = blacklist_index(config.get("source_blacklist"))
+    manual = [
+        source
+        for source in existing
+        if (source.get("id") == locked_id or not str(source.get("id", "")).startswith(prefix + "-"))
+        and not is_blacklisted(source, bl_index)
+    ]
     auto_sources = []
     headers = {k: v for k, v in private_iptv_request_headers(auto_cfg).items() if k.lower() != "cookie"}
     for index, item in enumerate(accepted):
         entry = item["entry"]
+        # Final write-barrier: blocked scraped feeds never enter stream.sources.
+        if is_blacklisted(entry, bl_index):
+            continue
         source_id = private_iptv_source_id(prefix, entry, index)
         label = entry.get("title") or (entry.get("attrs") or {}).get("tvg-name") or f"Private IPTV {index + 1}"
         url = entry.get("url")
@@ -2706,6 +3843,7 @@ def merge_private_iptv_sources(config, accepted):
 
 
 def disable_private_iptv_sources(config):
+    """Disable (don't remove) every auto-prefixed private-IPTV source in config; return True if any were changed."""
     stream = config.setdefault("stream", {})
     auto_cfg = config.get("private_iptv", {})
     prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
@@ -2721,6 +3859,7 @@ def disable_private_iptv_sources(config):
 
 
 def source_headers_for_url(raw_url):
+    """Return the configured custom headers for whichever source matches raw_url (exact URL or same-origin path prefix), else {}."""
     try:
         target = urlparse(raw_url)
     except Exception:
@@ -2746,6 +3885,7 @@ def source_headers_for_url(raw_url):
 
 
 def proxy_request_headers(raw_url):
+    """Build the outbound header set for a proxied upstream fetch (gooz origin/referer + browser-like defaults, overlaid with per-source headers)."""
     headers = {
         "User-Agent": _SCRAPE_UA,
         "Origin": _GOOZ_ORIGIN,
@@ -2761,27 +3901,47 @@ def proxy_request_headers(raw_url):
     return headers
 
 
+# ---------------------------------------------------------------------------
+# Public auto-scraper — sportsurge/gooz pages → hereisman playlist URLs.
+# ---------------------------------------------------------------------------
 async def _scrape_fetch(url: str, referer: str | None = None) -> str:
     """Fetch a page with browser-like headers. Uses subprocess curl to handle
     brotli/zstd compression that older httpx builds may not support."""
     headers_args: list[str] = [
-        "-H", f"User-Agent: {_SCRAPE_UA}",
-        "-H", f"Accept: {_SCRAPE_ACCEPT}",
-        "-H", "Accept-Language: en-US,en;q=0.5",
-        "-H", "DNT: 1",
-        "-H", "Sec-GPC: 1",
-        "-H", "Upgrade-Insecure-Requests: 1",
-        "-H", "Sec-Fetch-Dest: document",
-        "-H", "Sec-Fetch-Mode: navigate",
-        "-H", "Sec-Fetch-Site: same-origin",
-        "-H", "Pragma: no-cache",
-        "-H", "Cache-Control: no-cache",
+        "-H",
+        f"User-Agent: {_SCRAPE_UA}",
+        "-H",
+        f"Accept: {_SCRAPE_ACCEPT}",
+        "-H",
+        "Accept-Language: en-US,en;q=0.5",
+        "-H",
+        "DNT: 1",
+        "-H",
+        "Sec-GPC: 1",
+        "-H",
+        "Upgrade-Insecure-Requests: 1",
+        "-H",
+        "Sec-Fetch-Dest: document",
+        "-H",
+        "Sec-Fetch-Mode: navigate",
+        "-H",
+        "Sec-Fetch-Site: same-origin",
+        "-H",
+        "Pragma: no-cache",
+        "-H",
+        "Cache-Control: no-cache",
     ]
     if referer:
         headers_args += ["-H", f"Referer: {referer}"]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "--compressed", "--max-time", "15", "-L", url,
+            "curl",
+            "-s",
+            "--compressed",
+            "--max-time",
+            "15",
+            "-L",
+            url,
             *headers_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -2814,6 +3974,7 @@ async def _scrape_gooz_embed(embed_id: str, page_url: str) -> list[str]:
 
 
 def _decode_base64_url(value: str) -> str | None:
+    """Base64-decode value (padding-tolerant) and return it only if the result is a valid http(s) URL, else None."""
     text = str(value or "").strip()
     if not text:
         return None
@@ -2826,10 +3987,12 @@ def _decode_base64_url(value: str) -> str | None:
 
 
 def _extract_icelz_option_streams(page_url: str, html_text: str) -> list[str]:
+    """Extract .m3u8 stream URLs from an icelz page's <option> values, including base64-encoded hls/playlist query params."""
     streams: list[str] = []
     seen: set[str] = set()
 
     def add(candidate: str | None) -> None:
+        """Add a de-duplicated valid .m3u8 URL to the streams list."""
         url = str(candidate or "").strip()
         if not url or url in seen or not valid_stream_url(url):
             return
@@ -2857,13 +4020,22 @@ def _extract_icelz_option_streams(page_url: str, html_text: str) -> list[str]:
 
 
 async def _validate_hls_candidate(url: str) -> bool:
+    """True if a HEAD (curl -I) on the .m3u8 URL returns 200/206 with an HLS-ish content type."""
     if not valid_stream_url(url) or ".m3u8" not in url.lower():
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "--compressed", "--max-time", "10", "-L", "-I",
-            "-H", f"User-Agent: {_SCRAPE_UA}",
-            "-H", "Accept: application/vnd.apple.mpegurl,*/*;q=0.8",
+            "curl",
+            "-s",
+            "--compressed",
+            "--max-time",
+            "10",
+            "-L",
+            "-I",
+            "-H",
+            f"User-Agent: {_SCRAPE_UA}",
+            "-H",
+            "Accept: application/vnd.apple.mpegurl,*/*;q=0.8",
             url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -2898,6 +4070,7 @@ async def _scrape_page(url: str) -> list[str]:
     seen: set[str] = set()
 
     def add(u: str) -> None:
+        """Add a cleaned, de-duplicated valid stream URL to the results."""
         u = u.strip().rstrip("\"'")
         if u and u not in seen and valid_stream_url(u):
             seen.add(u)
@@ -2918,9 +4091,9 @@ async def _scrape_page(url: str) -> list[str]:
     # 2. All gooz embed IDs (iframe src + changeStream() onclick)
     gooz_ids = list(dict.fromkeys(_GOOZ_EMBED_RE.findall(html)))
     tasks = [_scrape_gooz_embed(gid, url) for gid in gooz_ids]
-    for results in await asyncio.gather(*tasks, return_exceptions=True):
-        if isinstance(results, list):
-            for u in results:
+    for embed_results in await asyncio.gather(*tasks, return_exceptions=True):
+        if isinstance(embed_results, list):
+            for u in embed_results:
                 add(u)
 
     # 3. Bare m3u8 links fallback
@@ -2951,18 +4124,22 @@ async def _run_auto_scrape() -> list[str]:
         cfg = load_config()
         scrape_pages: list[str] = []
         event_url = await _discover_ufc_event_url()
-        if valid_stream_url(event_url):
+        if event_url and valid_stream_url(event_url):
             scrape_pages.append(event_url)
         scrape_pages.extend(cfg.get("stream", {}).get("scrape_urls", []))
         scrape_pages = normalize_scrape_urls(scrape_pages)
         if not scrape_pages:
             return _AUTO_SOURCES
+        bl_index = blacklist_index(cfg.get("source_blacklist"))
         all_sources: list[str] = []
         seen_sources: set[str] = set()
         for page_url in scrape_pages:
             sources = await asyncio.wait_for(_scrape_page(page_url), timeout=40)
             for source in sources:
                 if source in seen_sources:
+                    continue
+                # Persistent blacklist: never surface a blocked scraped URL.
+                if is_blacklisted(source, bl_index):
                     continue
                 seen_sources.add(source)
                 all_sources.append(source)
@@ -2973,10 +4150,17 @@ async def _run_auto_scrape() -> list[str]:
 
 
 async def _auto_scrape_loop() -> None:
+    """Background loop: refresh the public auto-scraped sources every interval, pausing while an operator Stop is in effect."""
     global _AUTO_SOURCES, _AUTO_SOURCES_AT, _AUTO_SOURCES_LOCK
     while True:
         try:
+            # Paused while an operator Stop is in effect (master kill switch):
+            # keep the last-known red tiles but stop discovering new ones.
+            if operator_stopped(load_config()):
+                await asyncio.sleep(_AUTO_SCRAPE_INTERVAL)
+                continue
             sources = await _run_auto_scrape()
+            assert _AUTO_SOURCES_LOCK is not None  # initialised in lifespan before this loop starts
             async with _AUTO_SOURCES_LOCK:
                 if sources:
                     _AUTO_SOURCES = sources
@@ -2988,6 +4172,7 @@ async def _auto_scrape_loop() -> None:
 
 
 def private_iptv_public_runtime():
+    """Return a copy of the private-IPTV runtime status with the playlist URL redacted."""
     payload = json.loads(json.dumps(PRIVATE_IPTV_RUNTIME))
     if payload.get("playlist_url"):
         payload["playlist_url"] = "***"
@@ -2995,6 +4180,10 @@ def private_iptv_public_runtime():
 
 
 async def refresh_private_iptv_sources(reason="manual", force_probe=False):
+    """Run one private-IPTV cycle: fetch the provider playlist, score/probe candidates, merge accepted sources, and (re)start or disable the encode accordingly.
+
+    Respects the probe budget and the persisted operator Stop; returns {ok, changed, runtime}.
+    """
     global STREAM_DESIRED_STATE
     config = load_config(fresh=True)
     private_cfg = config.get("private_iptv", {})
@@ -3013,6 +4202,27 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
     )
     if not private_cfg.get("enabled"):
         return {"ok": True, "changed": False, "runtime": private_iptv_public_runtime()}
+    if private_cfg.get("paused"):
+        PRIVATE_IPTV_RUNTIME.update({"state": "paused", "message": "Private IPTV automation is paused; live ffmpeg is unchanged."})
+        return {"ok": True, "changed": False, "runtime": private_iptv_public_runtime()}
+
+    if should_protect_live_private_stream(config, budget, force_probe=force_probe):
+        prefix = private_cfg.get("auto_source_prefix") or "private-iptv"
+        active_ids = [
+            source.get("id")
+            for source in config.get("stream", {}).get("sources", [])
+            if source.get("enabled", True) and str(source.get("id", "")).startswith(prefix + "-")
+        ]
+        PRIVATE_IPTV_RUNTIME.update(
+            {
+                "state": "active",
+                "active_source_ids": active_ids,
+                "message": "Healthy live fight stream pinned; scheduled rescan skipped to prevent downtime.",
+                "reasons": [{"policy": "live stream protection", "health": budget.get("health_decision")}],
+            }
+        )
+        update_private_probe_runtime(config, budget, mode="live-pinned")
+        return {"ok": True, "changed": False, "protected": True, "runtime": private_iptv_public_runtime()}
 
     provider_url = private_cfg.get("provider_url")
     playlist_url = private_cfg.get("playlist_url")
@@ -3025,7 +4235,7 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             raise RuntimeError("private IPTV playlist URL was not found")
         playlist_text = await private_iptv_fetch_text(playlist_url, private_cfg, referer=provider_url)
         entries = parse_m3u_entries(playlist_text)
-        candidates = select_private_iptv_candidates(entries, private_cfg)
+        candidates = select_private_iptv_candidates(entries, private_cfg, blacklist=config.get("source_blacklist"))
         accepted = []
         probe_reasons = []
         should_probe = bool(private_cfg.get("probe_candidates", True) and budget.get("probe_allowed"))
@@ -3043,7 +4253,14 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             update_private_probe_runtime(config, budget, mode="metadata-only")
         elif should_probe:
             update_private_probe_runtime(config, budget, mode="deep-probe")
-            for candidate in candidates:
+            # Bound the work: each probe is serialized on the single spare upstream
+            # connection, so stop once we have enough verified feeds (or hit the
+            # attempt cap) rather than ffprobing all candidates and delaying startup.
+            accept_target = int(private_cfg.get("probe_accept_target", 5))
+            probe_cap = int(private_cfg.get("max_probe_attempts", 8))
+            for probed_count, candidate in enumerate(candidates):
+                if len(accepted) >= accept_target or probed_count >= probe_cap:
+                    break
                 async with PRIVATE_PROBE_LOCK:
                     assessment = await assess_playback_candidate(candidate["entry"]["url"], private_cfg, deep=True)
                 candidate["probe"] = assessment
@@ -3061,8 +4278,7 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             accepted = candidates
             update_private_probe_runtime(config, budget, mode="metadata-only")
             probe_reasons = [
-                {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])}
-                for item in candidates
+                {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])} for item in candidates
             ]
 
         changed = False
@@ -3071,6 +4287,7 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             active_ids = merge_private_iptv_sources(config, accepted)
             new_links = effective_stream_links(config)
             changed = old_links != new_links
+            _reconcile_operator_stopped(config)
             save_config(config)
             PRIVATE_IPTV_RUNTIME.update(
                 {
@@ -3093,13 +4310,24 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
                     event("private IPTV source changes saved without restart; live private stream protected", "warn")
                 if not restarted and private_cfg.get("auto_start_when_active", True):
                     async with PROCESS_LOCK:
-                        if (not PROCESS or PROCESS.poll() is not None) and effective_stream_links(load_config(fresh=True)):
-                            start_managed_process(load_config(fresh=True), None, kill_existing=True)
+                        # Re-read operator intent from FRESH config inside the lock:
+                        # an operator Stop can land during the long probe above, and
+                        # gating on the pre-probe snapshot would silently re-arm a
+                        # stream the operator just killed (defeating the kill switch).
+                        fresh = load_config(fresh=True)
+                        if (
+                            not operator_stopped(fresh)
+                            and STREAM_DESIRED_STATE != "stopped"
+                            and (not PROCESS or PROCESS.poll() is not None)
+                            and effective_stream_links(fresh)
+                        ):
+                            start_managed_process(fresh, None, kill_existing=True)
                             STREAM_DESIRED_STATE = "running"
             return {"ok": True, "changed": changed, "runtime": private_iptv_public_runtime()}
 
         disabled = disable_private_iptv_sources(config)
         if disabled:
+            _reconcile_operator_stopped(config)
             save_config(config)
         PRIVATE_IPTV_RUNTIME.update(
             {
@@ -3135,13 +4363,15 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
 
 
 async def private_iptv_loop():
+    """Background loop: run the private-IPTV refresh every refresh_interval_seconds when enabled and no operator Stop is active."""
     while True:
         try:
             cfg = load_config()
             private_cfg = cfg.get("private_iptv", {})
             interval = int(private_cfg.get("refresh_interval_seconds", 900))
             PRIVATE_IPTV_RUNTIME["next_check_at"] = now_ms() + interval * 1000
-            if private_cfg.get("enabled"):
+            # Paused while an operator Stop is in effect (master kill switch).
+            if private_cfg.get("enabled") and not private_cfg.get("paused") and not operator_stopped(cfg):
                 await refresh_private_iptv_sources(reason="scheduled")
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
@@ -3155,8 +4385,13 @@ _GOOZ_ORIGIN = "https://gooz.aapmains.net"
 _GOOZ_REFERER = "https://gooz.aapmains.net/"
 
 
+# ---------------------------------------------------------------------------
+# HLS proxy — shared upstream fetch/cache and m3u8 URL rewriting for viewers.
+# ---------------------------------------------------------------------------
 def _proxy_url(raw_url: str) -> str:
+    """Return the local /api/proxy-hls URL that fetches raw_url through this proxy."""
     from urllib.parse import quote
+
     return f"/api/proxy-hls?url={quote(raw_url, safe='')}"
 
 
@@ -3211,7 +4446,24 @@ async def _proxy_upstream_fetch(raw_url: str) -> tuple[bytes, str]:
         close_client = True
     try:
         _PROXY_CACHE.record_upstream_fetch()
-        response = await client.get(raw_url, headers=headers)
+        # Follow redirects manually so every hop is SSRF-validated. A public
+        # URL that 302s to http://127.0.0.1 must not be followed blindly.
+        current_url = raw_url
+        current_headers = headers
+        response = None
+        for _ in range(5):
+            response = await client.get(current_url, headers=current_headers, follow_redirects=False)
+            if not response.is_redirect:
+                break
+            location = response.headers.get("location")
+            if not location:
+                break
+            next_url = urljoin(str(response.url), location)
+            if not await url_is_safe_public_async(next_url):
+                raise RuntimeError(f"blocked redirect to non-public target {next_url}")
+            current_url = next_url
+            current_headers = proxy_request_headers(next_url)
+        assert response is not None  # the loop always runs at least once
         response.raise_for_status()
         return response.content, response.headers.get("content-type", "")
     except (httpx.HTTPError, httpx.DecodingError) as exc:
@@ -3223,6 +4475,7 @@ async def _proxy_upstream_fetch(raw_url: str) -> tuple[bytes, str]:
 
 
 async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> tuple[bytes, str]:
+    """Fallback upstream fetch via a curl subprocess (no redirect following) for origins httpx can't decode; returns (body, content_type)."""
     curl_args = [
         "curl",
         "-sS",
@@ -3231,7 +4484,12 @@ async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> t
         "12",
         "--connect-timeout",
         "4",
-        "-L",
+        # No redirect following: the initial URL is SSRF-validated upstream, and
+        # curl cannot re-validate a Location hop the way the httpx path does.
+        "--max-redirs",
+        "0",
+        "--proto",
+        "=http,https",
         "-D",
         "-",
     ]
@@ -3258,12 +4516,13 @@ async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> t
 
 
 def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
+    """Split curl's `-D -` output into (body, content_type), using the last header block to skip redirect/100-continue preambles."""
     header_end = raw_out.rfind(b"\r\n\r\n")
     separator_len = 4
     if header_end == -1:
         header_end = raw_out.rfind(b"\n\n")
         separator_len = 2
-    body = raw_out[header_end + separator_len:] if header_end != -1 else raw_out
+    body = raw_out[header_end + separator_len :] if header_end != -1 else raw_out
     header_block = raw_out[:header_end] if header_end != -1 else b""
     last_header_block = header_block.split(b"\r\n\r\n")[-1].split(b"\n\n")[-1]
     ct = ""
@@ -3274,7 +4533,6 @@ def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
     return body, ct
 
 
-
 _M3U8_URI_RE = re.compile(r'URI="([^"]+)"')
 
 
@@ -3283,6 +4541,7 @@ def _rewrite_m3u8(text: str, raw_url: str) -> str:
     from urllib.parse import urljoin
 
     def proxify(value: str) -> str:
+        """Resolve a playlist line/URI against the playlist URL and rewrite it to route through this proxy."""
         value = value.strip()
         if not value or value.startswith("#"):
             return value
@@ -3298,8 +4557,11 @@ def _rewrite_m3u8(text: str, raw_url: str) -> str:
         line = line.rstrip("\r")
         # Rewrite URI="..." attributes found in #EXT-X-KEY, #EXT-X-MAP, etc.
         if line.startswith("#") and "URI=" in line:
+
             def _sub_uri(m: re.Match) -> str:
+                """Rewrite a matched URI="..." attribute value through proxify."""
                 return f'URI="{proxify(m.group(1))}"'
+
             line = _M3U8_URI_RE.sub(_sub_uri, line)
             out_lines.append(line)
             continue
@@ -3318,6 +4580,7 @@ async def proxy_hls(request):
     No auth required; intended for client-side Source Changer playback.
     """
     from urllib.parse import unquote
+
     raw_url = unquote(request.query_params.get("url", "").strip())
     if not valid_stream_url(raw_url):
         return Response("bad url", status_code=400)
@@ -3330,6 +4593,10 @@ async def proxy_hls(request):
 
     if request.method == "OPTIONS":
         return Response("", headers=cors_headers)
+
+    if not await url_is_safe_public_async(raw_url):
+        logger.warning("proxy_hls blocked non-public target %s", raw_url)
+        return Response("forbidden host", status_code=403, headers=cors_headers)
 
     try:
         body, content_type = await _proxy_fetch(raw_url)
@@ -3360,6 +4627,7 @@ async def proxy_hls(request):
 
 
 async def source_hls(request):
+    """GET /api/source-hls/{source_id}: only 'server-1' is public — it maps to the managed ufc.m3u8 via hls_proxy; all others 404."""
     cors_headers = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors_headers)
@@ -3370,13 +4638,17 @@ async def source_hls(request):
             status_code=404,
             headers=cors_headers,
         )
+
     class _ServerOneRequest:
-        path_params = {"path": "ufc.m3u8"}
+        """Minimal request shim carrying the fixed ufc.m3u8 path param into hls_proxy."""
+
+        path_params: ClassVar[dict[str, str]] = {"path": "ufc.m3u8"}
 
     return await hls_proxy(_ServerOneRequest())
 
 
 async def public_configured_sources(request):
+    """GET /api/public-configured-sources (public, CORS): return the managed 'server-1' source with viewer counts."""
     cors = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors)
@@ -3386,6 +4658,7 @@ async def public_configured_sources(request):
 
 
 async def public_streams(request):
+    """GET /api/public-streams (public, CORS): return the enabled public source inventory as proxied playback entries."""
     cors = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors)
@@ -3395,6 +4668,7 @@ async def public_streams(request):
 
 
 async def public_news(request):
+    """GET /api/news (public, CORS): return the visible watcher news entries."""
     cors = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors)
@@ -3404,6 +4678,7 @@ async def public_news(request):
 
 
 async def upsert_news(request):
+    """POST /api/news (guarded): create or update a watcher news entry (merging onto an existing one by id) and persist it."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3444,6 +4719,7 @@ async def upsert_news(request):
 
 
 async def remove_news(request):
+    """POST /api/news/remove (guarded): delete a watcher news entry by id and persist."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3460,6 +4736,7 @@ async def remove_news(request):
 
 
 async def add_public_stream(request):
+    """POST /api/public-streams (guarded): add a viewer-facing public source (rejecting blacklisted URLs) and persist."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3468,6 +4745,8 @@ async def add_public_stream(request):
     url = str(body.get("url", "")).strip()
     if not valid_stream_url(url):
         return JSONResponse({"ok": False, "error": "url must be http(s)"}, status_code=400)
+    if is_blacklisted(url, config.get("source_blacklist")):
+        return JSONResponse({"ok": False, "error": "url is blacklisted; unblock it first"}, status_code=409)
     sources = normalize_public_sources(config.get("public_sources", []))
     if url not in {source.get("url") for source in sources}:
         sources.append(
@@ -3487,6 +4766,7 @@ async def add_public_stream(request):
 
 
 async def remove_public_stream(request):
+    """POST /api/public-streams/remove (guarded): delete a public source by id or url and persist."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3496,34 +4776,140 @@ async def remove_public_stream(request):
     url = str(body.get("url") or "").strip()
     sources = normalize_public_sources(config.get("public_sources", []))
     config["public_sources"] = [
-        source
-        for source in sources
-        if not ((source_id and source.get("id") == source_id) or (url and source.get("url") == url))
+        source for source in sources if not ((source_id and source.get("id") == source_id) or (url and source.get("url") == url))
     ]
     save_config(config)
     event("public source removed", "warn", {"id": source_id, "url": url})
     return JSONResponse({"ok": True, "sources": [proxied_public_source(source) for source in public_stream_inventory(config)]})
 
 
+# ---------------------------------------------------------------------------
+# Source blacklist: persistent per-source block that survives scraper cycles.
+# ---------------------------------------------------------------------------
+
+
+async def list_blacklist(request):
+    """Return the persisted source blacklist."""
+    config = load_config()
+    return JSONResponse({"ok": True, "blacklist": config.get("source_blacklist", [])})
+
+
+async def add_blacklist(request):
+    """Block a source by url/id/label/channel.
+
+    Persists the entry and immediately strips any now-matching source from
+    ``public_sources`` and ``stream.sources`` so it disappears from every list at
+    once. The scraper funnels then keep it from ever coming back.
+    """
+    config = load_config()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    url = str(body.get("url") or "").strip()
+    source_id = str(body.get("id") or "").strip()
+    label = str(body.get("label") or "").strip()
+    channel = str(body.get("channel") or "").strip()
+    if not (url or source_id or label or channel):
+        return JSONResponse({"ok": False, "error": "one of url/id/label/channel is required"}, status_code=400)
+    entry = {
+        "url": url,
+        "id": source_id,
+        "label": label,
+        "channel": channel,
+        "reason": str(body.get("reason") or "").strip(),
+        "added_at": now_ms(),
+    }
+    blacklist = normalize_blacklist([*config.get("source_blacklist", []), entry])
+    config["source_blacklist"] = blacklist
+    bl_index = blacklist_index(blacklist)
+    # Immediate removal from both live lists.
+    config["public_sources"] = [s for s in normalize_public_sources(config.get("public_sources", [])) if not is_blacklisted(s, bl_index)]
+    stream = config.setdefault("stream", {})
+    stream["sources"] = [
+        s for s in normalize_sources(stream.get("sources", []), stream.get("links", [])) if not is_blacklisted(s, bl_index)
+    ]
+    sync_links_from_sources(stream)
+    save_config(config)
+    event("source blacklisted", "warn", {"url": url, "id": source_id, "label": label, "channel": channel})
+    return JSONResponse({"ok": True, "blacklist": config["source_blacklist"]})
+
+
+async def remove_blacklist(request):
+    """Unblock a previously blacklisted source by url or id."""
+    config = load_config()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    url = str(body.get("url") or "").strip().lower()
+    source_id = str(body.get("id") or "").strip().lower()
+    if not (url or source_id):
+        return JSONResponse({"ok": False, "error": "url or id is required"}, status_code=400)
+    remaining = [
+        entry
+        for entry in normalize_blacklist(config.get("source_blacklist", []))
+        if not (
+            (url and str(entry.get("url", "")).strip().lower() == url)
+            or (source_id and str(entry.get("id", "")).strip().lower() == source_id)
+        )
+    ]
+    config["source_blacklist"] = remaining
+    save_config(config)
+    event("source un-blacklisted", "ok", {"url": url, "id": source_id})
+    return JSONResponse({"ok": True, "blacklist": config["source_blacklist"]})
+
+
+_LIVE_SNAPSHOT: dict[str, Any] = {"at": 0.0, "encoded": None}
+_LIVE_SNAPSHOT_LOCK = asyncio.Lock()
+_LIVE_SNAPSHOT_TTL = 2.5
+
+
+def _build_live_payload():
+    """Build the JSON-encoded public 'live' snapshot (HLS metrics, managed sources, viewers, news) shared across all SSE clients."""
+    config = load_config()
+    proc = process_metrics()
+    payload = {
+        "ok": True,
+        "server_time": now_ms(),
+        "hls": hls_metrics(config),
+        "sources": public_managed_sources(config, proc),
+        "viewers": viewer_counts_snapshot(),
+        "news": public_news_entries(config),
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+async def _live_payload_encoded():
+    """Return the live SSE payload from a shared snapshot, rebuilding it off-thread at most once per TTL (double-checked under a lock)."""
+    # Shared across ALL SSE viewers: compute the payload at most once per TTL and
+    # off the event loop, so thousands of /api/live connections cost the same as
+    # one instead of each rebuilding it (and formerly each /proc-scanning) per tick.
+    now = time.monotonic()
+    snap = _LIVE_SNAPSHOT
+    if snap["encoded"] is not None and (now - snap["at"]) < _LIVE_SNAPSHOT_TTL:
+        return snap["encoded"]
+    async with _LIVE_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        if snap["encoded"] is not None and (now - snap["at"]) < _LIVE_SNAPSHOT_TTL:
+            return snap["encoded"]
+        encoded = await asyncio.to_thread(_build_live_payload)
+        snap["encoded"] = encoded
+        snap["at"] = now
+        return encoded
+
+
 async def live_public_events(request):
+    """GET /api/live (public, CORS): Server-Sent Events stream that pushes the live snapshot every ~3s when it changes."""
     cors = public_cors_headers()
     if request.method == "OPTIONS":
         return Response("", headers=cors)
 
     async def stream():
+        """SSE generator: emit a status event whenever the shared live payload changes."""
         last_payload = None
         while True:
-            config = load_config()
-            proc = process_metrics()
-            payload = {
-                "ok": True,
-                "server_time": now_ms(),
-                "hls": hls_metrics(config),
-                "sources": public_managed_sources(config, proc),
-                "viewers": viewer_counts_snapshot(),
-                "news": public_news_entries(config),
-            }
-            encoded = json.dumps(payload, separators=(",", ":"))
+            encoded = await _live_payload_encoded()
             if encoded != last_payload:
                 yield f"event: status\ndata: {encoded}\n\n"
                 last_payload = encoded
@@ -3561,6 +4947,7 @@ async def scrape_streams(request):
 async def public_source(request):
     """Return the auto-scraped public stream sources as proxy URLs. No auth, CORS *."""
     from urllib.parse import quote as _quote
+
     cors = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -3568,18 +4955,22 @@ async def public_source(request):
     }
     if request.method == "OPTIONS":
         return Response("", headers=cors)
+    assert _AUTO_SOURCES_LOCK is not None  # initialised in lifespan before any request is served
     async with _AUTO_SOURCES_LOCK:
         sources = list(_AUTO_SOURCES)
         refreshed_at = _AUTO_SOURCES_AT
     proxy_urls = [f"/api/proxy-hls?url={_quote(s, safe='')}" for s in sources]
-    return JSONResponse({
-        "ok": True,
-        "sources": proxy_urls,
-        "raw": sources,
-        "count": len(proxy_urls),
-        "refreshed_at": refreshed_at,
-        "next_refresh_in": max(0, int(_AUTO_SCRAPE_INTERVAL - (time.time() - refreshed_at))),
-    }, headers=cors)
+    return JSONResponse(
+        {
+            "ok": True,
+            "sources": proxy_urls,
+            "raw": sources,
+            "count": len(proxy_urls),
+            "refreshed_at": refreshed_at,
+            "next_refresh_in": max(0, int(_AUTO_SCRAPE_INTERVAL - (time.time() - refreshed_at))),
+        },
+        headers=cors,
+    )
 
 
 async def activate_link(request):
@@ -3618,6 +5009,7 @@ async def activate_link(request):
 
 
 async def activate_source(request):
+    """POST /api/sources/activate (guarded): enable a source and move it to position #1, then hot-restart the encode onto it."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3627,7 +5019,9 @@ async def activate_source(request):
     url = str(body.get("url") or "").strip()
     stream = config.setdefault("stream", {})
     sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
-    match = next((source for source in sources if (source_id and source.get("id") == source_id) or (url and source.get("url") == url)), None)
+    match = next(
+        (source for source in sources if (source_id and source.get("id") == source_id) or (url and source.get("url") == url)), None
+    )
     if not match:
         return JSONResponse({"ok": False, "error": "source not found"}, status_code=404)
     match["enabled"] = True
@@ -3642,7 +5036,44 @@ async def activate_source(request):
     return JSONResponse({"ok": True, "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
 
 
+async def lock_source(request):
+    """Persistently pin one source first; unlock without disturbing playback."""
+    config = load_config()
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    stream = config.setdefault("stream", {})
+    source_id = str(body.get("id") or "").strip()
+    locked = bool(body.get("locked", True))
+    sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
+    match = next((source for source in sources if source.get("id") == source_id), None)
+    if locked and not match:
+        return JSONResponse({"ok": False, "error": "source not found"}, status_code=404)
+    previous_first = effective_stream_links(config)[:1]
+    stream["locked_source_id"] = source_id if locked else ""
+    if match:
+        match["enabled"] = True
+        stream["sources"] = normalize_sources([match, *[source for source in sources if source.get("id") != source_id]])
+        sync_links_from_sources(stream)
+    save_config(config)
+    new_first = effective_stream_links(config)[:1]
+    restarted = False
+    if locked and previous_first != new_first:
+        restarted = await restart_managed_with_config("operator locked a different source")
+    event("source locked" if locked else "source unlocked", "ok", {"id": source_id})
+    return JSONResponse(
+        {
+            "ok": True,
+            "locked_source_id": stream["locked_source_id"],
+            "restarted": restarted,
+            "sources": source_statuses(config, process_metrics()),
+        }
+    )
+
+
 async def recover_soursignal_source(request):
+    """POST /api/sources/recover-soursignal (guarded): re-scrape a soursignal source's page for a fresh HLS link, swap it in, and hot-restart."""
     config = load_config()
     try:
         body = await parse_json_body(request)
@@ -3672,10 +5103,18 @@ async def recover_soursignal_source(request):
     restarted = await restart_managed_with_config("sour signal source recovered")
     if restarted:
         event("running stream picked up recovered source", "ok")
-    return JSONResponse({"ok": True, "source": public_source_status(source, proc=process_metrics()), "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
+    return JSONResponse(
+        {
+            "ok": True,
+            "source": public_source_status(source, proc=process_metrics()),
+            "links": config["stream"]["links"],
+            "sources": source_statuses(config, process_metrics()),
+        }
+    )
 
 
 async def probe_configured_source(source, config=None, budget=None):
+    """Probe one configured source's reachability/playability and store the result (green/yellow/red) in SOURCE_HEALTH."""
     state = "unknown"
     message = ""
     url = source.get("url")
@@ -3693,7 +5132,9 @@ async def probe_configured_source(source, config=None, budget=None):
         else:
             deep = not is_private_soursignal_source(source, private_cfg)
             async with PRIVATE_PROBE_LOCK:
-                assessment = await assess_playback_candidate(url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url), deep=deep)
+                assessment = await assess_playback_candidate(
+                    url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url), deep=deep
+                )
             if assessment.get("ok"):
                 state = "green"
             elif assessment.get("score", 0) >= 20:
@@ -3712,6 +5153,7 @@ async def probe_configured_source(source, config=None, budget=None):
 
 
 async def source_health_loop():
+    """Background loop: every SOURCE_HEALTH_INTERVAL, probe each enabled configured source and refresh the probe budget."""
     while True:
         try:
             config = load_config()
@@ -3729,7 +5171,11 @@ async def source_health_loop():
         await asyncio.sleep(SOURCE_HEALTH_INTERVAL)
 
 
+# ---------------------------------------------------------------------------
+# Process supervisor — build/start/stop/restart the managed encode & watchdog.
+# ---------------------------------------------------------------------------
 async def read_process_output(proc):
+    """Background reader: stream the managed process's stdout into LOGS/ERRORS/EVENTS, classifying each line by level."""
     assert proc.stdout is not None
     while True:
         try:
@@ -3754,6 +5200,7 @@ async def read_process_output(proc):
 
 
 def build_command(config, links=None):
+    """Build the managed encode's argv from config (encoder, output dirs, bitrates, tuning flags, source manifest, and --links)."""
     stream = config.get("stream", {})
     links = normalize_links(links if links is not None else effective_stream_links(config))
     cmd = [stream.get("command", "/usr/bin/obbystreams"), "--no-color"]
@@ -3804,6 +5251,7 @@ def build_command(config, links=None):
 
 
 def terminate_process_tree(proc, timeout=5):
+    """SIGTERM the process group (escalating to SIGKILL after timeout); return True if a live process was signaled."""
     if not proc or proc.poll() is not None:
         return False
     with contextlib.suppress(ProcessLookupError):
@@ -3818,6 +5266,7 @@ def terminate_process_tree(proc, timeout=5):
 
 
 async def stop_managed_process(reason, kill_orphans=True):
+    """Terminate the managed encode (and its reader task), reset health/state, optionally kill orphan encodes; return whether anything was stopped."""
     global PROCESS, READER_TASK, STARTED_AT
     proc = PROCESS
     if not proc or proc.poll() is not None:
@@ -3847,7 +5296,11 @@ async def stop_managed_process(reason, kill_orphans=True):
 
 
 def start_managed_process(config, links, kill_existing=True):
-    global PROCESS, STARTED_AT, READER_TASK, STREAM_DESIRED_STATE
+    """Spawn the managed encode in its own session, wire up the stdout reader and health scorer; return (pid, cmd). Never touches operator-stop/desired-state.
+
+    Raises ValueError if no links, OSError if the process can't be launched.
+    """
+    global PROCESS, STARTED_AT, READER_TASK
     links = normalize_links(links if links is not None else effective_stream_links(config))
     if not links:
         raise ValueError("no links configured")
@@ -3863,7 +5316,10 @@ def start_managed_process(config, links, kill_existing=True):
         RUNTIME["start_failures"] += 1
         raise
     STARTED_AT = now_ms()
-    STREAM_DESIRED_STATE = "running"
+    # NOTE: intentionally does NOT touch STREAM_DESIRED_STATE / operator_stopped.
+    # Desired state is owned solely by the explicit start/stop/restart endpoints,
+    # so watchdog- and scraper-initiated starts can never silently re-arm a stream
+    # the operator has Stopped.
     STREAM_HEALTH_SCORER.reset(pid=PROCESS.pid, started_at=STARTED_AT)
     READER_TASK = asyncio.create_task(read_process_output(PROCESS))
     RUNTIME["stream_starts"] += 1
@@ -3872,6 +5328,7 @@ def start_managed_process(config, links, kill_existing=True):
 
 
 async def restart_managed_with_config(reason):
+    """If the managed encode is running, stop and restart it with freshly-loaded config/links (under PROCESS_LOCK); return whether it restarted."""
     global PROCESS
     async with PROCESS_LOCK:
         if not PROCESS or PROCESS.poll() is not None:
@@ -3890,13 +5347,164 @@ async def restart_managed_with_config(reason):
         return True
 
 
+# ---------------------------------------------------------------------------
+# UFC auto-schedule — bridge between the cockpit and the obbyschedule package.
+#
+# The scheduler never imports this module; it calls back in through the three
+# coroutines below. All of them take PROCESS_LOCK, which is what serialises them
+# against a human pressing Stop: whichever grabs the lock first wins, and the
+# loser sees the other's effect (suppression, or a cleared operator Stop).
+# ---------------------------------------------------------------------------
+async def suppress_current_schedule_event():
+    """Mark the event the scheduler is tracking as operator-vetoed.
+
+    Called from the Stop endpoint. The veto is scoped to the *current* card, so
+    the scheduler stays armed for the next one — Stop means "not this event",
+    not "never again". Returns the suppressed event id, if any.
+    """
+    if SCHEDULER is None:
+        return None
+    event_id = SCHEDULER.state.current_event_id
+    if not event_id:
+        return None
+    SCHEDULER.state.suppressed_event_id = event_id
+    SCHEDULER.state.started_by_scheduler = False
+    await SCHEDULER.persist()
+    return event_id
+
+
+async def clear_schedule_suppression():
+    """Lift any per-event veto — a manual Start hands control back to the scheduler."""
+    if SCHEDULER is None or SCHEDULER.state.suppressed_event_id is None:
+        return
+    SCHEDULER.state.suppressed_event_id = None
+    await SCHEDULER.persist()
+
+
+async def schedule_start_stream(reason):
+    """Arm the stream for a scheduled card. Returns True once the cockpit is armed.
+
+    "Armed" deliberately means *the operator Stop is lifted*, not "ffmpeg is up".
+    If no links are configured yet, clearing the Stop is what un-pauses the
+    private-IPTV scraper, which then discovers sources and auto-starts the
+    encode on its own. Reporting success here is what lets the scheduler take
+    ownership so it also performs the stand-down later.
+    """
+    global STREAM_DESIRED_STATE
+    if SCHEDULER is None:
+        return False
+    async with PROCESS_LOCK:
+        state = SCHEDULER.state
+        if state.current_event_id and state.suppressed_event_id == state.current_event_id:
+            event("auto-schedule start skipped: operator stopped this event", "warn")
+            return False
+        config = load_config(fresh=True)
+        set_operator_stopped(config, False)
+        if PROCESS and PROCESS.poll() is None:
+            event(f"auto-schedule armed ({reason}); stream already running", "ok")
+            return True
+        links = effective_stream_links(config)
+        if not links:
+            event(f"auto-schedule armed ({reason}); waiting on the scraper for sources", "warn")
+            return True
+        try:
+            start_managed_process(config, links, kill_existing=True)
+            STREAM_DESIRED_STATE = "running"
+        except (OSError, ValueError) as exc:
+            event(f"auto-schedule start failed: {exc}", "bad")
+            ERRORS.append({"ts": now_ms(), "level": "error", "line": f"auto-schedule start failed: {exc}"})
+            return False
+        event(f"auto-schedule started the stream ({reason})", "ok")
+        return True
+
+
+async def schedule_stop_stream(reason):
+    """Stand the stream down after a card, leaving it in scheduled standby."""
+    global STREAM_DESIRED_STATE, WATCHDOG_LAST_ACTION
+    async with PROCESS_LOCK:
+        STREAM_DESIRED_STATE = "stopped"
+        WATCHDOG_LAST_ACTION = time.monotonic()
+        set_operator_stopped(load_config(fresh=True), True, StopReason.SCHEDULE.value)
+        await stop_managed_process(f"stream stopped by auto-schedule: {reason}")
+        event(f"auto-schedule stood the stream down ({reason})", "ok")
+        return True
+
+
+async def schedule_force_source_refresh(reason):
+    """Kick a private-IPTV sweep during the pre-roll, when the spare slot is free."""
+    with contextlib.suppress(Exception):
+        await refresh_private_iptv_sources(reason=reason)
+
+
+def schedule_snapshot():
+    """Compact scheduler state for the status payload and ``GET /api/schedule``."""
+    if SCHEDULER is None:
+        return {"enabled": False, "phase": "idle", "action": "idle", "reason": "scheduler not running"}
+    return SCHEDULER.snapshot()
+
+
+async def get_schedule(request):
+    """GET /api/schedule (guarded): the auto-schedule state, tracked card, and countdown."""
+    return JSONResponse({"ok": True, "schedule": schedule_snapshot()})
+
+
+async def update_schedule(request):
+    """POST /api/schedule (guarded): toggle auto-schedule, or fire a test Discord embed."""
+    try:
+        body = await parse_json_body(request)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    if "enabled" in body:
+        config = load_config()
+        section = dict(config.get("schedule") or {})
+        section["enabled"] = bool(body.get("enabled"))
+        config["schedule"] = section
+        _reconcile_operator_stopped(config)
+        save_config(config)
+        event(f"auto-schedule {'enabled' if section['enabled'] else 'disabled'} by operator", "warn")
+        if SCHEDULER is not None:
+            SCHEDULER.reload_settings()
+
+    if body.get("coming_up"):
+        if SCHEDULER is None:
+            return JSONResponse({"ok": False, "error": "scheduler is not running"}, status_code=503)
+        if not SCHEDULER.notifier.active:
+            return JSONResponse({"ok": False, "error": "no Discord webhook configured"}, status_code=400)
+        upcoming = await SCHEDULER.load_upcoming_event()
+        if upcoming is None:
+            return JSONResponse({"ok": False, "error": "no upcoming UFC card on the ESPN calendar"}, status_code=404)
+        sent = await SCHEDULER.announce_coming_up(upcoming, force=True)
+        return JSONResponse({"ok": sent, "sent": sent, "event": upcoming.name, "schedule": schedule_snapshot()})
+
+    if body.get("test_notification"):
+        if SCHEDULER is None:
+            return JSONResponse({"ok": False, "error": "scheduler is not running"}, status_code=503)
+        await SCHEDULER.ensure_loaded()
+        SCHEDULER.reload_settings()
+        if not SCHEDULER.notifier.active:
+            return JSONResponse({"ok": False, "error": "no Discord webhook configured"}, status_code=400)
+        upcoming = SCHEDULER.next_after(SCHEDULER.state.calendar, datetime.now(UTC))
+        sent = await SCHEDULER.notifier.send_embed(SCHEDULER.notifier.builder.test(upcoming.label if upcoming else None))
+        return JSONResponse({"ok": sent, "sent": sent, "schedule": schedule_snapshot()})
+
+    return JSONResponse({"ok": True, "schedule": schedule_snapshot()})
+
+
 async def start_stream(request):
+    """POST /api/stream/start (guarded): clear the persisted operator Stop and start the managed encode (409 if already running)."""
     global PROCESS, STREAM_DESIRED_STATE
     try:
         body = await parse_json_body(request)
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     config = load_config()
+    # Clear the persisted operator Stop so this Start sticks and re-arms the
+    # watchdog + scrapers.
+    set_operator_stopped(config, False)
+    # A human taking manual control lifts any per-event suppression, so the
+    # scheduler is free to manage the *next* card normally.
+    await clear_schedule_suppression()
     raw_links = body.get("links")
     if raw_links is not None and not isinstance(raw_links, list):
         return JSONResponse({"ok": False, "error": "links must be an array"}, status_code=400)
@@ -3915,30 +5523,56 @@ async def start_stream(request):
 
 
 async def stop_stream(request):
+    """Persistent operator Stop: kills the managed ffmpeg AND pauses both scrapers.
+
+    Sets ``stream.operator_stopped`` in the config so the stop survives supervisor
+    ticks and full service/host restarts — the stream stays down until an explicit
+    Start/Restart.
+    """
     global STREAM_DESIRED_STATE, WATCHDOG_LAST_ACTION
     async with PROCESS_LOCK:
         STREAM_DESIRED_STATE = "stopped"
         WATCHDOG_LAST_ACTION = time.monotonic()
-        stopped = await stop_managed_process("stream stopped")
-        return JSONResponse({"ok": True, "stopped": stopped})
+        set_operator_stopped(load_config(), True, StopReason.MANUAL.value)
+        # Pressing Stop *during* a card means "not this one" — suppress only the
+        # event currently being tracked so the scheduler still arms the next one.
+        suppressed = await suppress_current_schedule_event()
+        stopped = await stop_managed_process("stream stopped by operator (persisted; scrapers paused)")
+        return JSONResponse(
+            {
+                "ok": True,
+                "stopped": stopped,
+                "operator_stopped": True,
+                "stop_reason": StopReason.MANUAL.value,
+                "suppressed_event_id": suppressed,
+            }
+        )
 
 
 async def restart_stream(request):
+    """Restart the managed stream, clearing any persisted operator Stop first."""
     global STREAM_DESIRED_STATE
     async with PROCESS_LOCK:
         STREAM_DESIRED_STATE = "running"
+        set_operator_stopped(load_config(), False)
+        await clear_schedule_suppression()
         if PROCESS and PROCESS.poll() is None:
             await stop_managed_process("stream stopped")
     return await start_stream(request)
 
 
 async def watchdog_loop():
+    """Background supervisor: every ~2s, auto-restart the managed encode if it exited or the health scorer confirms failure, honoring operator Stop and a cooldown."""
     global WATCHDOG_LAST_ACTION, PROCESS, STARTED_AT
     while True:
         try:
             await asyncio.sleep(2)
             config = load_config()
             stream = config.get("stream", {})
+            # Operator Stop is a hard idle: no auto-recovery of either the exited
+            # or the stalled branch until a human Starts the stream again.
+            if operator_stopped(config):
+                continue
             if not stream.get("auto_recover", True):
                 continue
             restart_cooldown = float(stream.get("watchdog_restart_cooldown", 20))
@@ -3991,7 +5625,11 @@ async def watchdog_loop():
             event(f"watchdog loop error: {exc}", "warn")
 
 
+# ---------------------------------------------------------------------------
+# Local HLS/DASH file server — serve or proxy the managed output to viewers.
+# ---------------------------------------------------------------------------
 def hls_content_type(path):
+    """Return the MIME type for an HLS/DASH path by extension (.mpd/.m3u8/.ts/.m4s/.mp4), else octet-stream."""
     if path.endswith(".mpd"):
         return "application/dash+xml"
     if path.endswith(".m3u8"):
@@ -4006,6 +5644,7 @@ def hls_content_type(path):
 
 
 def safe_hls_path(value):
+    """Sanitize a requested HLS path (default ufc.m3u8), rejecting empty or '..' traversal paths with None."""
     path = str(value or "ufc.m3u8").lstrip("/")
     if not path or ".." in Path(path).parts:
         return None
@@ -4013,6 +5652,7 @@ def safe_hls_path(value):
 
 
 def rewrite_playlist(text):
+    """Rewrite relative segment/playlist references in an m3u8 to absolute /hls/ paths (absolute URLs left unchanged)."""
     rewritten = []
     for line in text.splitlines():
         if line and not line.startswith("#") and not line.startswith(("http://", "https://")):
@@ -4023,11 +5663,12 @@ def rewrite_playlist(text):
 
 
 def hls_upstream_urls(config, path):
+    """Build the ordered list of remote fallback URLs (configured public DASH/HLS bases + fight.nswfiles.com) for a requested path."""
     stream = config.get("stream", {})
     public_dash_url = stream.get("public_dash_url", "")
     public_hls_url = stream.get("public_hls_url", "")
     candidates = []
-    if public_dash_url and (path.endswith(".mpd") or path.endswith((".m4s", ".mp4"))):
+    if public_dash_url and path.endswith((".mpd", ".m4s", ".mp4")):
         remote_base = public_dash_url.rsplit("/", 1)[0]
         candidates.append(public_dash_url if path.endswith(".mpd") else f"{remote_base}/{path}")
     if public_hls_url:
@@ -4040,6 +5681,7 @@ def hls_upstream_urls(config, path):
 
 
 async def hls_proxy(request):
+    """GET /hls/{path}: serve the managed encode's local HLS/DASH file (rewriting playlists), falling back to remote upstreams when absent."""
     path = safe_hls_path(request.path_params.get("path", "ufc.m3u8"))
     if not path:
         return JSONResponse({"ok": False, "error": "bad hls path"}, status_code=400)
@@ -4116,19 +5758,44 @@ async def hls_proxy(request):
 
 
 async def index(request):
+    """GET /: serve the cockpit SPA index.html."""
     return FileResponse(STATIC_DIR / "index.html")
 
 
 def static_asset(name, media_type=None):
+    """Return a route handler that serves the named file from STATIC_DIR with an optional media type."""
+
     async def handler(request):
+        """Serve the bound static asset file."""
         return FileResponse(STATIC_DIR / name, media_type=media_type)
 
     return handler
 
 
+# ---------------------------------------------------------------------------
+# App lifespan & routes — start/stop background tasks and wire up the ASGI app.
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app):
-    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK
+    """ASGI lifespan: honor a persisted operator Stop, init the shared HTTP client and Arango queue, launch all background loops, and tear them down (stopping the encode) on shutdown."""
+    global \
+        WATCHDOG_TASK, \
+        ARANGO_QUEUE, \
+        ARANGO_WORKER_TASK, \
+        _AUTO_SCRAPE_TASK, \
+        _AUTO_SOURCES_LOCK, \
+        _HTTPX_CLIENT, \
+        SOURCE_HEALTH_TASK, \
+        PRIVATE_IPTV_TASK, \
+        STREAM_DESIRED_STATE, \
+        SCHEDULER, \
+        SCHEDULE_TASK
+    # Honor a persisted operator Stop across restarts: keep the stream down and
+    # both scrapers idle until a human Starts it. The watchdog + scraper loops all
+    # re-check operator_stopped, so this only needs to seed the desired-state.
+    if operator_stopped(load_config()):
+        STREAM_DESIRED_STATE = "stopped"
+        event("boot: operator Stop is in effect; stream + scrapers idle until Start", "warn")
     _AUTO_SOURCES_LOCK = asyncio.Lock()
     ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
     _HTTPX_CLIENT = httpx.AsyncClient(
@@ -4143,7 +5810,21 @@ async def lifespan(app):
     SOURCE_HEALTH_TASK = asyncio.create_task(source_health_loop())
     PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
 
+    # UFC auto-schedule. It shares the httpx pool above and reaches back into the
+    # cockpit only through the injected coroutines, so this module stays the only
+    # place that knows about PROCESS_LOCK and the operator Stop switch.
+    SCHEDULER = UfcScheduler(
+        client=_HTTPX_CLIENT,
+        load_config=lambda: load_config(),
+        start_stream=schedule_start_stream,
+        stop_stream=schedule_stop_stream,
+        refresh_sources=schedule_force_source_refresh,
+        event_log=event,
+    )
+    SCHEDULE_TASK = asyncio.create_task(SCHEDULER.run(lambda: bool(PROCESS and PROCESS.poll() is None)))
+
     async def _proxy_cache_cleanup_loop():
+        """Background loop: prune the proxy cache every 60s."""
         while True:
             await asyncio.sleep(60)
             try:
@@ -4153,16 +5834,35 @@ async def lifespan(app):
 
     _PROXY_CACHE_TASK = asyncio.create_task(_proxy_cache_cleanup_loop())
 
+    # Viewer highscores: load persisted stats and flush periodically.
+    load_viewer_stats()
+
+    async def _viewer_stats_flush_loop():
+        """Background loop: persist viewer stats to disk every 30s."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await flush_viewer_stats()
+            except Exception as exc:
+                logger.warning("viewer stats flush error: %s", exc)
+
+    _VIEWER_STATS_TASK = asyncio.create_task(_viewer_stats_flush_loop())
+
     # Kick off first scrape immediately in the background, then loop
     async def _scrape_then_loop():
-        sources = await _run_auto_scrape()
+        """Run one immediate public scrape at boot (unless operator-stopped), then hand off to the periodic auto-scrape loop."""
         global _AUTO_SOURCES, _AUTO_SOURCES_AT
-        if sources:
-            async with _AUTO_SOURCES_LOCK:
-                _AUTO_SOURCES = sources
-                _AUTO_SOURCES_AT = time.time()
-            logger.info("initial auto scrape: %d source(s)", len(sources))
+        # Skip the immediate kick-off scrape while an operator Stop is in effect;
+        # the loop itself also re-checks each tick.
+        if not operator_stopped(load_config()):
+            sources = await _run_auto_scrape()
+            if sources:
+                async with _AUTO_SOURCES_LOCK:
+                    _AUTO_SOURCES = sources
+                    _AUTO_SOURCES_AT = time.time()
+                logger.info("initial auto scrape: %d source(s)", len(sources))
         await _auto_scrape_loop()
+
     _AUTO_SCRAPE_TASK = asyncio.create_task(_scrape_then_loop())
     try:
         yield
@@ -4183,10 +5883,18 @@ async def lifespan(app):
             PRIVATE_IPTV_TASK.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await PRIVATE_IPTV_TASK
+        if SCHEDULE_TASK:
+            SCHEDULE_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await SCHEDULE_TASK
         if _PROXY_CACHE_TASK:
             _PROXY_CACHE_TASK.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await _PROXY_CACHE_TASK
+        if _VIEWER_STATS_TASK:
+            _VIEWER_STATS_TASK.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _VIEWER_STATS_TASK
         async with PROCESS_LOCK:
             await stop_managed_process("stream stopped during shutdown")
         if ARANGO_WORKER_TASK:
@@ -4211,9 +5919,11 @@ routes = [
     Route("/api/status", guarded(status)),
     Route("/api/sources", guarded(list_sources), methods=["GET"]),
     Route("/api/sources/activate", guarded(activate_source), methods=["POST"]),
+    Route("/api/sources/lock", guarded(lock_source), methods=["POST"]),
     Route("/api/sources/recover-soursignal", guarded(recover_soursignal_source), methods=["POST"]),
     Route("/api/private-iptv", guarded(private_iptv_status), methods=["GET"]),
     Route("/api/private-iptv/refresh", guarded(private_iptv_refresh), methods=["POST"]),
+    Route("/api/private-iptv/control", guarded(private_iptv_control), methods=["POST"]),
     Route("/api/config", guarded(get_config), methods=["GET"]),
     Route("/api/config", guarded(put_config), methods=["PUT"]),
     Route("/api/links", guarded(add_link), methods=["POST"]),
@@ -4224,17 +5934,23 @@ routes = [
     Route("/api/public-streams", public_streams, methods=["GET", "OPTIONS"]),
     Route("/api/public-streams", guarded(add_public_stream), methods=["POST"]),
     Route("/api/public-streams/remove", guarded(remove_public_stream), methods=["POST"]),
+    Route("/api/blacklist", guarded(list_blacklist), methods=["GET"]),
+    Route("/api/blacklist", guarded(add_blacklist), methods=["POST"]),
+    Route("/api/blacklist/remove", guarded(remove_blacklist), methods=["POST"]),
     Route("/api/news", public_news, methods=["GET", "OPTIONS"]),
     Route("/api/news", guarded(upsert_news), methods=["POST"]),
     Route("/api/news/remove", guarded(remove_news), methods=["POST"]),
     Route("/api/public-configured-sources", public_configured_sources, methods=["GET", "OPTIONS"]),
     Route("/api/live", live_public_events, methods=["GET", "OPTIONS"]),
     Route("/api/viewers", viewer_counts, methods=["GET", "POST", "OPTIONS"]),
+    Route("/api/highscores", viewer_highscores, methods=["GET", "OPTIONS"]),
     Route("/api/proxy-hls", proxy_hls, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/api/source-hls/{source_id}", source_hls, methods=["GET", "HEAD", "OPTIONS"]),
     Route("/api/stream/start", guarded(start_stream), methods=["POST"]),
     Route("/api/stream/stop", guarded(stop_stream), methods=["POST"]),
     Route("/api/stream/restart", guarded(restart_stream), methods=["POST"]),
+    Route("/api/schedule", guarded(get_schedule), methods=["GET"]),
+    Route("/api/schedule", guarded(update_schedule), methods=["POST"]),
     Route("/api/arango", guarded(arango_status)),
     Route("/api/nvidia-smi", guarded(nvidia_smi_status)),
     Route("/hls/{path:path}", hls_proxy),

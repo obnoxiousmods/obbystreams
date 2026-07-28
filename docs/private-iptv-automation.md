@@ -27,6 +27,12 @@ The provider playlist contains many channels and event rows. On UFC/fight days, 
 
 ## Flow
 
+> The loop is paused entirely while an operator Stop is in effect
+> (`stream.operator_stopped`) — it neither refreshes sources nor auto-starts
+> ffmpeg. Blacklisted rows (`source_blacklist`) are dropped before scoring/probe
+> and never written into `stream.sources`. See
+> [Persistent Stop &amp; Source Blacklist](blacklist-and-stop.md).
+
 1. Fetch provider HTML when needed.
 2. Extract the download link with `m3uDownloadBtn` or use configured `playlist_url`.
 3. Fetch and parse the M3U playlist into `title`, attributes, and URL.

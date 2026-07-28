@@ -1,11 +1,24 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import videojs from "video.js";
 import type Player from "video.js/dist/types/player";
 import { api, isUnauthorized } from "./api";
 import { absoluteUrl, encoderLabel, errorMessage, fmtAge, fmtBytes, fmtClock, fmtMetric, fmtPercent, toneFromLevel } from "./format";
+import { blacklistKey, blacklistPrimaryLabel, blockPayload, isOperatorStopped } from "./lib/blacklist";
+import {
+  cardProgress,
+  formatCardTime,
+  formatCountdown,
+  phaseLabel,
+  phaseTone,
+  scheduleOf,
+  standbyBannerText,
+  standbyMode,
+  upcomingLabel,
+} from "./lib/schedule";
 import type {
   ArangoStatus,
+  BlacklistEntry,
   ChildProcess,
   ExternalProcess,
   FeedEvent,
@@ -18,10 +31,10 @@ import type {
   ManagedProcess,
   PrivateIptvRuntime,
   PublicStreamSource,
+  ScheduleSnapshot,
   SourceStatus,
   StatusPayload,
   Tone,
-  WatcherNewsEntry,
 } from "./types";
 
 type EncoderMode = "auto" | "gpu-only" | "cpu";
@@ -412,9 +425,21 @@ function StatusStrip({
   const healthTone = toneFromLevel(health.level || health.state);
   const gpuTone: Tone = gpu?.available ? toneFromLevel(gpu.level || "ok") : gpu ? "bad" : "neutral";
   const arangoTone: Tone = arango?.connected ? "ok" : arango ? "bad" : "neutral";
+  const hls = status?.hls || {};
+  const rate = typeof hls.encode_rate === "number" ? hls.encode_rate : null;
+  const lag = typeof hls.live_lag_seconds === "number" ? hls.live_lag_seconds : null;
+  const rateTone: Tone = rate == null ? "neutral" : rate >= 0.98 ? "ok" : rate >= 0.9 ? "warn" : "bad";
 
   return (
     <section className="statusStrip" aria-label="stream status">
+      <div className={`rateBadge rate-${rateTone}`} title="Real-time encode rate: output content-seconds vs wall-clock. 1.00× = keeping up.">
+        <span className="rateDot" aria-hidden="true" />
+        <span className="rateValue">{rate == null ? "—" : `${rate.toFixed(2)}×`}</span>
+        <span className="rateMeta">
+          <span className="rateName">encode rate</span>
+          <span className="rateLag">{lag == null ? "no output" : `${lag.toFixed(1)}s behind live`}</span>
+        </span>
+      </div>
       <MetricTile label="Run" value={runText} tone={runTone} />
       <MetricTile label="Health" value={`${health.level || "warn"}: ${health.state || "unknown"}`} tone={healthTone} />
       <MetricTile label="Encoder" value={stream.encoder || "auto"} />
@@ -425,14 +450,100 @@ function StatusStrip({
   );
 }
 
-function CommandHeader({
+/**
+ * Auto-schedule status: which card is next, when each segment starts, and how
+ * far through it the cockpit is. Also hosts the "send a test embed" button so
+ * the Discord webhook can be verified without waiting for a real event.
+ */
+export function SchedulePanel({
+  schedule,
+  pending,
+  onTest,
+  onComingUp,
+}: {
+  schedule: ScheduleSnapshot | null | undefined;
+  pending: boolean;
+  onTest: () => Promise<void>;
+  onComingUp: () => Promise<void>;
+}) {
+  if (!schedule) return null;
+
+  const label = upcomingLabel(schedule);
+  const event = schedule.event;
+  const countdown = formatCountdown(schedule.countdown_seconds);
+
+  return (
+    <Panel
+      title="Auto-schedule"
+      className="schedulePanel"
+      meta={
+        <>
+          <Badge tone={schedule.enabled ? phaseTone(schedule.phase) : "neutral"}>
+            {schedule.enabled ? phaseLabel(schedule.phase) : "Off"}
+          </Badge>
+          <button type="button" className="secondary compactButton" disabled={pending || !schedule.notify_enabled} onClick={() => void onComingUp()}>
+            {pending ? "Sending" : "Post “Coming up”"}
+          </button>
+          <button type="button" className="secondary compactButton" disabled={pending || !schedule.notify_enabled} onClick={() => void onTest()}>
+            {pending ? "Sending" : "Test Discord"}
+          </button>
+        </>
+      }
+    >
+      {!schedule.enabled && <p className="muted">Auto-schedule is off — Stop keeps the stream down until you press Start.</p>}
+
+      {schedule.enabled && !label && <p className="muted">No upcoming UFC card on the ESPN calendar yet.</p>}
+
+      {schedule.enabled && label && (
+        <div className="scheduleBody">
+          <p className="scheduleEventName">{label}</p>
+          <p className="scheduleCountdown">
+            <strong>{countdown}</strong>
+            <span className="muted">{schedule.countdown_is_estimate ? " until scheduled start" : " until first card"}</span>
+          </p>
+          {event?.venue && (
+            <p className="muted monoLine">
+              {event.venue}
+              {event.city ? ` · ${event.city}` : ""}
+            </p>
+          )}
+          {event?.cards?.length ? (
+            <ul className="scheduleCards">
+              {event.cards.map((card) => (
+                <li key={card.start} className={card.all_final ? "cardDone" : undefined}>
+                  <span className="cardLabel">{card.label}</span>
+                  <span className="cardTime">{formatCardTime(card.start)}</span>
+                  <span className="cardBouts muted">{cardProgress(card.completed, card.bouts)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {event?.winner && (
+            <p className="scheduleResult">
+              🏆 {event.winner} — main event
+            </p>
+          )}
+          <p className="muted scheduleReason">
+            {schedule.reason}
+            {schedule.notifications_sent ? ` · ${schedule.notifications_sent} Discord notice(s) sent` : ""}
+            {schedule.notify_enabled ? "" : " · Discord webhook not configured"}
+          </p>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+export function CommandHeader({
   status,
   pendingAction,
   onStreamAction,
+  onToggleSchedule,
 }: {
   status: StatusPayload | null;
   pendingAction: string;
   onStreamAction: (action: "start" | "restart" | "stop") => Promise<void>;
+  onToggleSchedule?: (enabled: boolean) => Promise<void>;
 }) {
   const proc = status?.managed_process || {};
   const externalProcessCount = status?.existing_processes?.length || 0;
@@ -440,6 +551,12 @@ function CommandHeader({
   const busy = Boolean(pendingAction);
   const canStop = Boolean(proc.managed) || externalProcessCount > 0;
   const hlsUrl = hls.public_hls_url || hls.dashboard_hls_url || "Waiting for HLS output";
+  // Persisted operator Stop: reflected from either the config flag or the runtime mirror.
+  const operatorStopped = isOperatorStopped(status);
+  const schedule = scheduleOf(status);
+  // With auto-schedule on, Stop parks the cockpit rather than killing it, so the
+  // banner has to say "standby" instead of claiming the stream is down for good.
+  const mode = standbyMode(status, operatorStopped);
 
   return (
     <header className="commandHeader">
@@ -447,10 +564,36 @@ function CommandHeader({
         <p className="kicker">Obbystreams</p>
         <h1>Stream Control Center</h1>
         <p className="monoLine">{hlsUrl}</p>
+        {mode === "standby" && (
+          <p className="standbyBanner" role="status">
+            {standbyBannerText(schedule)}
+          </p>
+        )}
+        {mode === "stopped" && (
+          <p className="stoppedBanner" role="status">
+            ⏹ STOPPED (manual) — auto-recovery &amp; scrapers paused. Press Start to resume.
+          </p>
+        )}
       </div>
       <div className="commandActions">
-        <button type="button" disabled={busy || Boolean(proc.managed)} onClick={() => onStreamAction("start")}>
-          {pendingAction === "start" ? "Starting" : "Start"}
+        {onToggleSchedule && (
+          <label className="scheduleToggle" title="Auto-start for UFC cards and stand down when they end">
+            <input
+              type="checkbox"
+              checked={Boolean(schedule?.enabled)}
+              disabled={busy}
+              onChange={(evt) => void onToggleSchedule(evt.target.checked)}
+            />
+            <span>Auto-schedule</span>
+          </label>
+        )}
+        <button
+          type="button"
+          className={operatorStopped ? "resumeButton" : undefined}
+          disabled={busy || Boolean(proc.managed)}
+          onClick={() => onStreamAction("start")}
+        >
+          {pendingAction === "start" ? "Starting" : operatorStopped ? "Resume" : "Start"}
         </button>
         <button type="button" className="secondary" disabled={busy} onClick={() => onStreamAction("restart")}>
           {pendingAction === "restart" ? "Restarting" : "Restart"}
@@ -1227,20 +1370,24 @@ function GpuProcessLine({ proc }: { proc: GpuProcess }) {
   );
 }
 
-function SourcesPanel({
+export function SourcesPanel({
   sources,
   pending,
   onAdd,
   onRemove,
   onActivate,
+  onLock,
   onRecover,
+  onBlock,
 }: {
   sources: SourceStatus[];
   pending: boolean;
   onAdd: (url: string) => Promise<void>;
   onRemove: (url: string) => Promise<void>;
   onActivate: (source: SourceStatus) => Promise<void>;
+  onLock: (source: SourceStatus, locked: boolean) => Promise<void>;
   onRecover: (source: SourceStatus) => Promise<void>;
+  onBlock: (source: SourceStatus) => Promise<void>;
 }) {
   const [newLink, setNewLink] = useState("");
 
@@ -1275,6 +1422,7 @@ function SourcesPanel({
                 <strong>{source.label || `Source ${index + 1}`}</strong>
                 <div className="sourceBadges">
                   <Badge tone={source.preferred ? "ok" : "neutral"}>{source.preferred ? "Preferred" : "Fallback"}</Badge>
+                  {source.locked && <Badge tone="ok">Locked</Badge>}
                   <Badge tone={source.health === "red" ? "bad" : source.health === "yellow" ? "warn" : source.health === "green" ? "ok" : "neutral"}>{source.health || "unknown"}</Badge>
                   <Badge>{source.type || "hls"}</Badge>
                   <Badge>{source.viewer_count || 0} watching</Badge>
@@ -1289,11 +1437,17 @@ function SourcesPanel({
                 <button type="button" className="compactButton streamNow" disabled={pending || source.preferred} onClick={() => onActivate(source)}>
                   {source.preferred ? "Active" : "Switch"}
                 </button>
+                <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onLock(source, !source.locked)}>
+                  {source.locked ? "Unlock" : "Lock"}
+                </button>
                 {recoverable && (
                   <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onRecover(source)}>
                     Recover
                   </button>
                 )}
+                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onBlock(source)} title="Blacklist this source so it never reappears">
+                  Block
+                </button>
                 <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(url)}>
                   Remove
                 </button>
@@ -1313,10 +1467,12 @@ function PrivateIptvPanel({
   runtime,
   pending,
   onRefresh,
+  onControl,
 }: {
   runtime?: PrivateIptvRuntime;
   pending: boolean;
-  onRefresh: (forceProbe?: boolean) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  onControl: (action: "pause" | "resume" | "stop" | "restart") => Promise<void>;
 }) {
   const state = runtime?.state || "idle";
   const tone: Tone = state === "active" ? "ok" : state === "error" ? "bad" : state === "inactive" ? "warn" : "neutral";
@@ -1330,26 +1486,19 @@ function PrivateIptvPanel({
         <span>{accepted}/{candidates} accepted</span>
         <span>{entries} entries</span>
         <span>Checked {fmtClock(runtime?.last_checked_at)}</span>
-        <span>Private slots {runtime?.stream_uses_private_slot ? "1" : "0"}/{runtime?.connection_limit ?? 2}</span>
-        <span>Probe {runtime?.probe_allowed ? "ready" : "reserved"}</span>
       </div>
       <p className="panelMessage">{runtime?.message || "Waiting for private IPTV automation."}</p>
-      {runtime?.probe_skipped_reason ? (
-        <p className="sourceMeta">Probe budget: {runtime.probe_skipped_reason}</p>
-      ) : null}
-      {runtime?.last_probe_mode ? (
-        <p className="sourceMeta">Last probe mode: {runtime.last_probe_mode}</p>
-      ) : null}
       {runtime?.active_source_ids?.length ? (
         <p className="sourceMeta">Active {runtime.active_source_ids.join(", ")}</p>
       ) : null}
       <div className="linkActions">
-        <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => onRefresh(false)}>
-          {pending ? "Refreshing..." : "Refresh"}
+        <button type="button" className="compactButton streamNow" disabled={pending} onClick={onRefresh}>
+          {pending ? "Working..." : "Safe Refresh"}
         </button>
-        <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onRefresh(true)}>
-          Force deep probe
-        </button>
+        <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onControl("pause")}>Pause</button>
+        <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onControl("resume")}>Resume</button>
+        <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onControl("restart")}>Restart Automation</button>
+        <button type="button" className="danger compactButton" disabled={pending} onClick={() => onControl("stop")}>Stop Automation</button>
       </div>
       {runtime?.reasons?.length ? (
         <div className="linksList automationEvidence">
@@ -1371,18 +1520,20 @@ function PrivateIptvPanel({
   );
 }
 
-function PublicStreamsPanel({
+export function PublicStreamsPanel({
   sources,
   pending,
   onAdd,
   onRemove,
   onScrape,
+  onBlock,
 }: {
   sources: PublicStreamSource[];
   pending: boolean;
   onAdd: (url: string, label?: string) => Promise<void>;
   onRemove: (source: PublicStreamSource) => Promise<void>;
   onScrape: (url: string) => Promise<{ count: number }>;
+  onBlock: (source: PublicStreamSource) => Promise<void>;
 }) {
   const [url, setUrl] = useState("");
   const [label, setLabel] = useState("");
@@ -1458,6 +1609,9 @@ function PublicStreamsPanel({
                 <a className="buttonLink compactButton" href={source.playback_url || source.url} target="_blank" rel="noreferrer">
                   Test
                 </a>
+                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onBlock(source)} title="Blacklist this source so it never reappears">
+                  Block
+                </button>
                 <button type="button" className="danger compactButton" disabled={pending || source.read_only} onClick={() => onRemove(source)}>
                   Remove
                 </button>
@@ -1472,138 +1626,41 @@ function PublicStreamsPanel({
   );
 }
 
-function WatcherNewsPanel({
+export function BlacklistPanel({
   entries,
   pending,
-  onSave,
-  onRemove,
+  onUnblock,
 }: {
-  entries: WatcherNewsEntry[];
+  entries: BlacklistEntry[];
   pending: boolean;
-  onSave: (entry: WatcherNewsEntry) => Promise<void>;
-  onRemove: (entry: WatcherNewsEntry) => Promise<void>;
+  onUnblock: (entry: BlacklistEntry) => Promise<void>;
 }) {
-  const emptyDraft: WatcherNewsEntry = {
-    title: "",
-    body: "",
-    tone: "info",
-    visible: true,
-    pinned: false,
-    link_url: "",
-    link_label: "",
-  };
-  const [draft, setDraft] = useState<WatcherNewsEntry>(emptyDraft);
-  const editing = Boolean(draft.id);
-
-  function updateDraft(patch: Partial<WatcherNewsEntry>) {
-    setDraft((current) => ({ ...current, ...patch }));
-  }
-
-  function edit(entry: WatcherNewsEntry) {
-    setDraft({
-      id: entry.id,
-      title: entry.title || "",
-      body: entry.body || "",
-      tone: entry.tone || "info",
-      visible: entry.visible !== false,
-      pinned: Boolean(entry.pinned),
-      link_url: entry.link_url || "",
-      link_label: entry.link_label || "",
-    });
-  }
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    if (!String(draft.title || "").trim() && !String(draft.body || "").trim()) return;
-    await onSave(draft);
-    setDraft(emptyDraft);
-  }
-
   return (
-    <Panel title="Watcher News" meta={<Badge>{entries.filter((entry) => entry.visible !== false).length} visible</Badge>} className="linksPanel watcherNewsPanel">
-      <form className="newsForm" onSubmit={submit}>
-        <input
-          value={draft.title || ""}
-          onChange={(event) => updateDraft({ title: event.target.value })}
-          placeholder="Headline"
-          maxLength={140}
-        />
-        <textarea
-          value={draft.body || ""}
-          onChange={(event) => updateDraft({ body: event.target.value })}
-          placeholder="Message shown on fight.nswfiles.com"
-          rows={4}
-          maxLength={4000}
-        />
-        <div className="newsOptions">
-          <select value={draft.tone || "info"} onChange={(event) => updateDraft({ tone: event.target.value })}>
-            <option value="info">Info</option>
-            <option value="ok">Good</option>
-            <option value="warn">Warning</option>
-            <option value="bad">Urgent</option>
-            <option value="neutral">Neutral</option>
-          </select>
-          <label>
-            <input type="checkbox" checked={draft.visible !== false} onChange={(event) => updateDraft({ visible: event.target.checked })} />
-            Visible
-          </label>
-          <label>
-            <input type="checkbox" checked={Boolean(draft.pinned)} onChange={(event) => updateDraft({ pinned: event.target.checked })} />
-            Pinned
-          </label>
-        </div>
-        <div className="newsLinkRow">
-          <input
-            value={draft.link_label || ""}
-            onChange={(event) => updateDraft({ link_label: event.target.value })}
-            placeholder="Link label"
-            maxLength={80}
-          />
-          <input
-            value={draft.link_url || ""}
-            onChange={(event) => updateDraft({ link_url: event.target.value })}
-            type="url"
-            placeholder="https://optional-link.example"
-          />
-        </div>
-        <div className="linkActions newsFormActions">
-          <button type="submit" className="streamNow" disabled={pending || (!String(draft.title || "").trim() && !String(draft.body || "").trim())}>
-            {pending ? "Saving..." : editing ? "Update news" : "Publish news"}
-          </button>
-          {editing ? (
-            <button type="button" className="secondary compactButton" disabled={pending} onClick={() => setDraft(emptyDraft)}>
-              Cancel edit
-            </button>
-          ) : null}
-        </div>
-      </form>
-
-      <div className="linksList newsList">
+    <Panel title="Blacklist" meta={<Badge tone={entries.length ? "warn" : "neutral"}>{entries.length} blocked</Badge>} className="linksPanel">
+      <p className="panelHint">Blocked sources never reappear from scraping and are hidden from viewers until unblocked.</p>
+      <div className="linksList">
         {entries.length ? (
-          entries.map((entry) => (
-            <div className="linkItem sourceItem newsItem" key={entry.id}>
-              <div className="linkTop">
-                <strong>{entry.title || "Untitled update"}</strong>
-                <div className="sourceBadges">
-                  <Badge tone={(entry.tone as Tone) || "info"}>{entry.tone || "info"}</Badge>
-                  <Badge tone={entry.visible === false ? "warn" : "ok"}>{entry.visible === false ? "hidden" : "visible"}</Badge>
-                  {entry.pinned ? <Badge>pinned</Badge> : null}
+          entries.map((entry, index) => {
+            const primary = blacklistPrimaryLabel(entry, index);
+            const key = blacklistKey(entry, index);
+            return (
+              <div className="linkItem sourceItem" key={key}>
+                <div className="linkTop">
+                  <strong>{primary}</strong>
+                  {entry.reason && <Badge tone="neutral">{entry.reason}</Badge>}
+                </div>
+                {entry.url && <p>{entry.url}</p>}
+                {entry.channel && entry.channel !== primary && <p className="sourceMeta">Channel {entry.channel}</p>}
+                <div className="linkActions">
+                  <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => onUnblock(entry)}>
+                    Unblock
+                  </button>
                 </div>
               </div>
-              {entry.body ? <p className="newsBody">{entry.body}</p> : null}
-              {entry.link_url ? <p className="sourceMeta">{entry.link_label || "Open"} {entry.link_url}</p> : null}
-              <div className="linkActions">
-                <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => edit(entry)}>
-                  Edit
-                </button>
-                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(entry)}>
-                  Remove
-                </button>
-              </div>
-            </div>
-          ))
+            );
+          })
         ) : (
-          <EmptyLine>No watcher news configured.</EmptyLine>
+          <EmptyLine>No blacklisted sources.</EmptyLine>
         )}
       </div>
     </Panel>
@@ -1702,14 +1759,16 @@ export default function App() {
   const [pendingEncoder, setPendingEncoder] = useState(false);
   const [pendingLinks, setPendingLinks] = useState(false);
   const [pendingPrivateIptv, setPendingPrivateIptv] = useState(false);
-  const [pendingNews, setPendingNews] = useState(false);
+  const [pendingSchedule, setPendingSchedule] = useState(false);
   const [sourceOverride, setSourceOverride] = useState<string | null>(null);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceMsg, setSourceMsg] = useState<string | null>(null);
   const authenticated = !locked;
-  const configuredSources = useMemo<SourceStatus[]>(() => (status?.sources || status?.config.stream?.sources || []) as SourceStatus[], [status?.config.stream?.sources, status?.sources]);
-  const publicStreams = useMemo<PublicStreamSource[]>(() => status?.config.public_sources || [], [status?.config.public_sources]);
-  const watcherNews = useMemo<WatcherNewsEntry[]>(() => status?.config.watcher_news || [], [status?.config.watcher_news]);
+  // Plain derived values: the React Compiler memoizes these; manual useMemo here
+  // tripped react-hooks/preserve-manual-memoization on the mixed source/config deps.
+  const configuredSources = (status?.sources || status?.config.stream?.sources || []) as SourceStatus[];
+  const publicStreams = status?.config.public_sources || [];
+  const blacklist = status?.config.source_blacklist || [];
 
   const logout = useCallback(() => {
     setLocked(true);
@@ -1890,6 +1949,19 @@ export default function App() {
     }
   }
 
+  async function lockSource(source: SourceStatus, locked: boolean) {
+    setPendingLinks(true);
+    try {
+      await api("/api/sources/lock", { method: "POST", body: JSON.stringify({ id: source.id, locked }) });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`lock error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
   async function addPublicStream(url: string, label?: string) {
     setPendingLinks(true);
     try {
@@ -1917,6 +1989,38 @@ export default function App() {
     } catch (err) {
       if (isUnauthorized(err)) logout();
       setSessionState(`public source error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
+  async function blockSource(source: { url?: string; id?: string; label?: string }) {
+    setPendingLinks(true);
+    try {
+      await api("/api/blacklist", {
+        method: "POST",
+        body: JSON.stringify(blockPayload(source)),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`blacklist error: ${errorMessage(err)}`);
+    } finally {
+      setPendingLinks(false);
+    }
+  }
+
+  async function unblockSource(entry: BlacklistEntry) {
+    setPendingLinks(true);
+    try {
+      await api("/api/blacklist/remove", {
+        method: "POST",
+        body: JSON.stringify({ url: entry.url, id: entry.id }),
+      });
+      await refreshStatus();
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`blacklist error: ${errorMessage(err)}`);
     } finally {
       setPendingLinks(false);
     }
@@ -1974,10 +2078,50 @@ export default function App() {
     return { count: data.links.length };
   }
 
-  async function refreshPrivateIptv(forceProbe = false) {
+  async function toggleSchedule(enabled: boolean) {
+    setPendingSchedule(true);
+    try {
+      await api("/api/schedule", { method: "POST", body: JSON.stringify({ enabled }) });
+      await refreshStatus();
+      setSessionState(enabled ? "auto-schedule enabled" : "auto-schedule disabled");
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`auto-schedule error: ${errorMessage(err)}`);
+    } finally {
+      setPendingSchedule(false);
+    }
+  }
+
+  async function sendScheduleTest() {
+    setPendingSchedule(true);
+    try {
+      await api("/api/schedule", { method: "POST", body: JSON.stringify({ test_notification: true }) });
+      setSessionState("test notification posted to Discord");
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`Discord test failed: ${errorMessage(err)}`);
+    } finally {
+      setPendingSchedule(false);
+    }
+  }
+
+  async function sendComingUp() {
+    setPendingSchedule(true);
+    try {
+      const res = await api<{ event?: string }>("/api/schedule", { method: "POST", body: JSON.stringify({ coming_up: true }) });
+      setSessionState(`posted "Coming up" for ${res.event || "the next card"}`);
+    } catch (err) {
+      if (isUnauthorized(err)) logout();
+      setSessionState(`Coming up post failed: ${errorMessage(err)}`);
+    } finally {
+      setPendingSchedule(false);
+    }
+  }
+
+  async function refreshPrivateIptv() {
     setPendingPrivateIptv(true);
     try {
-      await api("/api/private-iptv/refresh", { method: "POST", body: JSON.stringify({ force_probe: forceProbe }) });
+      await api("/api/private-iptv/refresh", { method: "POST", body: JSON.stringify({}) });
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();
@@ -1987,36 +2131,16 @@ export default function App() {
     }
   }
 
-  async function saveWatcherNews(entry: WatcherNewsEntry) {
-    setPendingNews(true);
+  async function controlPrivateIptv(action: "pause" | "resume" | "stop" | "restart") {
+    setPendingPrivateIptv(true);
     try {
-      await api("/api/news", {
-        method: "POST",
-        body: JSON.stringify(entry),
-      });
+      await api("/api/private-iptv/control", { method: "POST", body: JSON.stringify({ action }) });
       await refreshStatus();
     } catch (err) {
       if (isUnauthorized(err)) logout();
-      setSessionState(`news error: ${errorMessage(err)}`);
+      setSessionState(`private IPTV control error: ${errorMessage(err)}`);
     } finally {
-      setPendingNews(false);
-    }
-  }
-
-  async function removeWatcherNews(entry: WatcherNewsEntry) {
-    if (!entry.id) return;
-    setPendingNews(true);
-    try {
-      await api("/api/news/remove", {
-        method: "POST",
-        body: JSON.stringify({ id: entry.id }),
-      });
-      await refreshStatus();
-    } catch (err) {
-      if (isUnauthorized(err)) logout();
-      setSessionState(`news error: ${errorMessage(err)}`);
-    } finally {
-      setPendingNews(false);
+      setPendingPrivateIptv(false);
     }
   }
 
@@ -2032,8 +2156,9 @@ export default function App() {
 
   return (
     <main className="appShell">
-      <CommandHeader status={status} pendingAction={pendingAction} onStreamAction={streamAction} />
+      <CommandHeader status={status} pendingAction={pendingAction} onStreamAction={streamAction} onToggleSchedule={toggleSchedule} />
       <StatusStrip status={status} gpu={gpu} arango={arango} />
+      <SchedulePanel schedule={status?.schedule} pending={pendingSchedule} onTest={sendScheduleTest} onComingUp={sendComingUp} />
       <section className="primaryGrid">
         <LivePlayer
           proc={proc}
@@ -2059,10 +2184,10 @@ export default function App() {
         </aside>
       </section>
       <section className="lowerGrid">
-        <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onRecover={recoverSource} />
-        <PrivateIptvPanel runtime={status?.private_iptv} pending={pendingPrivateIptv} onRefresh={refreshPrivateIptv} />
-        <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} />
-        <WatcherNewsPanel entries={watcherNews} pending={pendingNews} onSave={saveWatcherNews} onRemove={removeWatcherNews} />
+        <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onLock={lockSource} onRecover={recoverSource} onBlock={blockSource} />
+        <PrivateIptvPanel runtime={status?.private_iptv} pending={pendingPrivateIptv} onRefresh={refreshPrivateIptv} onControl={controlPrivateIptv} />
+        <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} onBlock={blockSource} />
+        <BlacklistPanel entries={blacklist} pending={pendingLinks} onUnblock={unblockSource} />
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>
       <FooterStatus hls={hls} sessionState={sessionState} />

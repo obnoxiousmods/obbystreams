@@ -19,7 +19,7 @@
 - [ ] `npm audit --audit-level=moderate`
 - [ ] `uv run pytest`
 - [ ] `uv run ruff check .`
-- [ ] `uv run mypy app.py`
+- [ ] `uv run ty check`
 - [ ] `uv run python -m py_compile app.py tools/bootstrap_arango.py`
 
 ## Frontend Review

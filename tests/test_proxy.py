@@ -6,17 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from app import (
-    _ProxyCache,
-    _proxy_url,
-    _rewrite_m3u8,
-    _split_curl_headers_body,
-    assess_playback_candidate,
-    normalize_config,
-    normalize_news_entries,
-    probe_configured_source,
-    public_news_entries,
-)
+from app import _proxy_url, _ProxyCache, _rewrite_m3u8, _split_curl_headers_body, assess_playback_candidate, normalize_config
 
 
 @pytest.mark.asyncio
@@ -114,37 +104,8 @@ def test_proxy_url_encodes_url():
     )
 
 
-def test_normalize_news_entries_sanitizes_and_sorts():
-    entries = normalize_news_entries(
-        [
-            {"id": "Bad ID!", "title": "Later", "body": "Visible", "tone": "urgent", "updated_at": 10},
-            {"id": "pinned", "title": "Pinned", "body": "Top", "tone": "warn", "pinned": True, "updated_at": 2},
-            {"title": "", "body": ""},
-        ]
-    )
-    assert [entry["id"] for entry in entries] == ["pinned", "bad-id"]
-    assert entries[0]["tone"] == "warn"
-    assert entries[1]["tone"] == "info"
-
-
-def test_public_news_entries_hides_hidden_items():
-    config = normalize_config(
-        {
-            "watcher_news": [
-                {"id": "visible", "title": "Visible", "body": "Shown", "visible": True},
-                {"id": "hidden", "title": "Hidden", "body": "Nope", "visible": False},
-            ]
-        }
-    )
-    assert [entry["id"] for entry in public_news_entries(config)] == ["visible"]
-    assert {entry["id"] for entry in public_news_entries(config, include_hidden=True)} == {"visible", "hidden"}
-
-
 def test_rewrite_m3u8_rewrites_relative_segments():
-    playlist = (
-        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
-        "#EXTINF:4.0,\nsegment0.ts\n#EXTINF:4.0,\nsegment1.ts\n#EXT-X-ENDLIST\n"
-    )
+    playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nsegment0.ts\n#EXTINF:4.0,\nsegment1.ts\n#EXT-X-ENDLIST\n"
     raw_url = "https://example.com/live/playlist.m3u8?key=abc"
     rewritten = _rewrite_m3u8(playlist, raw_url)
     assert "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Flive%2Fsegment0.ts" in rewritten
@@ -153,10 +114,7 @@ def test_rewrite_m3u8_rewrites_relative_segments():
 
 
 def test_rewrite_m3u8_rewrites_key_uri():
-    playlist = (
-        '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
-        "#EXTINF:4.0,\nsegment.ts\n"
-    )
+    playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:4.0,\nsegment.ts\n'
     raw_url = "https://example.com/live/playlist.m3u8"
     rewritten = _rewrite_m3u8(playlist, raw_url)
     assert "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Flive%2Fkey.bin" in rewritten
@@ -213,47 +171,3 @@ async def test_assess_playback_candidate_accepts_media_playlist(monkeypatch):
     assert result["ok"] is True
     assert "media segments" in result["reasons"]
     assert "segment readable" in result["reasons"]
-
-
-@pytest.mark.asyncio
-async def test_assess_playback_candidate_shallow_mode_defers_segment_fetch(monkeypatch):
-    fetched = []
-
-    async def fake_fetch(url, headers, timeout=10.0):
-        fetched.append(url)
-        if url.endswith(".ts"):
-            raise AssertionError("shallow private probe should not fetch media segments")
-        return (
-            200,
-            "application/vnd.apple.mpegurl",
-            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n",
-        )
-
-    import app as obbystreams_app
-
-    monkeypatch.setattr(obbystreams_app, "fetch_small_head", fake_fetch)
-    cfg = normalize_config({})["private_iptv"]
-    result = await assess_playback_candidate("https://example.com/live.m3u8", cfg, deep=False)
-    assert result["ok"] is True
-    assert fetched == ["https://example.com/live.m3u8"]
-    assert "segment probe deferred" in result["reasons"]
-
-
-@pytest.mark.asyncio
-async def test_probe_configured_source_skips_private_probe_when_budget_reserved(monkeypatch):
-    import app as obbystreams_app
-
-    async def fail_probe(*args, **kwargs):
-        raise AssertionError("private source probe should be skipped")
-
-    monkeypatch.setattr(obbystreams_app, "assess_playback_candidate", fail_probe)
-    source = {"id": "private-iptv-main", "type": "soursignal", "url": "https://soursignal.com/private/main", "enabled": True}
-    cfg = normalize_config({"private_iptv": {"enabled": True}, "stream": {"sources": [source]}})
-    await probe_configured_source(
-        source,
-        config=cfg,
-        budget={"probe_allowed": False, "probe_skipped_reason": "private stream is live; spare upstream slot reserved"},
-    )
-    health = obbystreams_app.SOURCE_HEALTH["private-iptv-main"]
-    assert health["state"] == "unknown"
-    assert "reserved" in health["message"]

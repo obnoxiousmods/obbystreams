@@ -23,9 +23,13 @@ Stop:
 - Sends SIGTERM to the managed process group.
 - Sends SIGKILL if the process does not exit within the timeout.
 - Records the last exit code.
+- **Persists** `stream.operator_stopped: true`: the watchdog and both scrapers
+  stay idle, and the stream stays down across restarts, until an explicit
+  Start/Restart. See [Persistent Stop &amp; Source Blacklist](blacklist-and-stop.md).
 
 Restart:
 
+- Clears the persisted operator Stop.
 - Stops the current managed process.
 - Starts a new managed process using current config and links.
 
@@ -115,6 +119,12 @@ GPU telemetry is best-effort. Hosts without NVIDIA drivers return a structured d
 5. Merge any new example config keys into the live config.
 6. Run `sudo systemctl restart obbystreams.service`.
 7. Check `/api/health`, the dashboard, and `journalctl`.
+
+> **Deploy caution:** the config YAML hot-reloads, but `app.py` does not.
+> Shipping backend code requires the service restart in step 6, which kills the
+> live ffmpeg encode and drops viewers. Deploy off-hours — check `/api/live` for
+> an in-progress event first. The frontend `static/` bundle is served directly
+> and needs no restart.
 
 ## Useful Commands
 

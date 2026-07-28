@@ -1,33 +1,33 @@
 import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import (
-    _extract_icelz_option_streams,
     StreamHealthScorer,
-    disable_private_iptv_sources,
+    _extract_icelz_option_streams,
     build_command,
     classify_stream_log,
+    disable_private_iptv_sources,
     effective_stream_links,
     hls_content_type,
     hls_metrics,
     merge_private_iptv_sources,
     normalize_config,
     normalize_links,
-    parse_m3u_entries,
     normalize_scrape_urls,
-    public_stream_inventory,
+    parse_m3u_entries,
     parse_nvidia_gpu_csv,
     parse_nvidia_pmon,
     parse_nvidia_process_csv,
-    private_probe_budget,
+    public_stream_inventory,
     rewrite_playlist,
     safe_hls_path,
     score_private_iptv_entry,
     select_private_iptv_candidates,
+    should_protect_live_private_stream,
     should_watchdog_restart_exited_process,
     trusted_request_origin,
     valid_stream_url,
@@ -233,13 +233,7 @@ def test_effective_stream_links_keeps_auto_public_sources_out_of_ffmpeg_pool():
 
 
 def test_public_stream_inventory_includes_manual_and_auto_sources():
-    cfg = normalize_config(
-        {
-            "public_sources": [
-                {"id": "manual", "label": "Manual", "url": "https://a.example.com/live.m3u8"}
-            ]
-        }
-    )
+    cfg = normalize_config({"public_sources": [{"id": "manual", "label": "Manual", "url": "https://a.example.com/live.m3u8"}]})
     import app as obbystreams_app
 
     original_sources = list(obbystreams_app._AUTO_SOURCES)
@@ -283,7 +277,12 @@ https://soursignal.com/private/247
     assert [item["entry"]["url"] for item in selected] == ["https://soursignal.com/private/main"]
 
 
-def test_private_iptv_date_window_gate_blocks_generic_always_on_ufc_rows():
+def test_private_iptv_selection_is_recall_first_for_dateless_ufc_rows():
+    # Selection is deliberately recall-first: a dateless but clearly-UFC feed is
+    # NOT dropped (many valid event feeds omit a parseable date). Only clearly
+    # out-of-window ("stale/future date") rows are dropped here; the downstream
+    # ffprobe stage verifies which candidates actually carry live video. The
+    # explicitly-dated row simply scores higher and ranks first.
     playlist = """#EXTM3U
 #EXTINF:-1 tvg-name="UFC PPV Main Card" group-title="PPV Live Events",UFC PPV Main Card
 https://soursignal.com/private/generic
@@ -294,18 +293,51 @@ https://soursignal.com/private/dated
     now = datetime(2026, 6, 20, 12, 0, tzinfo=ZoneInfo("Canada/Pacific"))
     entries = parse_m3u_entries(playlist)
     selected = select_private_iptv_candidates(entries, cfg, now=now)
-    assert [item["entry"]["url"] for item in selected] == ["https://soursignal.com/private/dated"]
+    urls = [item["entry"]["url"] for item in selected]
+    assert set(urls) == {"https://soursignal.com/private/generic", "https://soursignal.com/private/dated"}
+    assert urls[0] == "https://soursignal.com/private/dated"
+
+
+def test_private_iptv_selection_rejects_non_ufc_fight_events():
+    playlist = """#EXTM3U
+#EXTINF:-1 tvg-name="PPV 29 PRELIMS EUBANK VS PAPOT" group-title="PPV Live Events",PPV 29 PRELIMS EUBANK VS PAPOT
+https://soursignal.com/private/boxing
+#EXTINF:-1 tvg-name="BKFC 91 Naples Prelims" group-title="PPV Live Events",BKFC 91 Naples Prelims
+https://soursignal.com/private/bkfc
+#EXTINF:-1 tvg-name="PFL Austin Prelims" group-title="PPV Live Events",PFL Austin Prelims
+https://soursignal.com/private/pfl
+#EXTINF:-1 tvg-name="UFC Fight Night Du Plessis vs Usman Prelims" group-title="PPV Live Events",UFC Fight Night Du Plessis vs Usman Prelims
+https://soursignal.com/private/ufc
+"""
+    cfg = normalize_config({"private_iptv": {"min_score": 70}})["private_iptv"]
+    now = datetime(2026, 7, 18, 19, 30, tzinfo=ZoneInfo("America/New_York"))
+    selected = select_private_iptv_candidates(parse_m3u_entries(playlist), cfg, now=now)
+    assert [item["entry"]["url"] for item in selected] == ["https://soursignal.com/private/ufc"]
+
+
+def test_private_iptv_selection_drops_blacklisted_entries():
+    # A blacklisted URL is filtered up front, before ffprobe, and can never be
+    # re-selected on a later refresh cycle.
+    playlist = """#EXTM3U
+#EXTINF:-1 tvg-name="UFC PPV Main Card" group-title="PPV Live Events",UFC PPV Main Card
+https://soursignal.com/private/keep
+#EXTINF:-1 tvg-name="UFC Fight Night Jun 20 6PM" group-title="PPV Live Events",UFC Fight Night Jun 20 6PM
+https://soursignal.com/private/blocked
+"""
+    cfg = normalize_config({"private_iptv": {"min_score": 70}})["private_iptv"]
+    entries = parse_m3u_entries(playlist)
+    blacklist = [{"url": "https://soursignal.com/private/blocked"}]
+    selected = select_private_iptv_candidates(entries, cfg, blacklist=blacklist)
+    urls = [item["entry"]["url"] for item in selected]
+    assert "https://soursignal.com/private/blocked" not in urls
+    assert "https://soursignal.com/private/keep" in urls
 
 
 def test_private_iptv_merge_and_disable_only_touch_auto_sources():
     cfg = normalize_config(
         {
             "private_iptv": {"auto_source_prefix": "private-iptv"},
-            "stream": {
-                "sources": [
-                    {"id": "manual", "label": "Manual", "url": "https://manual.example/live.m3u8", "enabled": True}
-                ]
-            },
+            "stream": {"sources": [{"id": "manual", "label": "Manual", "url": "https://manual.example/live.m3u8", "enabled": True}]},
         }
     )
     accepted = [
@@ -323,49 +355,21 @@ def test_private_iptv_merge_and_disable_only_touch_auto_sources():
     assert effective_stream_links(cfg) == ["https://manual.example/live.m3u8"]
 
 
-def test_private_iptv_budget_defaults_reserve_live_stream_slot():
-    cfg = normalize_config(
-        {
-            "private_iptv": {"enabled": True},
-            "stream": {
-                "sources": [
-                    {"id": "private-iptv-main", "label": "Main", "url": "https://soursignal.com/private/main"}
-                ]
-            },
-        }
-    )
-
-    assert cfg["private_iptv"]["connection_limit"] == 2
-    assert cfg["private_iptv"]["reserve_spare_when_streaming"] is True
-    assert cfg["private_iptv"]["keep_stream_live_when_inactive"] is True
-
-    budget = private_probe_budget(
-        cfg,
-        proc={"managed": True},
-        health_doc={"decision": "healthy"},
-    )
-    assert budget["stream_uses_private_slot"] is True
-    assert budget["probe_allowed"] is False
-    assert "reserved" in budget["probe_skipped_reason"]
+def test_healthy_live_private_stream_is_pinned_during_refresh():
+    cfg = normalize_config({"private_iptv": {"enabled": True, "protect_live_stream_on_refresh": True}})
+    healthy_live = {"stream_uses_private_slot": True, "health_decision": "healthy"}
+    assert should_protect_live_private_stream(cfg, healthy_live) is True
+    assert should_protect_live_private_stream(cfg, healthy_live, force_probe=True) is False
 
 
-def test_private_iptv_budget_allows_probe_during_confirmed_failure():
-    cfg = normalize_config(
-        {
-            "private_iptv": {"enabled": True},
-            "stream": {
-                "sources": [
-                    {"id": "private-iptv-main", "label": "Main", "url": "https://soursignal.com/private/main"}
-                ]
-            },
-        }
-    )
-    budget = private_probe_budget(cfg, proc={"managed": True}, health_doc={"decision": "failed"})
-    assert budget["probe_allowed"] is True
+def test_failed_private_stream_remains_eligible_for_recovery():
+    cfg = normalize_config({"private_iptv": {"enabled": True, "protect_live_stream_on_refresh": True}})
+    failed_live = {"stream_uses_private_slot": True, "health_decision": "failed"}
+    assert should_protect_live_private_stream(cfg, failed_live) is False
 
 
 def test_hls_metrics_reads_dash_generated_hls_media_playlists(tmp_path):
-    (tmp_path / "ufc.mpd").write_text("<MPD type=\"dynamic\"><Period /></MPD>", encoding="utf-8")
+    (tmp_path / "ufc.mpd").write_text('<MPD type="dynamic"><Period /></MPD>', encoding="utf-8")
     (tmp_path / "ufc.m3u8").write_text("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2500000\nmedia_0.m3u8\n", encoding="utf-8")
     (tmp_path / "media_0.m3u8").write_text(
         "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:4.0,\nufc_chunk_0_000007.m4s\n",
@@ -427,9 +431,7 @@ def test_trusted_request_origin_requires_same_origin():
 
 
 def test_nvidia_smi_parsers_extract_gpu_and_process_metrics():
-    gpus = parse_nvidia_gpu_csv(
-        "0, NVIDIA RTX 4000, GPU-abc, 550.54, P2, 63, 72, 38, 8192, 2048, 6144, 82.5, 120.0, 1500, 5001\n"
-    )
+    gpus = parse_nvidia_gpu_csv("0, NVIDIA RTX 4000, GPU-abc, 550.54, P2, 63, 72, 38, 8192, 2048, 6144, 82.5, 120.0, 1500, 5001\n")
     assert gpus[0]["index"] == 0
     assert gpus[0]["memory_used_pct"] == 25.0
     assert gpus[0]["power_draw_w"] == 82.5
@@ -437,9 +439,6 @@ def test_nvidia_smi_parsers_extract_gpu_and_process_metrics():
     processes = parse_nvidia_process_csv("GPU-abc, 1234, ffmpeg, 512\n")
     assert processes == [{"gpu_uuid": "GPU-abc", "pid": 1234, "process_name": "ffmpeg", "used_memory_mb": 512}]
 
-    pmon = parse_nvidia_pmon(
-        "# gpu pid type sm mem enc dec command\n"
-        "0 1234 C 14 8 63 0 ffmpeg\n"
-    )
+    pmon = parse_nvidia_pmon("# gpu pid type sm mem enc dec command\n0 1234 C 14 8 63 0 ffmpeg\n")
     assert pmon[0]["enc_pct"] == 63
     assert pmon[0]["process_name"] == "ffmpeg"

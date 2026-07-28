@@ -173,6 +173,25 @@ When enabled, the app queues writes for:
 
 ArangoDB write failures do not block the dashboard request path. Failures are tracked in runtime counters and recent errors.
 
+## Persistent Stop &amp; Blacklist
+
+- `stream.operator_stopped` (bool, default `false`) — the persisted operator
+  master kill switch. Managed by the `/api/stream/{start,stop,restart}`
+  endpoints; when `true` the managed ffmpeg and both scrapers stay idle until an
+  explicit Start. See [Persistent Stop &amp; Source Blacklist](blacklist-and-stop.md).
+- `source_blacklist` (list, default `[]`) — persistently blocks sources by
+  `url` / `id` / `channel` / `label` so they can never be re-scraped or shown.
+  Managed by the cockpit Block/Unblock buttons or the `/api/blacklist` endpoints.
+
+```yaml
+stream:
+  operator_stopped: false
+
+source_blacklist:
+  - url: https://example.com/known-bad/live.m3u8
+    reason: dead/slate feed
+```
+
 ## Config Safety
 
 - Keep the file readable only by the service user or trusted group.

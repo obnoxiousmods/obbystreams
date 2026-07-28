@@ -7,7 +7,11 @@ The project is intentionally small: one Starlette service, one Vite-built fronte
 ## Highlights
 
 - React 19 + Vite + Tailwind CSS frontend with a purple accent system, responsive control panels, and custom Video.js live-stream controls.
-- Start, stop, and restart the managed stream from the browser.
+- Start, stop, and restart the managed stream from the browser. **Stop is
+  persistent** — it keeps the encode and both scrapers idle (surviving restarts)
+  until an explicit Start.
+- **Blacklist** any scraped or pasted source so it never reappears, by URL
+  (query-insensitive), id, channel, or label.
 - Add, remove, deduplicate, and reorder HLS input links.
 - Kill existing unmanaged `ufc` or `obbystreams` processes before launching a new managed stream.
 - Track HLS freshness, segment count, playlist readiness, target duration, media sequence, and written bytes.
@@ -171,13 +175,17 @@ Run these before pushing changes:
 ```bash
 npm run typecheck
 npm run lint
+npm test
 npm run build
 npm audit --audit-level=moderate
 uv run pytest
 uv run ruff check .
-uv run mypy app.py
+uv run ty check
 uv run python -m py_compile app.py tools/bootstrap_arango.py
 ```
+
+Type checking uses [ty](https://github.com/astral-sh/ty) (Astral); linting uses
+ruff; both run through uv.
 
 ## License
 

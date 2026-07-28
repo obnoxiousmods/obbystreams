@@ -1,0 +1,834 @@
+{
+ "leagues": [
+  {
+   "calendar": [
+    {
+     "label": "UFC 324: Gaethje vs. Pimblett",
+     "startDate": "2026-01-25T01:30Z",
+     "endDate": "2026-01-25T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057024?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 325: Volkanovski vs. Lopes 2",
+     "startDate": "2026-02-01T01:00Z",
+     "endDate": "2026-02-01T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057025?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Bautista vs. Oliveira",
+     "startDate": "2026-02-08T01:00Z",
+     "endDate": "2026-02-08T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057328?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Strickland vs. Hernandez",
+     "startDate": "2026-02-22T01:00Z",
+     "endDate": "2026-02-22T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057329?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Moreno vs. Kavanagh",
+     "startDate": "2026-03-01T01:00Z",
+     "endDate": "2026-03-01T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057330?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 326: Holloway vs. Oliveira 2",
+     "startDate": "2026-03-08T01:30Z",
+     "endDate": "2026-03-08T07:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057326?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Emmett vs. Vallejos",
+     "startDate": "2026-03-15T00:00Z",
+     "endDate": "2026-03-15T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057364?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Evloev vs. Murphy",
+     "startDate": "2026-03-21T20:00Z",
+     "endDate": "2026-03-22T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057365?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Adesanya vs. Pyfer",
+     "startDate": "2026-03-29T00:00Z",
+     "endDate": "2026-03-29T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600057366?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Moicano vs. Duncan",
+     "startDate": "2026-04-05T00:00Z",
+     "endDate": "2026-04-05T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058693?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 327: Proch\u00e1zka vs. Ulberg",
+     "startDate": "2026-04-12T00:30Z",
+     "endDate": "2026-04-12T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058745?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Burns vs. Malott",
+     "startDate": "2026-04-19T00:00Z",
+     "endDate": "2026-04-19T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058725?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Sterling vs. Zalal",
+     "startDate": "2026-04-26T00:00Z",
+     "endDate": "2026-04-26T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058746?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Della Maddalena vs. Prates",
+     "startDate": "2026-05-02T11:00Z",
+     "endDate": "2026-05-03T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058807?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 328: Chimaev vs. Strickland",
+     "startDate": "2026-05-10T00:00Z",
+     "endDate": "2026-05-10T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058947?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Allen vs. Costa",
+     "startDate": "2026-05-17T00:00Z",
+     "endDate": "2026-05-17T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058948?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Song vs. Figueiredo",
+     "startDate": "2026-05-30T11:00Z",
+     "endDate": "2026-05-31T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058517?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Muhammad vs. Bonfim",
+     "startDate": "2026-06-07T00:00Z",
+     "endDate": "2026-06-07T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058949?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Freedom 250: Topuria vs. Gaethje",
+     "startDate": "2026-06-15T03:00Z",
+     "endDate": "2026-06-15T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600058854?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Kape vs. Horiguchi 2",
+     "startDate": "2026-06-21T00:00Z",
+     "endDate": "2026-06-21T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059467?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Fiziev vs. Torres",
+     "startDate": "2026-06-27T16:00Z",
+     "endDate": "2026-06-28T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059254?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 329: McGregor vs. Holloway 2",
+     "startDate": "2026-07-12T00:00Z",
+     "endDate": "2026-07-12T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059148?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Du Plessis vs. Usman",
+     "startDate": "2026-07-19T00:00Z",
+     "endDate": "2026-07-19T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059599?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Ankalaev vs. Guskov",
+     "startDate": "2026-07-25T16:00Z",
+     "endDate": "2026-07-26T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059667?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Medi\u0107 vs. Rodriguez",
+     "startDate": "2026-08-01T17:00Z",
+     "endDate": "2026-08-02T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059339?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Gamrot vs Salkilld",
+     "startDate": "2026-08-08T21:00Z",
+     "endDate": "2026-08-09T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060621?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 1",
+     "startDate": "2026-08-12T03:00Z",
+     "endDate": "2026-08-12T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060732?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC 330: Makhachev vs. Machado Garry",
+     "startDate": "2026-08-16T00:00Z",
+     "endDate": "2026-08-16T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059185?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 2",
+     "startDate": "2026-08-19T03:00Z",
+     "endDate": "2026-08-19T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060733?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Hernandez vs. Rodrigues",
+     "startDate": "2026-08-23T00:00Z",
+     "endDate": "2026-08-23T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060493?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 3",
+     "startDate": "2026-08-26T03:00Z",
+     "endDate": "2026-08-26T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060734?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Nurmagomedov vs. Song",
+     "startDate": "2026-08-29T10:00Z",
+     "endDate": "2026-08-30T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060620?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 4",
+     "startDate": "2026-09-02T03:00Z",
+     "endDate": "2026-09-02T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060735?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Paris",
+     "startDate": "2026-09-05T19:00Z",
+     "endDate": "2026-09-06T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600059993?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 5",
+     "startDate": "2026-09-09T03:00Z",
+     "endDate": "2026-09-09T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060736?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Noche UFC",
+     "startDate": "2026-09-13T00:00Z",
+     "endDate": "2026-09-13T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060772?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 6",
+     "startDate": "2026-09-16T03:00Z",
+     "endDate": "2026-09-16T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060737?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 7",
+     "startDate": "2026-09-23T03:00Z",
+     "endDate": "2026-09-23T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060738?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 8",
+     "startDate": "2026-09-30T03:00Z",
+     "endDate": "2026-09-30T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060739?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 9",
+     "startDate": "2026-10-07T03:00Z",
+     "endDate": "2026-10-07T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060740?lang=en&region=us"
+     }
+    },
+    {
+     "label": "Dana White's Contender Series: Season 10, Week 10",
+     "startDate": "2026-10-14T03:00Z",
+     "endDate": "2026-10-14T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060741?lang=en&region=us"
+     }
+    },
+    {
+     "label": "UFC Fight Night: Edmonton",
+     "startDate": "2026-10-18T00:00Z",
+     "endDate": "2026-10-18T06:59Z",
+     "event": {
+      "$ref": "http://sports.core.api.espn.pvt/v2/sports/mma/leagues/ufc/events/600060773?lang=en&region=us"
+     }
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "id": "600059667",
+   "name": "UFC Fight Night: Ankalaev vs. Guskov",
+   "shortName": "UFC Fight Night",
+   "date": "2026-07-25T13:00Z",
+   "competitions": [
+    {
+     "id": "401898030",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 1,
+       "athlete": {
+        "displayName": "Cody Gibson"
+       }
+      },
+      {
+       "winner": true,
+       "order": 2,
+       "athlete": {
+        "displayName": "Abdul Hussein"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401886737",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Mike Davis"
+       }
+      },
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Nurullo Aliev"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401874314",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Brendson Ribeiro"
+       }
+      },
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Magomed Tuchalov"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401874317",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 1,
+       "athlete": {
+        "displayName": "Ismael Bonfim"
+       }
+      },
+      {
+       "winner": true,
+       "order": 2,
+       "athlete": {
+        "displayName": "Axel Sola"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401891531",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 1,
+       "athlete": {
+        "displayName": "Santiago Ponzinibbio"
+       }
+      },
+      {
+       "winner": true,
+       "order": 2,
+       "athlete": {
+        "displayName": "Sam Patterson"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401898040",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 1,
+       "athlete": {
+        "displayName": "Dustin Jacoby"
+       }
+      },
+      {
+       "winner": true,
+       "order": 2,
+       "athlete": {
+        "displayName": "Muhammad Said"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401874312",
+     "date": "2026-07-25T13:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Thomas Petersen"
+       }
+      },
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Valter Walker"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401890156",
+     "date": "2026-07-25T16:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Abubakar Vagaev"
+       }
+      },
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Saygid Izagakhmaev"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401874311",
+     "date": "2026-07-25T16:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Rizvan Kuniev"
+       }
+      },
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Tyrell Fortune"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401886732",
+     "date": "2026-07-25T16:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Magomed Zaynukov"
+       }
+      },
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Damian Rzepecki"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401874315",
+     "date": "2026-07-25T16:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": true,
+       "order": 2,
+       "athlete": {
+        "displayName": "Ramazan Temirov"
+       }
+      },
+      {
+       "winner": false,
+       "order": 1,
+       "athlete": {
+        "displayName": "Steve Erceg"
+       }
+      }
+     ]
+    },
+    {
+     "id": "401892276",
+     "date": "2026-07-25T16:00Z",
+     "status": {
+      "type": {
+       "id": "3",
+       "name": "STATUS_FINAL",
+       "state": "post",
+       "completed": true,
+       "description": "Final",
+       "detail": "Final",
+       "shortDetail": "Final"
+      }
+     },
+     "venue": {
+      "id": "7126",
+      "fullName": "Etihad Arena",
+      "address": {
+       "city": "Abu Dhabi",
+       "country": "United Arab Emirates"
+      },
+      "indoor": true
+     },
+     "competitors": [
+      {
+       "winner": true,
+       "order": 1,
+       "athlete": {
+        "displayName": "Magomed Ankalaev"
+       }
+      },
+      {
+       "winner": false,
+       "order": 2,
+       "athlete": {
+        "displayName": "Bogdan Guskov"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

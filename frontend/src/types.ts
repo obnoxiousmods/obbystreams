@@ -23,6 +23,9 @@ export interface PublicConfig {
     include_auto_public_sources?: boolean;
     auto_recover?: boolean;
     auto_restart_on_exit?: boolean;
+    /** Persisted operator "master kill switch": stream + scrapers stay down until Start. */
+    operator_stopped?: boolean;
+    locked_source_id?: string;
     watchdog_restart_cooldown?: number;
     startup_grace_seconds?: number;
     playlist_stale_seconds?: number;
@@ -45,7 +48,16 @@ export interface PublicConfig {
   };
   private_iptv?: PrivateIptvConfig;
   public_sources?: PublicStreamSource[];
-  watcher_news?: WatcherNewsEntry[];
+  source_blacklist?: BlacklistEntry[];
+}
+
+export interface BlacklistEntry {
+  url?: string;
+  id?: string;
+  label?: string;
+  channel?: string;
+  reason?: string;
+  added_at?: number;
 }
 
 export interface SourceConfig {
@@ -60,6 +72,7 @@ export interface SourceConfig {
 
 export interface SourceStatus extends SourceConfig {
   preferred?: boolean;
+  locked?: boolean;
   in_process?: boolean;
   health?: string;
   health_message?: string;
@@ -81,21 +94,9 @@ export interface PublicStreamSource {
   has_headers?: boolean;
 }
 
-export interface WatcherNewsEntry {
-  id?: string;
-  title?: string;
-  body?: string;
-  tone?: "info" | "ok" | "warn" | "bad" | "neutral" | string;
-  visible?: boolean;
-  pinned?: boolean;
-  created_at?: number;
-  updated_at?: number;
-  link_url?: string;
-  link_label?: string;
-}
-
 export interface PrivateIptvConfig {
   enabled?: boolean;
+  paused?: boolean;
   provider_url?: string;
   playlist_url?: string;
   timezone?: string;
@@ -104,9 +105,6 @@ export interface PrivateIptvConfig {
   min_score?: number;
   probe_candidates?: boolean;
   disable_stream_when_inactive?: boolean;
-  connection_limit?: number;
-  reserve_spare_when_streaming?: boolean;
-  keep_stream_live_when_inactive?: boolean;
   auto_start_when_active?: boolean;
   keywords?: string[];
   reject_keywords?: string[];
@@ -124,6 +122,7 @@ export interface PrivateIptvReason {
 
 export interface PrivateIptvRuntime {
   enabled?: boolean;
+  paused?: boolean;
   state?: string;
   last_checked_at?: number | null;
   last_changed_at?: number | null;
@@ -135,11 +134,6 @@ export interface PrivateIptvRuntime {
   message?: string;
   reasons?: PrivateIptvReason[];
   next_check_at?: number | null;
-  connection_limit?: number;
-  stream_uses_private_slot?: boolean;
-  probe_allowed?: boolean;
-  probe_skipped_reason?: string;
-  last_probe_mode?: string;
 }
 
 export interface ViewerCounts {
@@ -199,6 +193,8 @@ export interface HlsMetrics {
   target_duration?: string | number | null;
   media_sequence?: string | number | null;
   segment_window_seconds?: number | null;
+  encode_rate?: number | null;
+  live_lag_seconds?: number | null;
   playlist_segment_count?: number;
   playlist_segments?: string[];
   first_segment?: string | null;
@@ -266,6 +262,9 @@ export interface RuntimeStats {
   app_uptime_seconds?: number;
   arango_queue_depth?: number;
   stream_desired_state?: "running" | "stopped";
+  operator_stopped?: boolean;
+  /** Who stopped it: a human ("manual") or the auto-scheduler ("schedule"). */
+  stop_reason?: StopReason | "";
   configured_link_count?: number;
   auto_public_source_count?: number;
   active_link_pool_count?: number;
@@ -286,6 +285,52 @@ export interface StatusPayload {
   sources?: SourceStatus[];
   viewers?: ViewerCounts;
   private_iptv?: PrivateIptvRuntime;
+  schedule?: ScheduleSnapshot;
+}
+
+export type StopReason = "manual" | "schedule";
+
+export type EventPhase = "idle" | "pending" | "pre_roll" | "live" | "wrapping" | "finished";
+
+export interface ScheduleCard {
+  label: string;
+  start: string;
+  bouts: number;
+  completed: number;
+  all_final: boolean;
+}
+
+export interface ScheduleEvent {
+  id: string;
+  name: string;
+  short_name: string;
+  venue: string;
+  city: string;
+  is_final: boolean;
+  main_event: string | null;
+  winner: string | null;
+  first_card_start: string | null;
+  cards: ScheduleCard[];
+}
+
+/** State of the UFC auto-schedule, as returned by /api/schedule and /api/status. */
+export interface ScheduleSnapshot {
+  enabled: boolean;
+  notify_enabled?: boolean;
+  lead_minutes?: number;
+  end_grace_minutes?: number;
+  phase?: EventPhase;
+  action?: "idle" | "start" | "stop";
+  reason?: string;
+  started_by_scheduler?: boolean;
+  suppressed_event_id?: string | null;
+  notifications_sent?: number;
+  calendar_size?: number;
+  event?: ScheduleEvent | null;
+  next_event?: { label: string; start: string } | null;
+  countdown_seconds?: number | null;
+  /** True while the countdown is against the calendar start, not the real first bout. */
+  countdown_is_estimate?: boolean;
 }
 
 export interface ArangoStatus {

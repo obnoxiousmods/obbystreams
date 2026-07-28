@@ -37,6 +37,11 @@ stream:
   include_auto_public_sources: true
   source_manifest_path: /tmp/obbystreams-sources.json
   soursignal_auto_recover: true
+  # Persisted operator "master kill switch". When true, a human hit Stop: the
+  # managed ffmpeg AND both scrapers stay idle until an explicit Start/Restart.
+  # Survives supervisor ticks and full restarts. Managed only by the
+  # /api/stream/{start,stop,restart} endpoints — leave false here.
+  operator_stopped: false
   restart_delay: 2
   max_restart_delay: 120
   rate_limit_delay: 180
@@ -74,6 +79,20 @@ public_sources:
     headers:
       Referer: https://example.com/
       User-Agent: Mozilla/5.0
+
+# Persistent per-source blacklist. Any scraped/auto-selected or manually added
+# source whose URL / id / channel / label matches an entry here is filtered out
+# of every scraper cycle and every viewer-facing list, so a blocked stream can
+# never reappear. Managed from the cockpit Block/Unblock buttons or the
+# /api/blacklist endpoints. URL matching also ignores the query string, so a
+# blocked stream stays blocked after its CDN token rotates.
+source_blacklist:
+  - url: https://example.com/known-bad/live.m3u8
+    id: private-iptv-slate-feed
+    label: Always-on slate feed
+    channel: UFC 24/7
+    reason: dead/slate feed
+    added_at: 0
 
 # Private official-source automation. This feeds stream.sources for the managed
 # ffmpeg output only. It is separate from public_sources.
@@ -121,6 +140,49 @@ watcher_news:
     tone: info
     visible: true
     pinned: true
+
+# UFC auto-schedule. While enabled, the operator Stop becomes a *standby*: the
+# cockpit arms the encode `lead_minutes` before a card's first segment (per the
+# public ESPN scoreboard) and stands it back down once every bout is decided.
+# See docs/auto-schedule.md.
+schedule:
+  enabled: true
+  espn_scoreboard_url: https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard
+  # Which calendar rows count as a card we stream.
+  include_pattern: '^UFC\s+(\d+|Fight Night)'
+  exclude_pattern: 'Contender Series|Road to UFC'
+  lead_minutes: 15
+  # Post-fight grace before standing down, plus a hard failsafe if ESPN stalls.
+  end_grace_minutes: 20
+  max_runtime_hours: 8
+  calendar_refresh_seconds: 3600
+  live_poll_seconds: 120
+  display_timezone: Canada/Pacific
+  state_path: /etc/obbystreams/schedule_state.json
+  notify:
+    enabled: false
+    # A bearer credential: anyone holding it can post to your channel.
+    discord_webhook_url: ""
+    watcher_url: https://fight.nswfiles.com/
+    warn_minutes: [1440, 720, 360, 120, 30]
+    notify_card_start: true
+    notify_event_end: true
+    # "Coming up" announcement, posted once when a card is first tracked.
+    notify_coming_up: true
+    # Zones listed in that announcement's static time table. Accepts bare IANA
+    # names or {zone, label} pairs; unknown zones are dropped.
+    timezones:
+      - zone: America/Los_Angeles
+        label: Los Angeles
+      - zone: America/New_York
+        label: New York
+      - zone: Europe/London
+        label: London
+      - zone: Australia/Sydney
+        label: Sydney
+    # Milestones older than this are dropped, not fired, so a redeploy cannot
+    # spam a backlog of stale countdowns.
+    max_late_minutes: 20
 
 arangodb:
   enabled: true

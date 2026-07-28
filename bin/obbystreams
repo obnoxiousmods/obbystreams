@@ -881,14 +881,44 @@ def proc_stats(pid):
     return None, None
 
 
-def update_progress(state, line):
+def _write_encode_status(args, ff):
+    out_dir = getattr(args, "output_dir", None)
+    if not out_dir:
+        return
+    try:
+        payload = {
+            "speed": ff.get("speed", ""),
+            "fps": ff.get("fps", ""),
+            "bitrate": ff.get("bitrate", ""),
+            "out_time": ff.get("out_time", ""),
+            "frame": ff.get("frame", ""),
+            "at": time.time(),
+        }
+        path = os.path.join(out_dir, ".encode-progress.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def update_progress(state, line, args=None):
     line = line.strip()
     if "=" not in line:
         return
     key, value = line.split("=", 1)
-    if key:
-        with with_lock(state):
-            state["ffmpeg"][key] = value
+    if not key:
+        return
+    snapshot = None
+    with with_lock(state):
+        state["ffmpeg"][key] = value
+        # ffmpeg -progress emits `progress=continue` to close each stats block;
+        # snapshot the live values (incl. real speed) and publish for the app.
+        if key == "progress":
+            snapshot = dict(state["ffmpeg"])
+    if snapshot is not None and args is not None:
+        _write_encode_status(args, snapshot)
 
 
 def remember_ffmpeg_log(state, line, args):
@@ -935,7 +965,7 @@ def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=
         for line in iter(stream.readline, ""):
             write_process_log(process_log, process_log_lock, kind, line.rstrip())
             if kind == "progress":
-                update_progress(state, line)
+                update_progress(state, line, args)
             else:
                 remember_ffmpeg_log(state, line, args)
     except Exception as exc:

@@ -26,10 +26,12 @@ jobs:
         run: uv sync --dev
       - name: Ruff
         run: uv run ruff check .
-      - name: Mypy
-        run: uv run mypy app.py
+      - name: Ty (type check)
+        run: uv run ty check
       - name: Compile
-        run: uv run python -m py_compile app.py tools/bootstrap_arango.py
+        run: uv run python -m py_compile app.py obbyschedule/*.py tools/bootstrap_arango.py tools/schedule_replay.py
+      - name: Pytest
+        run: uv run pytest -q
 
   frontend:
     runs-on: ubuntu-latest
@@ -45,6 +47,8 @@ jobs:
         run: npm run typecheck
       - name: Lint
         run: npm run lint
+      - name: Test
+        run: npm test
       - name: Build
         run: npm run build
 
@@ -62,4 +66,7 @@ jobs:
               data = yaml.safe_load(f)
           assert data["stream"]["command"]
           assert data["arangodb"]["database"] == "obbystreams"
+          # The schedule section must survive normalize_config; see docs/auto-schedule.md.
+          assert data["schedule"]["lead_minutes"] > 0
+          assert data["schedule"]["notify"]["discord_webhook_url"] == ""
           PY

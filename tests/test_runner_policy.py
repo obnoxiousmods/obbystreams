@@ -1,7 +1,6 @@
 import runpy
 from pathlib import Path
 
-
 RUNNER = runpy.run_path(str(Path(__file__).resolve().parents[1] / "bin" / "obbystreams"))
 
 

@@ -6,7 +6,36 @@ All notable Obbystreams changes are tracked here.
 
 ### Added
 
+- **Persistent operator Stop**: `POST /api/stream/stop` now persists
+  `stream.operator_stopped`, keeping the managed ffmpeg AND both scrapers idle
+  until an explicit Start/Restart — surviving supervisor ticks and full
+  restarts. The cockpit shows a "STOPPED (manual)" banner and a Resume button.
+- **Persistent source blacklist**: new `source_blacklist` config plus
+  `GET/POST /api/blacklist` and `/api/blacklist/remove`. A blocked source
+  (matched by URL, URL-without-query for token rotation, id, channel, or label)
+  is filtered from every scraper cycle and every viewer-facing list. Cockpit
+  gains Block buttons on both source lists and a Blacklist panel to unblock.
+- Backend integration test harness (Starlette `TestClient`) covering the full
+  route surface, plus dedicated operator-stop and blacklist unit tests; pytest
+  now runs in CI.
+- A Vitest + Testing Library suite for the cockpit frontend (previously had no
+  test runner), and config-module tests for ObbyWatcher.
 - Expanded live dashboard SEO metadata with canonical URL, Open Graph, Twitter Card, JSON-LD, manifest, favicon, robots, sitemap, and social preview assets.
+
+### Changed
+
+- **Type checking migrated from mypy to [ty](https://github.com/astral-sh/ty)**
+  (Astral) at strict settings (`error-on-warning`); the ruff ruleset was
+  broadened (C4, PIE, RET, RUF, ASYNC, PERF, ISC, TID, FLY, G, LOG, PLE). All
+  tooling runs through uv.
+
+### Fixed
+
+- `start_managed_process` no longer resets the stream desired-state as a side
+  effect, so a watchdog- or scraper-initiated start can never silently override
+  a manual Stop.
+- Closed a shutdown leak where the viewer-stats flush task was never cancelled,
+  and retained strong references to fire-and-forget geo-lookup tasks.
 - Expanded GitHub Pages SEO config with canonical site URL, base URL, page descriptions, social image, Jekyll SEO tag, Jekyll sitemap, and robots output.
 - Replaced selector-style dashboard controls with custom React dropdown/listbox menus, including the encoder picker and live player overflow actions, while keeping native Video.js dropdowns disabled.
 - Expanded responsive dashboard support with safe-area spacing, intrinsic grids, mobile player controls, phone bottom-sheet menus, viewport-aware dropdown placement, and a Playwright viewport screenshot checker.

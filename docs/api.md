@@ -309,6 +309,34 @@ Returns cached NVIDIA GPU telemetry. The collector runs at most once every five 
 
 If `nvidia-smi` is unavailable, the route still returns `ok: true` with `available: false` so the frontend can display degraded GPU telemetry without breaking the dashboard.
 
+## Stream Control (persistent)
+
+```http
+POST /api/stream/start
+POST /api/stream/stop
+POST /api/stream/restart
+```
+
+`stop` persists `stream.operator_stopped: true` (kills ffmpeg AND idles both
+scrapers until an explicit start); `start` and `restart` clear it. The flag
+survives supervisor ticks and full restarts. `stop` responds with
+`{"ok": true, "stopped": <bool>, "operator_stopped": true}`. Current state is
+exposed at `runtime.operator_stopped` in `GET /api/status`.
+
+## Blacklist
+
+```http
+GET  /api/blacklist
+POST /api/blacklist          { "url"?, "id"?, "label"?, "channel"?, "reason"? }
+POST /api/blacklist/remove   { "url"? , "id"? }
+```
+
+`POST /api/blacklist` persists a block (matching by URL, URL-without-query, id,
+channel, or label) and immediately strips matching entries from `public_sources`
+and `stream.sources`. Blocked sources are filtered from every scraper cycle and
+every viewer-facing list. `add` requires at least one of `url/id/label/channel`
+(`400` otherwise). See [Persistent Stop &amp; Source Blacklist](blacklist-and-stop.md).
+
 ## HLS Proxy
 
 ```http

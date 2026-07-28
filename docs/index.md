@@ -15,6 +15,7 @@ Obbystreams runs a production HLS stream from a browser-accessible control plane
 - [Configuration](configuration.md): every YAML section and practical production defaults.
 - [Operations](operations.md): start/stop/restart, watchdog behavior, HLS health, process telemetry, and deploy routines.
 - [Private IPTV Automation](private-iptv-automation.md): official source discovery from the authenticated provider playlist, fight-day scoring, probing, and inactive-day disable behavior.
+- [Persistent Stop &amp; Source Blacklist](blacklist-and-stop.md): the operator master kill switch and the persistent per-source blacklist, including how they gate the scrapers.
 - [API](api.md): authentication, endpoint payloads, health checks, HLS proxy behavior, and examples.
 - [Frontend](frontend.md): React, Tailwind, Video.js controls, build pipeline, and local UI workflow.
 - [Release](release.md): versioning, artifacts, GitHub Releases, GitHub Pages, and wiki publishing.
