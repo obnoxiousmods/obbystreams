@@ -119,15 +119,34 @@ class EmbedBuilder:
             "inline": False,
         }
 
+    @staticmethod
+    def _bout_lines(card: CardSegment, limit: int = 6) -> str:
+        """The matchups on a segment, headliner first, bounded for embed width.
+
+        ESPN returns bouts in running order, so the headliner is last; readers
+        care about it first. Discord caps a field at 1024 characters and long
+        cards would blow past that, so the tail is summarised rather than cut
+        silently.
+        """
+        if not card.bouts:
+            return ""
+        ordered = list(reversed(card.bouts))
+        shown = ordered[:limit]
+        lines = [f"**{shown[0]}**", *shown[1:]] if shown else []
+        remaining = len(ordered) - len(shown)
+        if remaining > 0:
+            lines.append(f"_+{remaining} more_")
+        return "\n".join(lines)
+
     def _card_fields(self, event: UfcEvent) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": card.label,
-                "value": f"{discord_timestamp(card.start)}\n{discord_timestamp(card.start, 'R')}",
-                "inline": True,
-            }
-            for card in event.cards
-        ]
+        fields: list[dict[str, Any]] = []
+        for card in event.cards:
+            value = f"{discord_timestamp(card.start)}\n{discord_timestamp(card.start, 'R')}"
+            bouts = self._bout_lines(card)
+            if bouts:
+                value += f"\n\n{bouts}"
+            fields.append({"name": card.label, "value": value, "inline": True})
+        return fields
 
     def _footer(self, event: UfcEvent) -> dict[str, str]:
         location = " · ".join(part for part in (event.venue, event.city) if part)
@@ -163,10 +182,14 @@ class EmbedBuilder:
         for card in event.cards:
             table = timezone_table(card.start, self._settings.timezones)
             bouts = f"{card.bout_count} bout{'s' if card.bout_count != 1 else ''}"
+            value = table or discord_timestamp(card.start)
+            matchups = self._bout_lines(card)
+            if matchups:
+                value += f"\n\n{matchups}"
             fields.append(
                 {
                     "name": f"{card.label} · {bouts}",
-                    "value": table or discord_timestamp(card.start),
+                    "value": value,
                     "inline": False,
                 }
             )
@@ -187,6 +210,9 @@ class EmbedBuilder:
         description = f"**{event.name}**\n{bouts} on this segment."
         if event.main_event_bout and card.label == "Main card":
             description += f"\n\n🥊 Main event: **{event.main_event_bout}**"
+        matchups = self._bout_lines(card)
+        if matchups:
+            description += f"\n\n{matchups}"
         return {
             "title": f"🔴 LIVE NOW — {card.label}",
             "url": self.watcher_url,

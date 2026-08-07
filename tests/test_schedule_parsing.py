@@ -193,3 +193,16 @@ async def test_espn_is_not_fetched_with_the_scraper_user_agent():
 
     assert "Mozilla" not in seen["ua"], f"sent a browser UA to ESPN: {seen['ua']}"
     assert "httpx" in seen["ua"]
+
+
+def test_card_segments_carry_their_matchups():
+    """The embeds show what is actually fighting, not just a bout count. ESPN
+    returns bouts in running order, so the headliner is last."""
+    event = EspnScheduleProvider.parse_events(load("pre"), ScheduleSettings())
+
+    assert event is not None
+    assert any(card.bouts for card in event.cards), "no matchups parsed from a real payload"
+    for card in event.cards:
+        if card.bouts:
+            assert all(" vs. " in bout for bout in card.bouts)
+            assert len(card.bouts) <= card.bout_count

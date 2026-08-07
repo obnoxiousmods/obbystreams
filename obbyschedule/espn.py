@@ -83,6 +83,23 @@ def _sequence(raw: Any) -> list[Any]:
     return raw if isinstance(raw, list) else []
 
 
+def _bout_label(bout: dict[str, Any]) -> str:
+    """"Gamrot vs. Salkilld" for one bout, or "" when ESPN has no names yet.
+
+    Prefers the surname to keep an embed field readable, but ESPN does not always
+    populate ``lastName`` on this endpoint - on the 2026-08-08 card it was absent
+    for every athlete - so it falls back to the full display name rather than
+    dropping the bout.
+    """
+    names: list[str] = []
+    for entry in _sequence(_mapping(bout).get("competitors")):
+        athlete = _mapping(_mapping(entry).get("athlete"))
+        short = _text(athlete.get("lastName")) or _text(athlete.get("displayName"))
+        if short:
+            names.append(short)
+    return " vs. ".join(names) if len(names) >= 2 else ""
+
+
 def card_labels_for(count: int) -> tuple[str, ...]:
     """Name each broadcast segment; the final one is always the main card."""
     known = CARD_LABELS.get(count)
@@ -215,6 +232,7 @@ class EspnScheduleProvider:
                 label=labels[index],
                 bout_count=len(bouts),
                 completed_bouts=sum(1 for bout in bouts if bool(_mapping(_mapping(bout.get("status")).get("type")).get("completed"))),
+                bouts=tuple(_bout_label(bout) for bout in bouts if _bout_label(bout)),
             )
             for index, (start, bouts) in enumerate(ordered)
         )

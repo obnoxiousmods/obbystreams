@@ -265,6 +265,10 @@ class CardSegment:
     label: str
     bout_count: int
     completed_bouts: int
+    #: "Gamrot vs. Salkilld" for each bout on this segment, in card order (the
+    #: headliner last, as ESPN returns them). Empty for events parsed before this
+    #: existed, so every consumer must treat it as optional.
+    bouts: tuple[str, ...] = ()
 
     @property
     def all_final(self) -> bool:
