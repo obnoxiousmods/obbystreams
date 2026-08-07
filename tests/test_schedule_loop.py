@@ -7,6 +7,7 @@ the callbacks into the cockpit — with stubs standing in for the network.
 
 import json
 import pathlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -55,6 +56,8 @@ class Recorder:
         self.published = []
         self.embeds = []
         self.satisfied = False
+        self.acceptable = True
+        self.acceptable_after_refresh = None
         self.start_result = True
 
     async def start(self, reason):
@@ -68,12 +71,17 @@ class Recorder:
     async def refresh(self, reason, context=None):
         self.refreshed.append(reason)
         self.contexts.append(context)
+        if self.acceptable_after_refresh is not None:
+            self.acceptable = self.acceptable_after_refresh
 
     def publish(self, context):
         self.published.append(context)
 
     def is_satisfied(self, _context):
         return self.satisfied
+
+    def is_stream_acceptable(self, _context):
+        return self.acceptable
 
 
 class FakeNotifier:
@@ -252,6 +260,38 @@ async def test_awaiting_source_is_owned_without_claiming_the_encoder_started(tmp
 
 
 @pytest.mark.asyncio
+async def test_running_wrong_feed_is_replaced_or_quarantined_at_pre_roll(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    recorder.acceptable = False
+    recorder.start_result = StartResult(StartStatus.AWAITING_SOURCE, "wrong card quarantined; still acquiring")
+    opened = CARD_START - timedelta(minutes=10)
+
+    await scheduler.tick(stream_running=True, now=opened)
+
+    assert len(recorder.started) == 1
+    assert "quarantining" in recorder.started[0]
+    assert scheduler.state.started_by_scheduler is True
+    # The pre-action observation said a process existed, but the start callback
+    # reports that it was quarantined. Never record that stale process as this
+    # card's successful encoder start.
+    assert scheduler.state.started_at is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_verdict_is_rechecked_before_replacing_a_running_feed(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    recorder.acceptable = False
+    recorder.acceptable_after_refresh = True
+    recorder.satisfied = True
+
+    await scheduler.tick(stream_running=True, now=CARD_START - timedelta(minutes=10))
+
+    assert len(recorder.refreshed) == 1
+    assert recorder.started == []
+    assert scheduler.state.started_by_scheduler is True  # safely adopted
+
+
+@pytest.mark.asyncio
 async def test_recent_event_cache_bridges_a_detail_feed_outage(tmp_path):
     scheduler, recorder = build(tmp_path, "pre")
     opened = CARD_START - timedelta(minutes=10)
@@ -269,6 +309,23 @@ async def test_recent_event_cache_bridges_a_detail_feed_outage(tmp_path):
     assert scheduler.event.event_id == cached_event_id
     assert scheduler.snapshot(opened + timedelta(minutes=3))["data_health"]["status"] == "stale-cache"
     assert recorder.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_cache_never_substitutes_a_different_fight_night(tmp_path):
+    scheduler, _recorder = build(tmp_path, "pre")
+    opened = CARD_START - timedelta(minutes=10)
+    await scheduler.tick(stream_running=False, now=opened)
+    target = scheduler.select_target(scheduler.state.calendar, opened)
+    assert target is not None
+    assert scheduler.state.cached_event is not None
+    scheduler.state.cached_event = replace(
+        scheduler.state.cached_event,
+        name="UFC Fight Night: Somebody vs. Else",
+        short_name="Somebody vs. Else",
+    )
+
+    assert scheduler.cached_event_for(target, opened + timedelta(minutes=3)) is None
 
 
 @pytest.mark.asyncio
@@ -627,3 +684,30 @@ async def test_one_flaky_fetch_is_not_an_outage(tmp_path):
     await scheduler._alert_if_feed_is_dark()
 
     assert not [t for t in titles(recorder) if "feed is down" in t]
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_alert_does_not_buy_permanent_silence(tmp_path):
+    """The latch must only close on a confirmed send. Setting it first meant one
+    dropped post silenced the rest of the outage - the exact failure this alert
+    exists to prevent, reintroduced inside the fix for it."""
+    from obbyschedule.espn import FEED_HEALTH
+
+    scheduler, recorder = build(tmp_path, "pre")
+    FEED_HEALTH.__init__()
+    FEED_HEALTH.failure("403", 403)
+    FEED_HEALTH.failure("403", 403)
+
+    async def _refuse(_embed):
+        return False
+
+    scheduler._notifier.send_embed = _refuse
+    await scheduler._alert_if_feed_is_dark()
+    assert scheduler._feed_alert_sent is False, "latched on a failed send"
+
+    # Next tick, delivery works: the alert must still go out.
+    scheduler._notifier.send_embed = scheduler._notifier.__class__.send_embed.__get__(
+        scheduler._notifier
+    )
+    await scheduler._alert_if_feed_is_dark()
+    assert [t for t in titles(recorder) if "feed is down" in t], "alert lost after a retry"

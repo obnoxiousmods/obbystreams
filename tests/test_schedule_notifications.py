@@ -351,3 +351,36 @@ def test_zone_abbreviations_are_readable(zone, expected):
     from obbyschedule.notify import zone_abbrev
 
     assert zone_abbrev(FIRST_CARD.astimezone(load_zone(zone))) == expected
+
+
+def test_an_abandoned_milestone_is_flagged_not_silently_marked_sent(scheduler, settings):
+    """A Discord outage longer than max_late_minutes used to convert 'undelivered,
+    will retry' into 'delivered': notify_due deliberately refuses to mark a failed
+    send as fired, but sweep_stale wrote the same ledger key once it aged out, and
+    staleness won. The channel never heard about the card, and nothing said so."""
+    state = ScheduleState()
+    now = MAIN_CARD + timedelta(hours=6)
+    said = []
+    scheduler._event_log = lambda message, level: said.append((message, level))
+
+    scheduler.sweep_stale(now, build_event(), state, settings)
+
+    # Still retired, so it cannot re-fire and spam after a redeploy.
+    assert state.has_fired(EVENT_ID, "warn:1440")
+    # ...but a human can now find out it never went out.
+    warned = [m for m, level in said if "never delivered" in m and level == "warn"]
+    assert warned, f"abandoned milestones were swept silently: {said}"
+
+
+def test_abandoning_is_reported_once_not_every_tick(scheduler, settings):
+    """Otherwise the anti-spam property of the ledger is traded for log spam."""
+    state = ScheduleState()
+    now = MAIN_CARD + timedelta(hours=6)
+    said = []
+    scheduler._event_log = lambda message, level: said.append((message, level))
+
+    scheduler.sweep_stale(now, build_event(), state, settings)
+    first = len(said)
+    scheduler.sweep_stale(now, build_event(), state, settings)
+
+    assert len(said) == first, "re-reported an already-abandoned milestone"

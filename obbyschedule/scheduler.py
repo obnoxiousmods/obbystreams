@@ -17,7 +17,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -68,6 +68,24 @@ CALENDAR_SKEW = timedelta(hours=12)
 #: Arming attempts that ended with the encode still down before we tell the
 #: channel that no usable feed has been found for a card that is under way.
 ACQUISITION_ALERT_ATTEMPTS = 3
+# Even a three-block card must retain a full main-card runway. The general
+# runtime cap is measured from the earliest segment, so without this floor an
+# unusually long early/prelim schedule could consume most of the failsafe before
+# the main card begins.
+MIN_MAIN_CARD_WINDOW = timedelta(hours=5)
+
+# Calendar/event correlation must not count boilerplate shared by every row.
+# Otherwise any cached "UFC Fight Night" can appear to match the next one.
+CORRELATION_NOISE = frozenset({"ufc", "fight", "night", "vs", "the", "main", "card", "prelims", "early"})
+
+
+def correlation_terms(value: str) -> set[str]:
+    """Distinctive normalized terms used to join calendar and detail rows."""
+    return {
+        token
+        for token in normalize_match_text(value).split()
+        if token not in CORRELATION_NOISE and (token.isdigit() or len(token) >= 3)
+    }
 
 
 class UfcScheduler:
@@ -147,9 +165,14 @@ class UfcScheduler:
 
     def _log(self, message: str, level: str = "info") -> None:
         logger.info("schedule: %s", message)
-        if self._event_log is not None:
+        # getattr, not attribute access: the pure decision helpers are unit-tested
+        # against `UfcScheduler.__new__(UfcScheduler)`, which never runs __init__.
+        # A logging call has no business raising just because of how the object
+        # under test was constructed.
+        event_log = getattr(self, "_event_log", None)
+        if event_log is not None:
             with contextlib.suppress(Exception):
-                self._event_log(f"schedule: {message}", level)
+                event_log(f"schedule: {message}", level)
 
     # ---- settings plumbing ---------------------------------------------
     def reload_settings(self) -> ScheduleSettings:
@@ -180,6 +203,16 @@ class UfcScheduler:
 
     # ---- pure policy ---------------------------------------------------
     @staticmethod
+    def hard_stop_for(event: UfcEvent, settings: ScheduleSettings) -> float | None:
+        """Absolute deadline with both whole-event and main-card safety room."""
+        first = event.first_card_start
+        if first is None:
+            return None
+        whole_event = first + timedelta(hours=settings.max_runtime_hours)
+        main_card = (event.last_card_start or first) + MIN_MAIN_CARD_WINDOW
+        return max(whole_event, main_card).timestamp()
+
+    @staticmethod
     def select_target(calendar: tuple[CalendarEntry, ...], now: datetime) -> CalendarEntry | None:
         """The card we should currently care about: the one in progress, else the next one."""
         for entry in calendar:
@@ -202,6 +235,7 @@ class UfcScheduler:
         settings: ScheduleSettings,
         *,
         stream_running: bool,
+        stream_verified: bool = True,
     ) -> Decision:
         """Pure verdict for one tick — no I/O, no mutation.
 
@@ -214,16 +248,14 @@ class UfcScheduler:
         moment = now.timestamp()
         # Ownership and the absolute event deadline are persisted precisely so
         # an ESPN outage cannot strand ffmpeg online forever.
-        derived_hard_stop = (
-            event.first_card_start + timedelta(hours=settings.max_runtime_hours)
-        ).timestamp() if event is not None and event.first_card_start is not None else None
+        derived_hard_stop = self.hard_stop_for(event, settings) if event is not None else None
         hard_stop_at = state.hard_stop_at or derived_hard_stop
         if state.started_by_scheduler and hard_stop_at is not None and moment >= hard_stop_at:
             event_id = event.event_id if event is not None else state.current_event_id
             phase = event.phase(now, settings) if event is not None else EventPhase.LIVE
             return Decision(
                 SchedulerAction.STOP,
-                f"max runtime failsafe: absolute event-window limit ({settings.max_runtime_hours}h) reached",
+                "max runtime failsafe: absolute event safety deadline reached",
                 phase,
                 event_id,
             )
@@ -249,6 +281,13 @@ class UfcScheduler:
                     phase,
                     event.event_id,
                 )
+            if stream_running and not stream_verified and phase in {EventPhase.PRE_ROLL, EventPhase.LIVE}:
+                return Decision(
+                    SchedulerAction.START,
+                    "replacing an unverified or wrong-segment feed",
+                    phase,
+                    event.event_id,
+                )
             if not stream_running:
                 # The encode went down mid-card (a crash the watchdog could not
                 # recover, or a scraper stand-down). Being level-triggered, the
@@ -263,11 +302,19 @@ class UfcScheduler:
             return Decision(SchedulerAction.IDLE, "operator stopped this event manually", phase, event.event_id)
         if event.is_final:
             return Decision(SchedulerAction.IDLE, "event already finished", EventPhase.FINISHED, event.event_id)
+        if stream_running and not stream_verified and phase in {EventPhase.PRE_ROLL, EventPhase.LIVE}:
+            return Decision(
+                SchedulerAction.START,
+                "quarantining an unverified running feed",
+                phase,
+                event.event_id,
+            )
         if stream_running:
             return Decision(SchedulerAction.IDLE, "stream already running (not scheduler-owned)", phase, event.event_id)
         if now < first - timedelta(minutes=settings.lead_minutes):
             return Decision(SchedulerAction.IDLE, "waiting for the pre-roll window", phase, event.event_id)
-        if moment - first.timestamp() >= settings.max_runtime_hours * 3600:
+        admission_deadline = self.hard_stop_for(event, settings)
+        if admission_deadline is not None and moment >= admission_deadline:
             return Decision(SchedulerAction.IDLE, "event window has already lapsed", phase, event.event_id)
         return Decision(SchedulerAction.START, f"{settings.lead_minutes}m pre-roll for {event.short_name}", phase, event.event_id)
 
@@ -302,6 +349,7 @@ class UfcScheduler:
         settings: ScheduleSettings,
         *,
         stream_running: bool,
+        stream_verified: bool = True,
     ) -> bool:
         """Whether to take ownership of an already-running stream.
 
@@ -315,7 +363,7 @@ class UfcScheduler:
         window, never for a card the operator vetoed or one already stood down.
         Turning auto-schedule off opts out entirely.
         """
-        if not settings.enabled or not stream_running or state.started_by_scheduler:
+        if not settings.enabled or not stream_running or not stream_verified or state.started_by_scheduler:
             return False
         if event.is_final:
             return False
@@ -395,13 +443,28 @@ class UfcScheduler:
         first = event.first_card_start
         if first is None:
             return
+        # These are ABANDONED, not delivered. The distinction matters: a
+        # milestone that failed to send is retried on the next tick because
+        # notify_due refuses to mark it fired (see there), but once it ages past
+        # the cutoff this sweep used to write the very same ledger key and the
+        # retry stopped. A Discord outage longer than max_late_minutes therefore
+        # converted "undelivered, will retry" into "delivered" and the channel
+        # never heard about the card at all. Recording them separately keeps the
+        # anti-spam behaviour while leaving a trace a human can find.
         for minutes in notify.warn_minutes:
             due = first - timedelta(minutes=minutes)
             if now - due > cutoff:
-                state.mark_fired(event.event_id, f"warn:{minutes}")
+                self._abandon(state, event, f"warn:{minutes}")
         for card in event.cards:
             if now - card.start > cutoff:
-                state.mark_fired(event.event_id, f"card:{card.key}")
+                self._abandon(state, event, f"card:{card.key}")
+
+    def _abandon(self, state: ScheduleState, event: UfcEvent, key: str) -> None:
+        """Retire a milestone that is now too late to be worth sending."""
+        if state.has_fired(event.event_id, key):
+            return
+        state.mark_fired(event.event_id, key)
+        self._log(f"{event.name}: {key} was never delivered and is now too late to send", "warn")
 
     # ---- async orchestration -------------------------------------------
     async def _alert_if_feed_is_dark(self) -> None:
@@ -425,9 +488,12 @@ class UfcScheduler:
         dark = failures >= FEED_DARK_FAILURES and (stale is None or stale >= FEED_DARK_SECONDS)
         if not dark or self._feed_alert_sent or not self._notifier.active:
             return
-        self._feed_alert_sent = True
         when = "never since boot" if stale is None else f"{stale / 3600:.1f}h ago"
-        await self._notifier.send_embed(
+        # Latch only on a confirmed send. Setting it first meant a single dropped
+        # post bought permanent silence for the rest of the outage - which is the
+        # exact failure this alert exists to prevent, reintroduced inside the fix
+        # for it.
+        delivered = await self._notifier.send_embed(
             {
                 "title": "\u26a0\ufe0f UFC schedule feed is down",
                 "description": (
@@ -446,6 +512,7 @@ class UfcScheduler:
                 ],
             }
         )
+        self._feed_alert_sent = bool(delivered)
 
     async def refresh_calendar(self, *, force: bool = False) -> tuple[CalendarEntry, ...]:
         """Re-fetch the season calendar when the cache is stale."""
@@ -480,20 +547,28 @@ class UfcScheduler:
         utc_day = target.start.astimezone(UTC).date()
         if utc_day != eastern_day:
             days.append(utc_day)
-        candidates: list[UfcEvent] = []
-        for day in days:
+
+        async def fetch_day(day: date) -> tuple[UfcEvent, ...]:
             fetch_many = getattr(self._provider, "fetch_events", None)
             if callable(fetch_many):
-                candidates.extend(await fetch_many(day))
-            else:
-                event = await self._provider.fetch_event(day)
-                if event is not None:
-                    candidates.append(event)
+                return tuple(await fetch_many(day))
+            event = await self._provider.fetch_event(day)
+            return (event,) if event is not None else ()
+
+        candidates: list[UfcEvent] = []
+        results = await asyncio.gather(*(fetch_day(day) for day in days), return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("espn event-detail candidate day failed: %s", result)
+                continue
+            candidates.extend(result)
         if candidates:
-            target_terms = set(normalize_match_text(target.label).split())
+            target_terms = correlation_terms(target.label)
 
             def rank(event: UfcEvent) -> tuple[int, float]:
-                event_terms = set(normalize_match_text(event.name).split())
+                event_terms = correlation_terms(event.name)
                 overlap = len(target_terms & event_terms)
                 first = event.first_card_start or target.start
                 return (-overlap, abs((first - target.start).total_seconds()))
@@ -509,9 +584,12 @@ class UfcScheduler:
         age = now.timestamp() - self._state.event_fetched_at
         if age < 0 or age > self._settings.cache_max_age_hours * 3600:
             return None
-        target_terms = set(normalize_match_text(target.label).split())
-        cached_terms = set(normalize_match_text(cached.name).split())
-        if len(target_terms & cached_terms) < 2:
+        target_terms = correlation_terms(target.label)
+        cached_terms = correlation_terms(cached.name)
+        if target_terms and not target_terms.intersection(cached_terms):
+            return None
+        cached_start = cached.first_card_start
+        if cached_start is None or abs((cached_start - target.start).total_seconds()) > CALENDAR_LOOKBACK.total_seconds():
             return None
         return cached
 
@@ -586,9 +664,7 @@ class UfcScheduler:
             )
             self._last_start_result = result
             stamp = (now or datetime.now(UTC)).timestamp()
-            hard_stop_at = (
-                event.first_card_start + timedelta(hours=self._settings.max_runtime_hours)
-            ).timestamp() if event.first_card_start else None
+            hard_stop_at = self.hard_stop_for(event, self._settings)
             if result.accepted:
                 if result.status is StartStatus.STARTED:
                     self._state.begin_event(
@@ -737,11 +813,24 @@ class UfcScheduler:
         segment_key = segment.key if segment is not None else None
         segment_changed = bool(segment_key and segment_key != self._state.active_segment_key)
         source_satisfied = False
+        source_verification_available = False
+        checker = None
+        source_acceptable = True
+        acceptance_checker = None
         if self._sources is not None:
             checker = getattr(self._sources, "is_satisfied", None)
             if callable(checker):
+                source_verification_available = True
                 with contextlib.suppress(Exception):
                     source_satisfied = bool(checker(context))
+            acceptance_checker = getattr(self._sources, "is_stream_acceptable", None)
+            if callable(acceptance_checker):
+                source_acceptable = False
+                with contextlib.suppress(Exception):
+                    source_acceptable = bool(acceptance_checker(context))
+            elif source_verification_available:
+                # Older resolvers exposed only the stricter quality gate.
+                source_acceptable = source_satisfied
         refresh_due = moment.timestamp() - self._state.last_source_refresh_at >= settings.acquisition_poll_seconds
         in_window = event.phase(moment, settings) in {EventPhase.PRE_ROLL, EventPhase.LIVE}
         acquisition_allowed = (
@@ -770,12 +859,32 @@ class UfcScheduler:
             self._state.active_segment_key = segment_key
             await self.persist()
 
+            # Refresh may have replaced a stale live feed or populated enough
+            # evidence for the health gate. Re-read it before adoption/decision
+            # so we neither restart twice nor adopt the feed we just disproved.
+            if callable(checker):
+                with contextlib.suppress(Exception):
+                    source_satisfied = bool(checker(context))
+            if callable(acceptance_checker):
+                source_acceptable = False
+                with contextlib.suppress(Exception):
+                    source_acceptable = bool(acceptance_checker(context))
+            elif source_verification_available:
+                source_acceptable = source_satisfied
+
+        stream_verified = source_acceptable
+
         # Take ownership of a stream that was already up when the card started,
         # so the post-card stand-down still happens.
-        if self.should_adopt(moment, event, self._state, settings, stream_running=stream_running):
-            hard_stop_at = (
-                event.first_card_start + timedelta(hours=settings.max_runtime_hours)
-            ).timestamp() if event.first_card_start else None
+        if self.should_adopt(
+            moment,
+            event,
+            self._state,
+            settings,
+            stream_running=stream_running,
+            stream_verified=stream_verified,
+        ):
+            hard_stop_at = self.hard_stop_for(event, settings)
             self._state.begin_event(
                 event.event_id,
                 by_scheduler=True,
@@ -788,11 +897,28 @@ class UfcScheduler:
         self.sweep_stale(moment, event, self._state, settings)
         await self.notify_due(moment, event)
 
-        decision = self.decide(moment, event, self._state, settings, stream_running=stream_running)
+        decision = self.decide(
+            moment,
+            event,
+            self._state,
+            settings,
+            stream_running=stream_running,
+            stream_verified=stream_verified,
+        )
         self._last_decision = decision
         if decision.acts:
             await self.apply(decision, event, context, now=moment)
-        if self._state.started_by_scheduler and stream_running and self._state.note_encoder_started(moment=moment.timestamp()):
+        start_left_encoder_up = not (
+            decision.action is SchedulerAction.START
+            and self._last_start_result is not None
+            and self._last_start_result.status is not StartStatus.STARTED
+        )
+        if (
+            self._state.started_by_scheduler
+            and stream_running
+            and start_left_encoder_up
+            and self._state.note_encoder_started(moment=moment.timestamp())
+        ):
             await self.persist()
         if decision.action is SchedulerAction.START:
             await self.note_arming_progress(event, stream_running=stream_running, now=moment)
