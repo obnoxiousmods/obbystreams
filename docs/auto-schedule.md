@@ -141,6 +141,10 @@ schedule:
   max_runtime_hours: 8
   calendar_refresh_seconds: 3600
   live_poll_seconds: 120
+  acquisition_poll_seconds: 60   # retry cadence while armed with nothing on air
+  stall_hours: 6                 # stand-down backstop when ESPN never marks the card final
+  stall_idle_minutes: 45
+  require_event_match: true      # a feed must identify the tracked card
   display_timezone: Canada/Pacific
   state_path: /etc/obbystreams/schedule_state.json
   notify:
@@ -167,6 +171,48 @@ leaves the box via `/api/config` or `/api/status`.
 * `POST /api/schedule` (guarded) → `{"enabled": bool}` to toggle, `{"test_notification": true}` to
   post one test embed.
 * The same snapshot is embedded in `/api/status` under `schedule`, so the SPA needs no extra polling.
+
+## Event-aware source discovery
+
+Arming on time is only half the job — the encode also has to be carrying *that card*. Until
+2026-08-02 it frequently was not: the scraper's only questions were "does this channel say UFC?"
+and "is there a date within 30h?", so the feeds auto-selected for one Saturday stayed selected the
+next. On 2026-08-01 the cockpit armed perfectly for Medić vs. Rodriguez and then ran the entire
+event on the three soursignal channels picked a week earlier for Ankalaev vs. Guskov, reporting
+healthy the whole time (ffmpeg was decoding fine — it was simply the wrong fight).
+
+Four things changed:
+
+1. **The card's identity reaches the scraper.** `UfcEvent.context()` builds an `EventContext`
+   (fighter surnames, the `UFC 330`-style event number, and ESPN's real per-segment start times).
+   The scheduler publishes it every tick through the `SourceResolver` protocol, implemented in the
+   cockpit by `CockpitSourceResolver`. Names are folded to ASCII (`normalize_match_text`), because
+   ESPN says `Medić` and the provider says `MEDIC`.
+2. **Discovery runs before the start, not after.** `UfcScheduler.apply()` refreshes sources first.
+   Previously the encode came up on stale links and the refresh that followed then declined to touch
+   a stream that looked healthy — `should_protect_live_private_stream` pinned the mistake for hours.
+   Protection is now forfeited by a feed that cannot be the tracked card, or one chosen before the
+   card moved to its next segment.
+3. **Unverified means nothing goes on air.** `schedule_start_links()` only returns feeds tagged with
+   the tracked `event_id`; with none, the cockpit stays armed with the encode *down* and retries on
+   `acquisition_poll_seconds` (60s). Discord gets a warning if the card starts with nothing found.
+   Public backup sources are pulled in after `public_fallback_after_attempts` failed sweeps.
+4. **Switching is bounded.** Every swap costs viewers a few seconds, so `switch_cooldown_seconds`,
+   `switch_confirm_samples` and `max_switches_per_card` stop it flapping mid-fight. A *confirmed
+   wrong-card* feed overrides the cooldown: that is a correction, not an improvement.
+
+Sources carry `event_id` + `discovered_at` in `stream.sources`. `purge_foreign_event_sources()` runs
+at every arming and the stand-down retires the card's feeds and clears `locked_source_id`.
+`GET /api/schedule` gains a `source_state` block (matched sources, match terms, rejected candidates
+with reasons, switch count), and the cockpit renders it — including
+`🔍 Acquiring a verified source for … — 6 candidates rejected (wrong event)`.
+
+### Stand-down backstop
+
+ESPN sometimes never flips a card's final flag. `card_stalled()` stands the stream down when the
+last segment started more than `stall_hours` (6) ago *and* no bout has been decided for
+`stall_idle_minutes` (45) — both conditions, so a genuinely slow card is never cut off mid-broadcast.
+The 8h `max_runtime_hours` failsafe remains as the outer bound.
 
 ## Cockpit UI
 

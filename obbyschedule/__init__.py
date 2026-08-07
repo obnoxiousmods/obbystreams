@@ -14,6 +14,7 @@ from .models import (
     CalendarEntry,
     CardSegment,
     Decision,
+    EventContext,
     EventPhase,
     Milestone,
     MilestoneKind,
@@ -24,6 +25,7 @@ from .models import (
     UfcEvent,
 )
 from .notify import DiscordNotifier, EmbedBuilder
+from .protocols import SourceResolver
 from .scheduler import UfcScheduler
 from .state import ScheduleState, ScheduleStateStore
 
@@ -35,6 +37,7 @@ __all__ = [
     "DiscordNotifier",
     "EmbedBuilder",
     "EspnScheduleProvider",
+    "EventContext",
     "EventPhase",
     "Milestone",
     "MilestoneKind",
@@ -43,6 +46,7 @@ __all__ = [
     "ScheduleState",
     "ScheduleStateStore",
     "SchedulerAction",
+    "SourceResolver",
     "StopReason",
     "UfcEvent",
     "UfcScheduler",

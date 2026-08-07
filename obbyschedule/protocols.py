@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Protocol
 
-from .models import CalendarEntry, NotifySettings, ScheduleSettings, UfcEvent
+from .models import CalendarEntry, EventContext, NotifySettings, ScheduleSettings, UfcEvent
 from .notify import EmbedBuilder
 
 
@@ -23,6 +23,19 @@ class ScheduleProvider(Protocol):
     async def fetch_calendar(self) -> tuple[CalendarEntry, ...]: ...
 
     async def fetch_event(self, day: date) -> UfcEvent | None: ...
+
+
+class SourceResolver(Protocol):
+    """The cockpit's source-discovery side, seen from the scheduler.
+
+    ``refresh`` runs one discovery sweep for the given card; ``publish`` hands
+    over (or clears, with ``None``) the context the scraper matches against so
+    the background sweeps in between ticks stay event-aware too.
+    """
+
+    async def refresh(self, reason: str, context: EventContext | None = None) -> None: ...
+
+    def publish(self, context: EventContext | None) -> None: ...
 
 
 class Notifier(Protocol):

@@ -9,6 +9,7 @@ without a network, an event loop, or ffmpeg.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -48,6 +49,69 @@ CARD_LABELS: dict[int, tuple[str, ...]] = {
 }
 
 EASTERN = "America/New_York"
+
+#: Tokens that carry no identifying power when matching a provider channel title
+#: against an ESPN card. "UFC" is on every candidate by construction (it is a
+#: required keyword upstream), and the connective words show up in every
+#: "A vs. B" title, so treating them as event terms would match last week's card
+#: just as happily as tonight's.
+_STOPWORD_TERMS = frozenset(
+    {
+        "ufc",
+        "fight",
+        "night",
+        "vs",
+        "and",
+        "the",
+        "de",
+        "da",
+        "dos",
+        "van",
+        "von",
+        "jr",
+        "sr",
+        "st",
+        "main",
+        "card",
+        "prelims",
+        "early",
+    }
+)
+
+#: Surnames shorter than this are too collision-prone to use as a match term
+#: (e.g. "Li", "Vo") — the event number and the other fighter still carry it.
+MIN_TERM_LENGTH = 4
+
+
+def normalize_match_text(text: str) -> str:
+    """Fold text to lowercase ASCII for provider-title matching.
+
+    Provider playlists are ASCII and inconsistently punctuated, while ESPN
+    returns proper diacritics ("Medić", "Procházka"). Stripping combining marks
+    is what makes ``medic`` match ``Medić`` instead of silently failing the
+    event gate and holding the stream down through a whole card.
+    """
+    folded = unicodedata.normalize("NFKD", text or "")
+    ascii_only = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", ascii_only.lower()).strip()
+
+
+def event_number_from(name: str) -> str | None:
+    """The numbered-card ordinal in an event name ("UFC 330: ..." -> "330")."""
+    match = re.search(r"\bufc\s+(\d{2,4})\b", normalize_match_text(name))
+    return match.group(1) if match else None
+
+
+def surname_terms(*names: str) -> tuple[str, ...]:
+    """Distinctive surname tokens from fighter/event names, in first-seen order."""
+    terms: list[str] = []
+    for raw in names:
+        for token in normalize_match_text(raw).split():
+            if token in _STOPWORD_TERMS or len(token) < MIN_TERM_LENGTH or token.isdigit():
+                continue
+            if token not in terms:
+                terms.append(token)
+    return tuple(terms)
 
 
 @lru_cache(maxsize=32)
@@ -213,6 +277,65 @@ class CardSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class EventContext:
+    """What the source scraper needs to recognise *this* card in a provider playlist.
+
+    The cockpit's private-IPTV scraper historically matched on the literal word
+    "UFC" plus a ±30h date window, which cannot tell tonight's card from the one
+    it selected last Saturday. Handing it the tracked event's identifying terms
+    and real segment times is what makes "is this the right stream?" answerable.
+    """
+
+    event_id: str
+    name: str
+    short_name: str
+    event_number: str | None
+    terms: tuple[str, ...]
+    #: (segment start, label) in UTC, straight from ESPN — replaces the scraper's
+    #: hardcoded 5pm/7pm/9pm ET phase guesses while a card is tracked.
+    segments: tuple[tuple[datetime, str], ...]
+    first_card_start: datetime | None
+    last_card_start: datetime | None
+    phase: EventPhase = EventPhase.IDLE
+    is_final: bool = False
+
+    @property
+    def active(self) -> bool:
+        """Whether the card is close enough that source discovery should be event-gated."""
+        return self.phase in {EventPhase.PRE_ROLL, EventPhase.LIVE, EventPhase.WRAPPING}
+
+    def matches(self, text: str) -> tuple[bool, list[str]]:
+        """Whether a provider title identifies this card, and which terms hit."""
+        haystack = normalize_match_text(text)
+        if not haystack:
+            return False, []
+        hits = [term for term in self.terms if re.search(rf"\b{re.escape(term)}\b", haystack)]
+        if self.event_number and re.search(rf"\bufc\s+{self.event_number}\b", haystack):
+            hits.append(f"ufc {self.event_number}")
+        return bool(hits), hits
+
+    def current_segment(self, now: datetime) -> tuple[datetime, str] | None:
+        """The segment that has most recently started, if any."""
+        started = [segment for segment in self.segments if segment[0] <= now]
+        return started[-1] if started else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe projection for ``/api/schedule`` and the cockpit banner."""
+        return {
+            "event_id": self.event_id,
+            "name": self.name,
+            "short_name": self.short_name,
+            "event_number": self.event_number,
+            "terms": list(self.terms),
+            "segments": [{"start": start.isoformat(), "label": label} for start, label in self.segments],
+            "first_card_start": self.first_card_start.isoformat() if self.first_card_start else None,
+            "last_card_start": self.last_card_start.isoformat() if self.last_card_start else None,
+            "phase": str(self.phase),
+            "is_final": self.is_final,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class UfcEvent:
     """A single UFC card as reported by ESPN, reduced to what the scheduler needs."""
 
@@ -225,6 +348,8 @@ class UfcEvent:
     is_final: bool
     main_event_bout: str | None = None
     main_event_winner: str | None = None
+    #: Every athlete on the card, so a provider title naming the co-main still matches.
+    fighters: tuple[str, ...] = ()
 
     @property
     def first_card_start(self) -> datetime | None:
@@ -233,6 +358,42 @@ class UfcEvent:
     @property
     def last_card_start(self) -> datetime | None:
         return self.cards[-1].start if self.cards else None
+
+    @property
+    def progress_signature(self) -> str:
+        """Fingerprint of how far the card has got, for stall detection."""
+        return "|".join(f"{card.key}:{card.completed_bouts}/{card.bout_count}" for card in self.cards)
+
+    def match_terms(self) -> tuple[str, ...]:
+        """Distinctive tokens a provider title would carry for this card.
+
+        Built from the event name (already surnames-only: "UFC Fight Night:
+        Medić vs. Rodriguez") plus the surname of each competitor. First names
+        are deliberately excluded — they collide across cards far more often
+        than they help.
+        """
+        names = [self.name, self.short_name]
+        for bout in (self.main_event_bout or "", *self.fighters):
+            for side in re.split(r"\bvs\.?\b", bout, flags=re.IGNORECASE):
+                tokens = normalize_match_text(side).split()
+                if tokens:
+                    names.append(tokens[-1])
+        return surname_terms(*names)
+
+    def context(self, now: datetime, settings: ScheduleSettings) -> EventContext:
+        """Freeze what the source scraper needs to identify this card right now."""
+        return EventContext(
+            event_id=self.event_id,
+            name=self.name,
+            short_name=self.short_name,
+            event_number=event_number_from(self.name) or event_number_from(self.short_name),
+            terms=self.match_terms(),
+            segments=tuple((card.start, card.label) for card in self.cards),
+            first_card_start=self.first_card_start,
+            last_card_start=self.last_card_start,
+            phase=self.phase(now, settings),
+            is_final=self.is_final,
+        )
 
     def phase(self, now: datetime, settings: ScheduleSettings) -> EventPhase:
         """Classify the event relative to ``now``.
@@ -354,6 +515,16 @@ class ScheduleSettings:
     max_runtime_hours: int = 8
     calendar_refresh_seconds: int = 3600
     live_poll_seconds: int = 120
+    #: Tighter cadence while the card is in its window but nothing is on air, so
+    #: a feed that only appears at the bell is picked up in a minute, not five.
+    acquisition_poll_seconds: int = 60
+    #: Stand-down backstop for a card ESPN never marks final: this long after the
+    #: last segment started with no bout completing, the card is over in practice.
+    stall_hours: int = 6
+    stall_idle_minutes: int = 45
+    #: Whether source discovery must positively identify the tracked card. Off is
+    #: the pre-2026-08 behaviour (any "UFC" channel in the date window will do).
+    require_event_match: bool = True
     display_timezone: str = DEFAULT_DISPLAY_TZ
     state_path: str = DEFAULT_STATE_PATH
     notify: NotifySettings = field(default_factory=NotifySettings)
@@ -371,6 +542,10 @@ class ScheduleSettings:
             max_runtime_hours=_as_int(section.get("max_runtime_hours"), 8, minimum=1, maximum=24),
             calendar_refresh_seconds=_as_int(section.get("calendar_refresh_seconds"), 3600, minimum=300, maximum=86400),
             live_poll_seconds=_as_int(section.get("live_poll_seconds"), 120, minimum=30, maximum=3600),
+            acquisition_poll_seconds=_as_int(section.get("acquisition_poll_seconds"), 60, minimum=30, maximum=900),
+            stall_hours=_as_int(section.get("stall_hours"), 6, minimum=1, maximum=24),
+            stall_idle_minutes=_as_int(section.get("stall_idle_minutes"), 45, minimum=5, maximum=720),
+            require_event_match=_as_bool(section.get("require_event_match"), True),
             display_timezone=_as_str(section.get("display_timezone"), DEFAULT_DISPLAY_TZ),
             state_path=_as_str(section.get("state_path"), DEFAULT_STATE_PATH),
             notify=NotifySettings.from_config(section.get("notify")),
@@ -388,6 +563,10 @@ class ScheduleSettings:
             "max_runtime_hours": self.max_runtime_hours,
             "calendar_refresh_seconds": self.calendar_refresh_seconds,
             "live_poll_seconds": self.live_poll_seconds,
+            "acquisition_poll_seconds": self.acquisition_poll_seconds,
+            "stall_hours": self.stall_hours,
+            "stall_idle_minutes": self.stall_idle_minutes,
+            "require_event_match": self.require_event_match,
             "display_timezone": self.display_timezone,
             "state_path": self.state_path,
             "notify": self.notify.to_config(),

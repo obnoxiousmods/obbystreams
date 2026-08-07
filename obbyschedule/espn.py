@@ -27,6 +27,22 @@ from .models import CARD_LABELS, CalendarEntry, CardSegment, ScheduleSettings, U
 
 logger = logging.getLogger("obbystreams.schedule.espn")
 
+#: ESPN's public API is fetched with the library's own User-Agent rather than the
+#: cockpit's.
+#:
+#: The shared httpx client sends a Firefox string because the stream-source
+#: scrapers need one, and on 2026-08-04 ESPN began answering **403** to
+#: browser-like agents on this endpoint while still serving plain library ones.
+#: That silently killed every UFC alert: no scoreboard means no tracked card, no
+#: milestones and no Discord post, and nothing else in the cockpit depends on
+#: ESPN, so the only symptom was silence.
+#:
+#: Verified against the live endpoint: "curl/8.16.0" and "python-httpx/..." return
+#: 200, while a Firefox UA, "obbystreams/1.0 (+https://s.obby.ca)" and any agent
+#: carrying a URL return 403. It is also the honest thing to send - the scheduler
+#: is a script reading a public JSON API, not a browser.
+_ESPN_HEADERS = {"User-Agent": f"python-httpx/{httpx.__version__}"}
+
 #: Bouts in these states never complete (scratched from the card), so they must
 #: not hold the event open forever.
 DEAD_STATUSES = frozenset({"STATUS_CANCELED", "STATUS_CANCELLED", "STATUS_POSTPONED", "STATUS_ABANDONED"})
@@ -89,11 +105,30 @@ class EspnScheduleProvider:
         return EspnScheduleProvider(self._client, settings)
 
     # ---- network -------------------------------------------------------
+    #: ESPN's public API is fetched with the library's own User-Agent rather than
+    #: the cockpit's.
+    #:
+    #: The shared httpx client sends a Firefox string because the stream-source
+    #: scrapers need one, and on 2026-08-04 ESPN began answering **403** to
+    #: browser-like agents on this endpoint while still serving plain library
+    #: ones. That silently killed every UFC alert: no scoreboard means no tracked
+    #: card, no milestones and no Discord post, and nothing else in the cockpit
+    #: depends on ESPN so the only symptom was silence.
+    #:
+    #: Verified against the live endpoint: "curl/8.16.0" and "python-httpx/..."
+    #: return 200, while a Firefox UA, "obbystreams/1.0 (+https://s.obby.ca)" and
+    #: any agent carrying a URL return 403. This is also the honest thing to send
+    #: - the scheduler is a script reading a public JSON API, not a browser.
     async def fetch_scoreboard(self, day: date | None = None) -> dict[str, Any]:
         """GET the scoreboard, optionally for a specific day. Returns {} on any failure."""
         params = {"dates": day.strftime("%Y%m%d")} if day is not None else None
         try:
-            response = await self._client.get(self._settings.scoreboard_url, params=params, timeout=15.0)
+            response = await self._client.get(
+                self._settings.scoreboard_url,
+                params=params,
+                timeout=15.0,
+                headers=_ESPN_HEADERS,
+            )
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -204,6 +239,16 @@ class EspnScheduleProvider:
             if competitor.get("winner"):
                 winner = athlete
 
+        # Every athlete on the card, not just the headliners: provider channels
+        # for the prelims blocks are often titled after a co-main or a featured
+        # undercard bout, and those titles are what the source matcher reads.
+        fighters: list[str] = []
+        for row in competitions:
+            for entry in _sequence(_mapping(row).get("competitors")):
+                athlete = _text(_mapping(_mapping(entry).get("athlete")).get("displayName"))
+                if athlete and athlete not in fighters:
+                    fighters.append(athlete)
+
         return UfcEvent(
             event_id=_text(payload.get("id")),
             name=_text(payload.get("name")),
@@ -214,4 +259,5 @@ class EspnScheduleProvider:
             is_final=is_final,
             main_event_bout=" vs. ".join(names) if names else None,
             main_event_winner=winner or None,
+            fighters=tuple(fighters),
         )

@@ -54,6 +54,8 @@ Some upstreams answer with HTTP 200 but are not usable streams. Candidate probin
 - tiny ended VOD windows that look unlike a live source.
 - placeholder rows such as “No Scheduled Event”, 24/7 rows, replays, classics, preshows, and post-fight press conferences.
 
+**Event gate (since 2026-08-02).** When the auto-schedule is tracking a card, the scorer also receives that card's identity and a candidate must positively identify it — a fighter surname, the `UFC 330`-style event number, or failing that a date that lands on the card itself. A perfectly well-formed UFC channel for a *different* card is rejected outright, and rejections are reported through `GET /api/schedule` → `source_state.rejected`. See [auto-schedule.md](auto-schedule.md#event-aware-source-discovery).
+
 The scorer is intentionally heuristic. It does not claim perfect schedule knowledge; it makes defensible decisions from provider metadata and playback evidence. Tune `keywords`, `reject_keywords`, `min_score`, `date_window_hours`, and `require_date_window_match` when provider naming changes. For the current provider shape, requiring a current date-window match is important because generic UFC/PPV rows can remain in the playlist even when there is no active fight.
 
 ## Private Connection Budget

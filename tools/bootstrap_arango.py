@@ -40,16 +40,10 @@ def main():
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
-    status, body = request(
-        "POST",
-        f"{base}/_api/database",
-        args.root_user,
-        args.root_password,
-        {
-            "name": args.database,
-            "users": [{"username": args.app_user, "passwd": args.app_password, "active": True}],
-        },
-    )
+    status, body = request("POST", f"{base}/_api/database", args.root_user, args.root_password, {
+        "name": args.database,
+        "users": [{"username": args.app_user, "passwd": args.app_password, "active": True}],
+    })
     if status not in (200, 201, 409):
         print(f"database create failed: HTTP {status} {body}", file=sys.stderr)
         return 1

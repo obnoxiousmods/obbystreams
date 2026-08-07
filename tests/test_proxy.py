@@ -105,7 +105,10 @@ def test_proxy_url_encodes_url():
 
 
 def test_rewrite_m3u8_rewrites_relative_segments():
-    playlist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nsegment0.ts\n#EXTINF:4.0,\nsegment1.ts\n#EXT-X-ENDLIST\n"
+    playlist = (
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+        "#EXTINF:4.0,\nsegment0.ts\n#EXTINF:4.0,\nsegment1.ts\n#EXT-X-ENDLIST\n"
+    )
     raw_url = "https://example.com/live/playlist.m3u8?key=abc"
     rewritten = _rewrite_m3u8(playlist, raw_url)
     assert "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Flive%2Fsegment0.ts" in rewritten
@@ -114,7 +117,10 @@ def test_rewrite_m3u8_rewrites_relative_segments():
 
 
 def test_rewrite_m3u8_rewrites_key_uri():
-    playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:4.0,\nsegment.ts\n'
+    playlist = (
+        '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        "#EXTINF:4.0,\nsegment.ts\n"
+    )
     raw_url = "https://example.com/live/playlist.m3u8"
     rewritten = _rewrite_m3u8(playlist, raw_url)
     assert "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Flive%2Fkey.bin" in rewritten

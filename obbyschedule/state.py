@@ -59,6 +59,20 @@ class ScheduleState:
     #: Event the scheduler has already put back to standby.
     handled_event_id: str | None = None
     notified: dict[str, list[str]] = field(default_factory=dict)
+    #: Bout-completion fingerprint of the tracked card and when it last changed.
+    #: ESPN occasionally never flips a card's final flag; without a record of
+    #: when the scoreboard last moved there is nothing to distinguish "the card
+    #: is still going" from "the feed ended two hours ago and nobody told us".
+    progress_signature: str | None = None
+    progress_seen_at: float | None = None
+
+    def note_progress(self, signature: str, *, moment: float) -> bool:
+        """Record the card's completion fingerprint; True when it changed."""
+        if self.progress_signature == signature and self.progress_seen_at is not None:
+            return False
+        self.progress_signature = signature
+        self.progress_seen_at = moment
+        return True
 
     def has_fired(self, event_id: str, key: str) -> bool:
         return key in self.notified.get(event_id, [])
@@ -90,6 +104,8 @@ class ScheduleState:
             self.started_at = None
         self.current_event_id = event_id
         self.final_seen_at = None
+        self.progress_signature = None
+        self.progress_seen_at = None
         if self.suppressed_event_id != event_id:
             self.suppressed_event_id = None
         return True
@@ -132,6 +148,8 @@ class ScheduleState:
             "suppressed_event_id": self.suppressed_event_id,
             "handled_event_id": self.handled_event_id,
             "notified": self.notified,
+            "progress_signature": self.progress_signature,
+            "progress_seen_at": self.progress_seen_at,
         }
 
     @classmethod
@@ -164,6 +182,8 @@ class ScheduleState:
             suppressed_event_id=_text_or_none(data.get("suppressed_event_id")),
             handled_event_id=_text_or_none(data.get("handled_event_id")),
             notified=notified,
+            progress_signature=_text_or_none(data.get("progress_signature")),
+            progress_seen_at=_float_or_none(data.get("progress_seen_at")),
         )
 
 

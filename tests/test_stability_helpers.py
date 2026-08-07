@@ -233,7 +233,13 @@ def test_effective_stream_links_keeps_auto_public_sources_out_of_ffmpeg_pool():
 
 
 def test_public_stream_inventory_includes_manual_and_auto_sources():
-    cfg = normalize_config({"public_sources": [{"id": "manual", "label": "Manual", "url": "https://a.example.com/live.m3u8"}]})
+    cfg = normalize_config(
+        {
+            "public_sources": [
+                {"id": "manual", "label": "Manual", "url": "https://a.example.com/live.m3u8"}
+            ]
+        }
+    )
     import app as obbystreams_app
 
     original_sources = list(obbystreams_app._AUTO_SOURCES)
@@ -337,7 +343,11 @@ def test_private_iptv_merge_and_disable_only_touch_auto_sources():
     cfg = normalize_config(
         {
             "private_iptv": {"auto_source_prefix": "private-iptv"},
-            "stream": {"sources": [{"id": "manual", "label": "Manual", "url": "https://manual.example/live.m3u8", "enabled": True}]},
+            "stream": {
+                "sources": [
+                    {"id": "manual", "label": "Manual", "url": "https://manual.example/live.m3u8", "enabled": True}
+                ]
+            },
         }
     )
     accepted = [
@@ -369,7 +379,7 @@ def test_failed_private_stream_remains_eligible_for_recovery():
 
 
 def test_hls_metrics_reads_dash_generated_hls_media_playlists(tmp_path):
-    (tmp_path / "ufc.mpd").write_text('<MPD type="dynamic"><Period /></MPD>', encoding="utf-8")
+    (tmp_path / "ufc.mpd").write_text("<MPD type=\"dynamic\"><Period /></MPD>", encoding="utf-8")
     (tmp_path / "ufc.m3u8").write_text("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2500000\nmedia_0.m3u8\n", encoding="utf-8")
     (tmp_path / "media_0.m3u8").write_text(
         "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:4.0,\nufc_chunk_0_000007.m4s\n",
@@ -431,7 +441,9 @@ def test_trusted_request_origin_requires_same_origin():
 
 
 def test_nvidia_smi_parsers_extract_gpu_and_process_metrics():
-    gpus = parse_nvidia_gpu_csv("0, NVIDIA RTX 4000, GPU-abc, 550.54, P2, 63, 72, 38, 8192, 2048, 6144, 82.5, 120.0, 1500, 5001\n")
+    gpus = parse_nvidia_gpu_csv(
+        "0, NVIDIA RTX 4000, GPU-abc, 550.54, P2, 63, 72, 38, 8192, 2048, 6144, 82.5, 120.0, 1500, 5001\n"
+    )
     assert gpus[0]["index"] == 0
     assert gpus[0]["memory_used_pct"] == 25.0
     assert gpus[0]["power_draw_w"] == 82.5
@@ -439,6 +451,9 @@ def test_nvidia_smi_parsers_extract_gpu_and_process_metrics():
     processes = parse_nvidia_process_csv("GPU-abc, 1234, ffmpeg, 512\n")
     assert processes == [{"gpu_uuid": "GPU-abc", "pid": 1234, "process_name": "ffmpeg", "used_memory_mb": 512}]
 
-    pmon = parse_nvidia_pmon("# gpu pid type sm mem enc dec command\n0 1234 C 14 8 63 0 ffmpeg\n")
+    pmon = parse_nvidia_pmon(
+        "# gpu pid type sm mem enc dec command\n"
+        "0 1234 C 14 8 63 0 ffmpeg\n"
+    )
     assert pmon[0]["enc_pct"] == 63
     assert pmon[0]["process_name"] == "ffmpeg"

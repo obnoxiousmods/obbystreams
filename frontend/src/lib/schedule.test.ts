@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { ScheduleSnapshot, StatusPayload } from "../types";
 import {
+  acquisitionBannerText,
   cardProgress,
   formatCardTime,
   formatCountdown,
+  isAwaitingSource,
   isCurrentEventSuppressed,
   phaseLabel,
   phaseTone,
@@ -194,5 +196,41 @@ describe("isCurrentEventSuppressed", () => {
     expect(text).toContain("STOPPED for this card");
     expect(text).toContain("next event");
     expect(text).not.toContain("auto-starts");
+  });
+});
+
+describe("acquisitionBannerText", () => {
+  const awaiting = {
+    enabled: true,
+    awaiting_source: true,
+    event: { id: "600059339", short_name: "Medić vs. Rodriguez" },
+    source_state: {
+      event_id: "600059339",
+      event_matched: false,
+      event_matched_sources: [],
+      terms: ["medic", "rodriguez"],
+      acquire_attempts: 3,
+      switches: 0,
+      mismatch_samples: 0,
+      rejected: [{ title: "PPV 17 | UFC FN ANKALAEV VS. GUSKOV", reason: "does not identify Medić vs. Rodriguez" }],
+      last_error: "",
+    },
+  } as unknown as ScheduleSnapshot;
+
+  it("says the cockpit is hunting, and how many candidates it turned down", () => {
+    const text = acquisitionBannerText(awaiting);
+    expect(text).toContain("Acquiring a verified source");
+    expect(text).toContain("Medić vs. Rodriguez");
+    expect(text).toContain("1 candidate rejected");
+  });
+
+  it("is silent once a feed for the card is on air", () => {
+    expect(acquisitionBannerText({ enabled: true, awaiting_source: false } as ScheduleSnapshot)).toBeNull();
+    expect(isAwaitingSource(null)).toBe(false);
+  });
+
+  it("takes over the standby banner, because the card has already started", () => {
+    // "STANDBY — auto-starts in ..." would be a lie: it is armed and trying.
+    expect(standbyBannerText(awaiting)).toContain("Acquiring a verified source");
   });
 });

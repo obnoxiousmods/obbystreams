@@ -260,6 +260,25 @@
     @apply text-[0.75rem];
   }
 
+  .sourceAcquisition {
+    @apply text-[0.78rem] leading-snug;
+  }
+
+  .sourceAcquisition.warn {
+    @apply rounded-md px-2 py-1.5;
+    border: 1px solid rgba(245, 166, 35, 0.35);
+    background: rgba(245, 166, 35, 0.1);
+    color: #fcd34d;
+  }
+
+  .sourceRejects {
+    @apply mt-1 space-y-0.5 text-[0.7rem];
+  }
+
+  .sourceRejects .rejectTitle {
+    @apply font-medium;
+  }
+
   .resumeButton {
     border-color: #15803d !important;
     background: rgba(21, 128, 61, 0.18) !important;

@@ -51,6 +51,8 @@ class Recorder:
         self.started = []
         self.stopped = []
         self.refreshed = []
+        self.contexts = []
+        self.published = []
         self.embeds = []
 
     async def start(self, reason):
@@ -61,8 +63,12 @@ class Recorder:
         self.stopped.append(reason)
         return True
 
-    async def refresh(self, reason):
+    async def refresh(self, reason, context=None):
         self.refreshed.append(reason)
+        self.contexts.append(context)
+
+    def publish(self, context):
+        self.published.append(context)
 
 
 class FakeNotifier:
@@ -94,7 +100,7 @@ def build(tmp_path, payload_name, *, config=None, notify=True):
         load_config=lambda: {"schedule": section},
         start_stream=recorder.start,
         stop_stream=recorder.stop,
-        refresh_sources=recorder.refresh,
+        sources=recorder,
     )
     settings = ScheduleSettings.from_config(section)
     scheduler.bind(
@@ -117,10 +123,28 @@ async def test_tick_arms_the_stream_inside_the_pre_roll(tmp_path):
     assert len(recorder.started) == 1
     assert "pre-roll" in recorder.started[0]
     # The pre-roll is when the spare provider connection is free, so source
-    # discovery must be kicked immediately rather than waiting for the sweep.
-    assert recorder.refreshed == ["auto-schedule pre-roll"]
+    # discovery must be kicked immediately rather than waiting for the sweep —
+    # and it must happen *before* the start, or the encode comes up on whatever
+    # stale links are still on disk.
+    assert len(recorder.refreshed) == 1
+    assert "pre-roll" in recorder.refreshed[0]
     assert scheduler.state.started_by_scheduler is True
     assert recorder.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_the_card_identity_reaches_the_source_scraper(tmp_path):
+    """The scraper cannot pick tonight's feed without knowing whose fight it is."""
+    scheduler, recorder = build(tmp_path, "pre")
+
+    await scheduler.tick(stream_running=False, now=CARD_START - timedelta(minutes=10))
+
+    published = [context for context in recorder.published if context is not None]
+    assert published, "the tracked card must be published to the source resolver"
+    assert published[-1].terms, "a card with no match terms would gate everything out"
+    # The refresh that precedes the start carries the same card.
+    assert recorder.contexts[-1] is not None
+    assert recorder.contexts[-1].event_id == published[-1].event_id
 
 
 @pytest.mark.asyncio
@@ -156,10 +180,20 @@ async def test_poll_backs_off_while_the_card_is_far_out(tmp_path):
     scheduler, _recorder = build(tmp_path, "pre")
 
     far = await scheduler.tick(stream_running=False, now=CARD_START - timedelta(hours=30))
-    near = await scheduler.tick(stream_running=False, now=CARD_START - timedelta(minutes=5))
+    near = await scheduler.tick(stream_running=True, now=CARD_START - timedelta(minutes=5))
 
     assert far > 600
     assert near == 120
+
+
+@pytest.mark.asyncio
+async def test_poll_tightens_while_no_source_is_on_air(tmp_path):
+    """Armed with nothing streaming means retry acquisition sooner than the 2m poll."""
+    scheduler, _recorder = build(tmp_path, "pre")
+
+    delay = await scheduler.tick(stream_running=False, now=CARD_START - timedelta(minutes=5))
+
+    assert delay == 60
 
 
 @pytest.mark.asyncio

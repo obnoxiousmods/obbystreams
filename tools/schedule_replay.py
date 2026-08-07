@@ -119,8 +119,13 @@ class DryRunCockpit:
         self.actions.append(f"STOP ({reason})")
         return True
 
-    async def refresh(self, reason: str) -> None:
-        self.actions.append(f"refresh sources ({reason})")
+    async def refresh(self, reason: str, context: Any = None) -> None:
+        label = f" for {context.short_name}" if context is not None else ""
+        self.actions.append(f"refresh sources ({reason}){label}")
+
+    def publish(self, context: Any) -> None:
+        if context is not None:
+            self.actions.append(f"source context -> {context.short_name} [{', '.join(context.terms[:4])}]")
 
 
 def describe_embed(embed: dict[str, Any]) -> str:
@@ -143,7 +148,7 @@ async def replay(step_minutes: int, live: bool) -> int:
             load_config=lambda: {"schedule": section},
             start_stream=cockpit.start,
             stop_stream=cockpit.stop,
-            refresh_sources=cockpit.refresh,
+            sources=cockpit,
         )
         notifier = DryRunNotifier(scheduler.notifier.builder)
         scheduler.bind(notifier=notifier)

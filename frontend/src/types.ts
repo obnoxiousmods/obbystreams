@@ -313,6 +313,32 @@ export interface ScheduleEvent {
   cards: ScheduleCard[];
 }
 
+/** A candidate the source scraper turned down, and why. */
+export interface RejectedSource {
+  title?: string | null;
+  score?: number;
+  reason: string;
+}
+
+/**
+ * How source discovery is going for the tracked card.
+ *
+ * The cockpit could not answer "is the stream showing tonight's fight?" during
+ * the 2026-08-01 card — it ran the whole event on the previous week's channels.
+ * This block is that answer.
+ */
+export interface SourceState {
+  event_id: string | null;
+  event_matched: boolean;
+  event_matched_sources: { id: string; label: string; discovered_at?: number }[];
+  terms: string[];
+  acquire_attempts: number;
+  switches: number;
+  mismatch_samples: number;
+  rejected: RejectedSource[];
+  last_error: string;
+}
+
 /** State of the UFC auto-schedule, as returned by /api/schedule and /api/status. */
 export interface ScheduleSnapshot {
   enabled: boolean;
@@ -331,6 +357,10 @@ export interface ScheduleSnapshot {
   countdown_seconds?: number | null;
   /** True while the countdown is against the calendar start, not the real first bout. */
   countdown_is_estimate?: boolean;
+  /** True while the card is armed but nothing has been verified to put on air. */
+  awaiting_source?: boolean;
+  arm_attempts?: number;
+  source_state?: SourceState;
 }
 
 export interface ArangoStatus {

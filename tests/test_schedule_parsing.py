@@ -166,3 +166,30 @@ def test_parse_event_without_competitions_is_none():
 )
 def test_card_labels_always_end_with_main_card(count, expected):
     assert card_labels_for(count) == expected
+
+
+@pytest.mark.asyncio
+async def test_espn_is_not_fetched_with_the_scraper_user_agent():
+    """The cockpit's shared httpx client sends a Firefox UA because the
+    stream-source scrapers need one. On 2026-08-04 ESPN began answering 403 to
+    browser-like agents on this endpoint while still serving plain library ones,
+    which silently killed every UFC alert - no scoreboard means no tracked card,
+    no milestones, no Discord post, and nothing else depends on ESPN so the only
+    symptom was silence."""
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["ua"] = request.headers.get("User-Agent", "")
+        return httpx.Response(200, json={"leagues": [], "events": []})
+
+    scraper_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), headers={"User-Agent": scraper_ua}
+    ) as client:
+        provider = EspnScheduleProvider(client, ScheduleSettings())
+        await provider.fetch_scoreboard()
+
+    assert "Mozilla" not in seen["ua"], f"sent a browser UA to ESPN: {seen['ua']}"
+    assert "httpx" in seen["ua"]

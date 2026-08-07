@@ -26,6 +26,7 @@ from .espn import EspnScheduleProvider
 from .models import (
     CalendarEntry,
     Decision,
+    EventContext,
     EventPhase,
     Milestone,
     MilestoneKind,
@@ -35,14 +36,13 @@ from .models import (
     UfcEvent,
 )
 from .notify import DiscordNotifier
-from .protocols import Notifier, ScheduleProvider
+from .protocols import Notifier, ScheduleProvider, SourceResolver
 from .state import ScheduleState, ScheduleStateStore
 
 logger = logging.getLogger("obbystreams.schedule")
 
 ConfigLoader = Callable[[], Mapping[str, Any]]
 StreamAction = Callable[[str], Awaitable[bool]]
-RefreshAction = Callable[[str], Awaitable[None]]
 EventLogger = Callable[[str, str], None]
 
 #: How long after an event's scheduled start we still consider it "current"
@@ -56,6 +56,9 @@ DETAIL_LEAD_SLACK = timedelta(minutes=60)
 #: anchor on the real first-bout time from the event detail, so the detail has to
 #: be loaded well before the calendar time to avoid missing the 24h warning.
 CALENDAR_SKEW = timedelta(hours=12)
+#: Arming attempts that ended with the encode still down before we tell the
+#: channel that no usable feed has been found for a card that is under way.
+ACQUISITION_ALERT_ATTEMPTS = 3
 
 
 class UfcScheduler:
@@ -68,15 +71,20 @@ class UfcScheduler:
         load_config: ConfigLoader,
         start_stream: StreamAction,
         stop_stream: StreamAction,
-        refresh_sources: RefreshAction | None = None,
+        sources: SourceResolver | None = None,
         event_log: EventLogger | None = None,
     ) -> None:
         self._client = client
         self._load_config = load_config
         self._start_stream = start_stream
         self._stop_stream = stop_stream
-        self._refresh_sources = refresh_sources
+        self._sources = sources
         self._event_log = event_log
+        self._context: EventContext | None = None
+        # Consecutive arming attempts that left the encode down — the card is in
+        # its window but no feed has been verified as *this* event yet.
+        self._arm_attempts = 0
+        self._acquisition_alerted: str | None = None
         self._settings = ScheduleSettings.from_config({})
         self._store = ScheduleStateStore(self._settings.state_path)
         self._state = ScheduleState()
@@ -215,6 +223,13 @@ class UfcScheduler:
                 if moment - state.final_seen_at >= grace:
                     return Decision(SchedulerAction.STOP, "card finished and grace period elapsed", phase, event.event_id)
                 return Decision(SchedulerAction.IDLE, "card finished; holding for post-fight grace", phase, event.event_id)
+            if self.card_stalled(now, event, state, settings):
+                return Decision(
+                    SchedulerAction.STOP,
+                    f"card stalled: no bout decided for {settings.stall_idle_minutes}m and ESPN never marked it final",
+                    phase,
+                    event.event_id,
+                )
             if not stream_running:
                 # The encode went down mid-card (a crash the watchdog could not
                 # recover, or a scraper stand-down). Being level-triggered, the
@@ -236,6 +251,29 @@ class UfcScheduler:
         if moment - first.timestamp() >= settings.max_runtime_hours * 3600:
             return Decision(SchedulerAction.IDLE, "event window has already lapsed", phase, event.event_id)
         return Decision(SchedulerAction.START, f"{settings.lead_minutes}m pre-roll for {event.short_name}", phase, event.event_id)
+
+    @staticmethod
+    def card_stalled(
+        now: datetime,
+        event: UfcEvent,
+        state: ScheduleState,
+        settings: ScheduleSettings,
+    ) -> bool:
+        """Whether a card ESPN never marked final has clearly finished anyway.
+
+        The 8h ``max_runtime_hours`` failsafe already exists, but it is far too
+        blunt to be the only backstop: a card that ends at the four-hour mark
+        with a stuck scoreboard would keep the encode (and the provider slot)
+        burning for another four. Requires *both* a long time since the last
+        segment opened and a quiet scoreboard, so a genuinely slow card with
+        fights still landing is never cut off mid-broadcast.
+        """
+        last = event.last_card_start
+        if event.is_final or last is None or state.progress_seen_at is None:
+            return False
+        if now < last + timedelta(hours=settings.stall_hours):
+            return False
+        return now.timestamp() - state.progress_seen_at >= settings.stall_idle_minutes * 60
 
     def should_adopt(
         self,
@@ -431,20 +469,26 @@ class UfcScheduler:
             else:
                 logger.warning("discord milestone %s for %s not delivered; will retry", milestone.key, event.event_id)
 
-    async def apply(self, decision: Decision, event: UfcEvent) -> None:
-        """Carry out a START/STOP verdict against the cockpit."""
+    async def apply(self, decision: Decision, event: UfcEvent, context: EventContext | None = None) -> None:
+        """Carry out a START/STOP verdict against the cockpit.
+
+        Discovery runs *before* the start, not after it. The other order is what
+        put last week's channels on air for a whole card: the cockpit would come
+        up on whatever stale links were on disk, and the refresh that followed
+        then declined to touch a stream that was — by ffmpeg's measure — healthy.
+        """
         if decision.action is SchedulerAction.START:
+            if self._sources is not None:
+                # The pre-roll is the one window where the spare provider
+                # connection is free, so resolve sources for *this* card first
+                # rather than waiting up to 15 minutes for the next sweep.
+                with contextlib.suppress(Exception):
+                    await self._sources.refresh(f"auto-schedule: {decision.reason}", context)
             if await self._start_stream(f"auto-schedule: {decision.reason}"):
                 self._state.begin_event(event.event_id, by_scheduler=True)
                 self._state.suppressed_event_id = None
                 await self.persist()
                 self._log(f"armed for {event.name} ({decision.reason})", "ok")
-                if self._refresh_sources is not None:
-                    # The pre-roll is the one window where the spare provider
-                    # connection is free, so kick source discovery immediately
-                    # instead of waiting up to 15 minutes for the next sweep.
-                    with contextlib.suppress(Exception):
-                        await self._refresh_sources("auto-schedule pre-roll")
             else:
                 logger.warning("auto-schedule start failed for %s", event.event_id)
         elif decision.action is SchedulerAction.STOP:
@@ -452,8 +496,39 @@ class UfcScheduler:
                 self._state.finish_event(event.event_id)
                 await self.persist()
                 self._log(f"stood down after {event.name} ({decision.reason})", "ok")
+                if self._sources is not None:
+                    # Drop the card's context so a later background sweep cannot
+                    # re-adopt this event's feeds once it is over.
+                    with contextlib.suppress(Exception):
+                        self._sources.publish(None)
             else:
                 logger.warning("auto-schedule stop failed for %s", event.event_id)
+
+    async def note_arming_progress(self, event: UfcEvent, *, stream_running: bool, now: datetime) -> None:
+        """Track (and eventually announce) a card that is under way with nothing on air.
+
+        The system deliberately holds rather than streaming an unverified feed,
+        so "armed but silent" is a legitimate state — but only for a few minutes.
+        Past that it is an operator problem, and staying quiet about it is how a
+        card gets missed entirely.
+        """
+        if stream_running or event.is_final:
+            self._arm_attempts = 0
+            return
+        self._arm_attempts += 1
+        first = event.first_card_start
+        if (
+            self._arm_attempts < ACQUISITION_ALERT_ATTEMPTS
+            or first is None
+            or now < first
+            or self._acquisition_alerted == event.event_id
+        ):
+            return
+        self._acquisition_alerted = event.event_id
+        self._log(f"no verified source for {event.short_name} — the card is live and nothing is on air", "bad")
+        embed = self._notifier.builder.for_acquisition_failure(event, self._arm_attempts)
+        with contextlib.suppress(Exception):
+            await self._notifier.send_embed(embed)
 
     async def tick(self, *, stream_running: bool, now: datetime | None = None) -> float:
         """One full cycle. Returns how long to sleep before the next one."""
@@ -464,6 +539,7 @@ class UfcScheduler:
         if not settings.enabled:
             self._last_decision = Decision(SchedulerAction.IDLE, "auto-schedule disabled")
             self._event = None
+            self.publish_context(None)
             return float(settings.live_poll_seconds)
 
         calendar = await self.refresh_calendar()
@@ -471,6 +547,7 @@ class UfcScheduler:
         if target is None:
             self._event = None
             self._last_decision = Decision(SchedulerAction.IDLE, "no upcoming UFC event on the calendar")
+            self.publish_context(None)
             return float(settings.calendar_refresh_seconds)
 
         warn_lead = timedelta(minutes=max(settings.notify.warn_minutes, default=1440)) + DETAIL_LEAD_SLACK + CALENDAR_SKEW
@@ -484,7 +561,13 @@ class UfcScheduler:
         self._event = event
         if event is None:
             self._last_decision = Decision(SchedulerAction.IDLE, f"ESPN has no bout detail for {target.label} yet")
+            self.publish_context(None)
             return float(settings.live_poll_seconds)
+
+        # Hand the card's identity to the source scraper on every tick, so the
+        # background sweeps between ticks match on tonight's fighters too.
+        context = event.context(moment, settings)
+        self.publish_context(context)
 
         # Point state at this card (a no-op after the first tick) so the operator
         # Stop path and the grace stamp always have an event to attach to.
@@ -500,6 +583,11 @@ class UfcScheduler:
             self._state.final_seen_at = moment.timestamp()
             await self.persist()
 
+        # Remember when the scoreboard last moved, so a card ESPN forgets to
+        # close out can still be stood down (see card_stalled).
+        if self._state.note_progress(event.progress_signature, moment=moment.timestamp()):
+            await self.persist()
+
         # Take ownership of a stream that was already up when the card started,
         # so the post-card stand-down still happens.
         if self.should_adopt(moment, event, self._state, settings, stream_running=stream_running):
@@ -513,8 +601,22 @@ class UfcScheduler:
         decision = self.decide(moment, event, self._state, settings, stream_running=stream_running)
         self._last_decision = decision
         if decision.acts:
-            await self.apply(decision, event)
+            await self.apply(decision, event, context)
+        if decision.action is SchedulerAction.START:
+            await self.note_arming_progress(event, stream_running=stream_running, now=moment)
+        elif stream_running:
+            self._arm_attempts = 0
         return self.next_wakeup(moment, event, settings)
+
+    def publish_context(self, context: EventContext | None) -> None:
+        """Push the tracked card's identity to the source scraper (None clears it)."""
+        if context == self._context:
+            return
+        self._context = context
+        if self._sources is None:
+            return
+        with contextlib.suppress(Exception):
+            self._sources.publish(context)
 
     def next_wakeup(self, now: datetime, event: UfcEvent, settings: ScheduleSettings) -> float:
         """Sleep until the next thing that actually matters.
@@ -534,6 +636,10 @@ class UfcScheduler:
             return float(settings.calendar_refresh_seconds)
         pre_roll = first - timedelta(minutes=settings.lead_minutes)
         if now >= pre_roll:
+            # Armed with nothing on air: retry acquisition on the tighter cadence
+            # until a feed for this card is verified.
+            if self._arm_attempts:
+                return float(min(settings.acquisition_poll_seconds, settings.live_poll_seconds))
             return float(settings.live_poll_seconds)
 
         moments = [pre_roll]
@@ -627,4 +733,9 @@ class UfcScheduler:
             if first is not None:
                 payload["countdown_seconds"] = max(0, int((first - moment).total_seconds()))
                 payload["countdown_is_estimate"] = False
+        # What the source scraper is matching against, and whether the card is
+        # armed-but-silent while it hunts for a feed it can identify.
+        payload["context"] = self._context.to_dict() if self._context else None
+        payload["awaiting_source"] = bool(self._arm_attempts)
+        payload["arm_attempts"] = self._arm_attempts
         return payload

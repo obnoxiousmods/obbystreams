@@ -217,6 +217,26 @@ class EmbedBuilder:
             "footer": self._footer(event),
         }
 
+    def for_acquisition_failure(self, event: UfcEvent, attempts: int) -> dict[str, Any]:
+        """Operator alert: the card is under way and no feed has been verified.
+
+        The cockpit deliberately holds rather than putting an unidentified feed
+        on air, so this is the signal that a human needs to add a source — the
+        one failure mode the hold-and-retry policy cannot fix by itself.
+        """
+        return {
+            "title": f"⚠️ No verified source for {event.short_name}",
+            "url": self.watcher_url,
+            "description": (
+                f"The card is live and the cockpit has tried {attempts} times to find a feed that "
+                "matches it. Nothing is on air — the stream is holding rather than broadcasting an "
+                "unidentified channel. A source may need to be added by hand."
+            ),
+            "color": COLOR_WARNING,
+            "fields": [self._watch_field()],
+            "footer": self._footer(event),
+        }
+
     def for_milestone(self, event: UfcEvent, milestone: Milestone, next_event_label: str | None = None) -> dict[str, Any]:
         """Dispatch a milestone to its embed shape."""
         if milestone.kind is MilestoneKind.COMING_UP:

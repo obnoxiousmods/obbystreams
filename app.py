@@ -34,7 +34,6 @@ change (``load_config`` has a 1s cache). Note: this module itself does NOT
 hot-reload — deploying code changes requires restarting ``obbystreams.service``,
 which interrupts the live encode. Tooling: ruff + ty (Astral) + pytest via uv.
 """
-
 import asyncio
 import base64
 import contextlib
@@ -70,7 +69,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from obbyschedule import ScheduleSettings, StopReason, UfcScheduler
+from obbyschedule import EventContext, ScheduleSettings, StopReason, UfcScheduler
 
 logger = logging.getLogger("obbystreams")
 CONFIG_PATH = Path(os.environ.get("OBBYSTREAMS_CONFIG", "/etc/obbystreams/obbystreams.yaml"))
@@ -101,6 +100,22 @@ STREAM_DESIRED_STATE = "running"
 # UFC auto-schedule (obbyschedule.UfcScheduler); constructed in lifespan.
 SCHEDULER: UfcScheduler | None = None
 SCHEDULE_TASK = None
+# The card the scheduler is currently tracking, as handed to the source scraper.
+# None outside an event window, which restores the older date-window-only
+# matching for anyone running the cockpit without the auto-schedule.
+ACTIVE_EVENT_CONTEXT: EventContext | None = None
+# Mid-card source switching bookkeeping, reset per tracked card: how many swaps
+# this card has cost viewers, when the last one landed, and how many consecutive
+# cycles have judged the live feed wrong (a single bad sample is not enough).
+SOURCE_SWITCH_STATE: dict[str, Any] = {
+    "event_id": None,
+    "switches": 0,
+    "last_switch_at": 0.0,
+    "mismatch_samples": 0,
+    "acquire_attempts": 0,
+    "last_reasons": [],
+    "last_error": "",
+}
 NVIDIA_SMI_CACHE_SECONDS = 5.0
 NVIDIA_SMI_CACHE: dict = {"at": 0.0, "payload": None}
 NVIDIA_SMI_LOCK = asyncio.Lock()
@@ -288,7 +303,10 @@ class _ProxyCache:
     def ttl_for(self, body: bytes, ct: str, raw_url: str) -> float:
         """Pick the playlist TTL (short) vs segment TTL (long) by sniffing content-type, extension, and #EXTM3U magic."""
         is_playlist = (
-            "mpegurl" in ct.lower() or "m3u" in ct.lower() or raw_url.split("?")[0].endswith(".m3u8") or body.lstrip()[:7] == b"#EXTM3U"
+            "mpegurl" in ct.lower()
+            or "m3u" in ct.lower()
+            or raw_url.split("?")[0].endswith(".m3u8")
+            or body.lstrip()[:7] == b"#EXTM3U"
         )
         return self._playlist_ttl if is_playlist else self._segment_ttl
 
@@ -414,6 +432,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
         "date_window_hours": 30,
         "require_date_window_match": True,
+        # Event-aware discovery. While the auto-schedule is tracking a card, the
+        # scraper is handed that card's identity and must positively match it —
+        # matching only "UFC" plus a date window is what put the previous week's
+        # channels on air for a whole event.
+        "event_refresh_interval_seconds": 90,
+        "switch_cooldown_seconds": 300,
+        "switch_confirm_samples": 2,
+        "max_switches_per_card": 6,
+        "public_fallback_after_attempts": 4,
     },
     "public_sources": [],
     # Persistent per-source blacklist. Any scraped/auto-selected or manually added
@@ -523,10 +550,10 @@ def valid_stream_url(value):
 _EXTRA_BLOCKED_NETS = tuple(
     ipaddress.ip_network(n)
     for n in (
-        "100.64.0.0/10",  # RFC 6598 CGNAT / shared address space
-        "192.0.0.0/24",  # IETF protocol assignments
-        "198.18.0.0/15",  # RFC 2544 benchmarking
-        "64:ff9b::/96",  # NAT64
+        "100.64.0.0/10",   # RFC 6598 CGNAT / shared address space
+        "192.0.0.0/24",    # IETF protocol assignments
+        "198.18.0.0/15",   # RFC 2544 benchmarking
+        "64:ff9b::/96",    # NAT64
     )
 )
 
@@ -540,7 +567,14 @@ def _ip_is_blocked(ip_str):
     mapped = getattr(ip, "ipv4_mapped", None)
     if mapped is not None:
         ip = mapped
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
         return True
     return any(ip in net for net in _EXTRA_BLOCKED_NETS)
 
@@ -642,7 +676,9 @@ def is_private_soursignal_source(source, private_cfg=None):
     prefix = str(private_cfg.get("auto_source_prefix") or "private-iptv")
     source_id = str(source.get("id") or "")
     return (
-        str(source.get("type") or "").lower() == "soursignal" or is_soursignal_url(source.get("url")) or source_id.startswith(prefix + "-")
+        str(source.get("type") or "").lower() == "soursignal"
+        or is_soursignal_url(source.get("url"))
+        or source_id.startswith(prefix + "-")
     )
 
 
@@ -696,6 +732,15 @@ def normalize_sources(raw_sources, fallback_links=None):
         notes = str(raw.get("notes") or "").strip()
         if notes:
             source["notes"] = notes
+        # Provenance for the auto-schedule: which card this feed was discovered
+        # for, and when. Without it a source list is indistinguishable from last
+        # week's, which is exactly how a stale channel goes back on air.
+        event_id = str(raw.get("event_id") or "").strip()
+        if event_id:
+            source["event_id"] = event_id
+        discovered_at = safe_int(raw.get("discovered_at"), 0, minimum=0)
+        if discovered_at:
+            source["discovered_at"] = discovered_at
         seen_ids.add(source_id)
         seen_urls.add(url)
         sources.append(source)
@@ -952,9 +997,7 @@ def normalize_private_iptv(raw_config):
     else:
         defaults["keep_stream_live_when_inactive"] = not defaults["disable_stream_when_inactive"]
     defaults["auto_start_when_active"] = bool(defaults.get("auto_start_when_active", True))
-    defaults["auto_source_prefix"] = (
-        re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
-    )
+    defaults["auto_source_prefix"] = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(defaults.get("auto_source_prefix") or "private-iptv")).strip("-").lower() or "private-iptv"
     defaults["headers"] = normalize_source_headers(defaults.get("headers"))
     cookies = {}
     if isinstance(defaults.get("cookies"), dict):
@@ -968,6 +1011,11 @@ def normalize_private_iptv(raw_config):
     defaults["reject_keywords"] = normalize_string_list(defaults.get("reject_keywords"))
     defaults["date_window_hours"] = safe_number(defaults.get("date_window_hours"), 30, minimum=1)
     defaults["require_date_window_match"] = bool(defaults.get("require_date_window_match", True))
+    defaults["event_refresh_interval_seconds"] = safe_int(defaults.get("event_refresh_interval_seconds"), 90, minimum=30)
+    defaults["switch_cooldown_seconds"] = safe_number(defaults.get("switch_cooldown_seconds"), 300, minimum=0)
+    defaults["switch_confirm_samples"] = safe_int(defaults.get("switch_confirm_samples"), 2, minimum=1)
+    defaults["max_switches_per_card"] = safe_int(defaults.get("max_switches_per_card"), 6, minimum=1)
+    defaults["public_fallback_after_attempts"] = safe_int(defaults.get("public_fallback_after_attempts"), 4, minimum=1)
     return defaults
 
 
@@ -1005,7 +1053,11 @@ def public_stream_inventory(config):
     bl_index = blacklist_index(config.get("source_blacklist"))
     manual = [s for s in normalize_public_sources(config.get("public_sources", [])) if not is_blacklisted(s, bl_index)]
     seen_urls = {source.get("url") for source in manual}
-    auto = [source for source in auto_public_sources() if source.get("url") not in seen_urls and not is_blacklisted(source, bl_index)]
+    auto = [
+        source
+        for source in auto_public_sources()
+        if source.get("url") not in seen_urls and not is_blacklisted(source, bl_index)
+    ]
     return [*manual, *auto]
 
 
@@ -1149,7 +1201,12 @@ def load_config(fresh=False):
     except OSError:
         mtime = 0.0
     cached = _CONFIG_CACHE
-    if not fresh and cached["config"] is not None and cached["mtime"] == mtime and now - cached["at"] < _CONFIG_CACHE_TTL:
+    if (
+        not fresh
+        and cached["config"] is not None
+        and cached["mtime"] == mtime
+        and now - cached["at"] < _CONFIG_CACHE_TTL
+    ):
         return cached["config"]
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -1347,66 +1404,24 @@ def viewer_counts_snapshot():
 # anonymised leaderboard. Persisted to a JSON snapshot so it survives restarts.
 # ---------------------------------------------------------------------------
 VIEWER_STATS: dict[str, dict[str, Any]] = {}
-SOURCE_QOE: dict[str, dict] = {}  # source_id -> {watch_ms, buffering_ms, stalls, viewers:set}
+SOURCE_QOE: dict[str, dict] = {}   # source_id -> {watch_ms, buffering_ms, stalls, viewers:set}
 VIEWER_STATS_LOCK = asyncio.Lock()
 VIEWER_STATS_PATH = CONFIG_PATH.parent / "viewer_highscores.json"
 VIEWER_STATS_DIRTY = False
-VIEWER_WATCH_MAX_STEP = 90.0  # cap seconds credited per heartbeat gap
+VIEWER_WATCH_MAX_STEP = 90.0            # cap seconds credited per heartbeat gap
 _GEO_CACHE: dict[str, dict] = {}
 _GEO_INFLIGHT: set[str] = set()
 _IP_HASH_SALT = "obbyviewer.v1"
 
 _CODENAME_ADJ = [
-    "Swift",
-    "Silent",
-    "Crimson",
-    "Golden",
-    "Shadow",
-    "Iron",
-    "Electric",
-    "Frost",
-    "Solar",
-    "Rogue",
-    "Mighty",
-    "Cosmic",
-    "Turbo",
-    "Neon",
-    "Velvet",
-    "Savage",
-    "Lucky",
-    "Phantom",
-    "Atomic",
-    "Wild",
-    "Blazing",
-    "Midnight",
-    "Emerald",
-    "Thunder",
+    "Swift", "Silent", "Crimson", "Golden", "Shadow", "Iron", "Electric", "Frost",
+    "Solar", "Rogue", "Mighty", "Cosmic", "Turbo", "Neon", "Velvet", "Savage",
+    "Lucky", "Phantom", "Atomic", "Wild", "Blazing", "Midnight", "Emerald", "Thunder",
 ]
 _CODENAME_NOUN = [
-    "Falcon",
-    "Tiger",
-    "Viper",
-    "Wolf",
-    "Panther",
-    "Cobra",
-    "Eagle",
-    "Rhino",
-    "Jaguar",
-    "Hawk",
-    "Bear",
-    "Fox",
-    "Shark",
-    "Lynx",
-    "Raven",
-    "Bison",
-    "Otter",
-    "Mantis",
-    "Stallion",
-    "Kraken",
-    "Puma",
-    "Falconer",
-    "Drake",
-    "Orca",
+    "Falcon", "Tiger", "Viper", "Wolf", "Panther", "Cobra", "Eagle", "Rhino",
+    "Jaguar", "Hawk", "Bear", "Fox", "Shark", "Lynx", "Raven", "Bison",
+    "Otter", "Mantis", "Stallion", "Kraken", "Puma", "Falconer", "Drake", "Orca",
 ]
 
 
@@ -1559,20 +1574,18 @@ async def viewer_highscores_snapshot(limit=25):
         favorite = max(by_source.items(), key=lambda kv: kv[1])[0] if by_source else None
         geo = stats.get("geo") or {}
         location = ", ".join(part for part in (geo.get("region"), geo.get("country")) if part)
-        leaderboard.append(
-            {
-                "rank": index + 1,
-                "codename": stats.get("codename"),
-                "ip_masked": stats.get("ip_masked"),
-                "watch_seconds": int(stats.get("total", 0.0)),
-                "favorite_source": favorite,
-                "flag": geo.get("flag") or "🌐",
-                "location": location,
-                "country": geo.get("country") or "",
-                "first_seen": stats.get("first"),
-                "last_seen": stats.get("last"),
-            }
-        )
+        leaderboard.append({
+            "rank": index + 1,
+            "codename": stats.get("codename"),
+            "ip_masked": stats.get("ip_masked"),
+            "watch_seconds": int(stats.get("total", 0.0)),
+            "favorite_source": favorite,
+            "flag": geo.get("flag") or "🌐",
+            "location": location,
+            "country": geo.get("country") or "",
+            "first_seen": stats.get("first"),
+            "last_seen": stats.get("last"),
+        })
     source_totals: dict[str, float] = {}
     for stats in rows:
         for source_id, seconds in stats.get("by_source", {}).items():
@@ -1585,22 +1598,19 @@ async def viewer_highscores_snapshot(limit=25):
         buffering_ms = float(qoe.get("buffering_ms", 0.0))
         viewers = len(qoe.get("viewers") or ())
         buffer_ratio = (buffering_ms / watch_ms) if watch_ms > 0 else 0.0
-        source_performance.append(
-            {
-                "source_id": source_id,
-                "label": qoe.get("label") or source_id,
-                "watch_hours": round(watch_ms / 3_600_000.0, 2),
-                "smoothness": round(max(0.0, min(1.0, 1.0 - buffer_ratio)) * 100.0, 1),
-                "buffering_minutes": round(buffering_ms / 60_000.0, 1),
-                "stalls": int(qoe.get("stalls", 0)),
-                "viewers": viewers,
-            }
-        )
+        source_performance.append({
+            "source_id": source_id,
+            "label": qoe.get("label") or source_id,
+            "watch_hours": round(watch_ms / 3_600_000.0, 2),
+            "smoothness": round(max(0.0, min(1.0, 1.0 - buffer_ratio)) * 100.0, 1),
+            "buffering_minutes": round(buffering_ms / 60_000.0, 1),
+            "stalls": int(qoe.get("stalls", 0)),
+            "viewers": viewers,
+        })
     source_performance.sort(key=lambda s: s["watch_hours"], reverse=True)
     best_sources = sorted(
         (s for s in source_performance if s["watch_hours"] >= 0.02),
-        key=lambda s: (s["smoothness"], s["watch_hours"]),
-        reverse=True,
+        key=lambda s: (s["smoothness"], s["watch_hours"]), reverse=True,
     )[:5]
     country_totals: dict[str, dict] = {}
     for stats in rows:
@@ -1620,10 +1630,7 @@ async def viewer_highscores_snapshot(limit=25):
         "top_sources": [{"source_id": sid, "watch_hours": round(sec / 3600.0, 2)} for sid, sec in top_sources[:8]],
         "source_performance": source_performance[:10],
         "best_sources": best_sources,
-        "top_countries": [
-            {"country": c["country"], "flag": c["flag"], "watch_hours": round(c["seconds"] / 3600.0, 2), "viewers": c["viewers"]}
-            for c in top_countries[:8]
-        ],
+        "top_countries": [{"country": c["country"], "flag": c["flag"], "watch_hours": round(c["seconds"] / 3600.0, 2), "viewers": c["viewers"]} for c in top_countries[:8]],
     }
 
 
@@ -1756,9 +1763,7 @@ class StreamHealthScorer:
         failure_threshold = float(stream.get("failure_score_threshold", -120))
         confirmed_failure_samples = int(stream.get("confirmed_failure_samples", 2))
 
-        score, evidence, reasons = score_stream_snapshot(
-            proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors
-        )
+        score, evidence, reasons = score_stream_snapshot(proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors)
         bad_sample = elapsed >= min_assessment and score <= failure_threshold
         good_sample = score >= success_threshold
         if bad_sample:
@@ -1798,9 +1803,7 @@ class StreamHealthScorer:
             decision = "recovering"
             message = "Stream has some positive evidence, but not enough yet for a healthy decision."
 
-        confidence = confidence_for_assessment(
-            score, elapsed, min_assessment, len(self.samples), self.consecutive_bad_samples, self.consecutive_good_samples
-        )
+        confidence = confidence_for_assessment(score, elapsed, min_assessment, len(self.samples), self.consecutive_bad_samples, self.consecutive_good_samples)
         sample = {
             "ts": now_ms(),
             "score": round(score, 1),
@@ -1879,15 +1882,11 @@ def score_stream_snapshot(proc, hls, previous_hls, elapsed, min_assessment, stal
     current_bytes = int(hls.get("bytes") or 0)
     previous_bytes = int(previous_hls.get("bytes") or 0) if previous_hls else 0
     bytes_delta = max(0, current_bytes - previous_bytes) if previous_hls else 0
-    playlist_moved = bool(
-        previous_hls and hls.get("playlist_modified_at") and hls.get("playlist_modified_at") != previous_hls.get("playlist_modified_at")
-    )
+    playlist_moved = bool(previous_hls and hls.get("playlist_modified_at") and hls.get("playlist_modified_at") != previous_hls.get("playlist_modified_at"))
 
     media_sequence = safe_float_or_none(hls.get("media_sequence"))
     previous_media_sequence = safe_float_or_none(previous_hls.get("media_sequence")) if previous_hls else None
-    media_sequence_advanced = (
-        media_sequence is not None and previous_media_sequence is not None and media_sequence > previous_media_sequence
-    )
+    media_sequence_advanced = media_sequence is not None and previous_media_sequence is not None and media_sequence > previous_media_sequence
     progress_seen = segment_delta > 0 or bytes_delta > 0 or playlist_moved or media_sequence_advanced
 
     if proc.get("managed"):
@@ -1994,7 +1993,6 @@ def require_auth(request):
 
 def guarded(handler):
     """Decorator that wraps a route handler with same-origin enforcement (for writes) and session-token auth."""
-
     async def wrapped(request):
         """Enforce origin/token guards, then delegate to the wrapped handler (or return 401/403)."""
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
@@ -2004,7 +2002,6 @@ def guarded(handler):
         if not require_auth(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return await handler(request)
-
     return wrapped
 
 
@@ -2173,13 +2170,11 @@ def stream_processes():
                 or "ufc_tool.py" in cmd
                 or "streamUFC" in cmd
             ):
-                found.append(
-                    {
-                        "pid": proc.info["pid"],
-                        "cmd": cmd,
-                        "age": max(0, time.time() - proc.info.get("create_time", time.time())),
-                    }
-                )
+                found.append({
+                    "pid": proc.info["pid"],
+                    "cmd": cmd,
+                    "age": max(0, time.time() - proc.info.get("create_time", time.time())),
+                })
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return found
@@ -2301,9 +2296,7 @@ def classify_stream_log(line):
     lowered = line.lower()
     if "starting" in lowered or "stream commander" in lowered or "status:" in lowered:
         return "info"
-    if "ffmpeg:" in lowered or any(
-        token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")
-    ):
+    if "ffmpeg:" in lowered or any(token in lowered for token in ("error", "failed", "invalid", "timed out", "timeout", "403", "404", "500")):
         return "error"
     if "ffmpeg exited" in lowered or "restart" in lowered or "weak stream" in lowered or "every link failed" in lowered:
         return "warn"
@@ -2350,7 +2343,11 @@ def hls_metrics(config):
     playlist = output_dir / "ufc.m3u8"
     dash_manifest = output_dir / "ufc.mpd"
     media_playlist_paths = [Path(p) for p in glob.glob(str(output_dir / "media_*.m3u8"))]
-    segments = [Path(p) for pattern in ("ufc*.ts", "ufc*.m4s", "ufc*.mp4") for p in glob.glob(str(output_dir / pattern))]
+    segments = [
+        Path(p)
+        for pattern in ("ufc*.ts", "ufc*.m4s", "ufc*.mp4")
+        for p in glob.glob(str(output_dir / pattern))
+    ]
     total_bytes = sum(safe_stat_size(p) for p in segments)
     playlist_age = None
     playlist_mtime = None
@@ -2401,10 +2398,12 @@ def hls_metrics(config):
     except Exception:
         pass
     live_lag_seconds = None
-    playlist_seg_mtimes = sorted(m for m in (safe_stat_mtime(output_dir / name) for name in playlist_segment_names[-9:]) if m)
+    playlist_seg_mtimes = sorted(
+        m for m in (safe_stat_mtime(output_dir / name) for name in playlist_segment_names[-9:]) if m
+    )
     if encode_rate is None and len(playlist_seg_mtimes) >= 2 and len(segment_durations) >= 2:
         wall_span = playlist_seg_mtimes[-1] - playlist_seg_mtimes[0]
-        content_seconds = sum(segment_durations[-(len(playlist_seg_mtimes)) :][1:])
+        content_seconds = sum(segment_durations[-(len(playlist_seg_mtimes)):][1:])
         if wall_span > 0 and content_seconds > 0:
             encode_rate = round(content_seconds / wall_span, 2)
             encode_rate_source = "derived"
@@ -2783,7 +2782,11 @@ def analyze_nvidia_smi(gpus, processes, commands):
     else:
         diagnosis.append("No FFmpeg/NVENC process visible to nvidia-smi")
 
-    optional_failures = [name for name in ("encoder", "processes", "pmon") if commands.get(name, {}).get("returncode") not in (None, 0)]
+    optional_failures = [
+        name
+        for name in ("encoder", "processes", "pmon")
+        if commands.get(name, {}).get("returncode") not in (None, 0)
+    ]
     if optional_failures:
         diagnosis.append(f"Optional query failed: {', '.join(optional_failures)}")
 
@@ -2982,13 +2985,8 @@ async def viewer_counts(request):
             counts = viewer_counts_snapshot()
         if ip_hash:
             await record_watch(
-                ip_hash,
-                client_ip,
-                source_id,
-                now_t,
-                last_at,
-                buffering_ms=body.get("buffering_ms", 0),
-                stalls=body.get("stalls", 0),
+                ip_hash, client_ip, source_id, now_t, last_at,
+                buffering_ms=body.get("buffering_ms", 0), stalls=body.get("stalls", 0),
                 source_label=body.get("source_label"),
             )
         return JSONResponse({"ok": True, "session_id": session_id, "viewers": counts}, headers=cors)
@@ -3146,9 +3144,7 @@ async def put_config(request):
 
 async def private_iptv_status(request):
     """GET /api/private-iptv (guarded): return the private-IPTV runtime state plus its redacted config."""
-    return JSONResponse(
-        {"ok": True, "private_iptv": private_iptv_public_runtime(), "config": public_config(load_config()).get("private_iptv", {})}
-    )
+    return JSONResponse({"ok": True, "private_iptv": private_iptv_public_runtime(), "config": public_config(load_config()).get("private_iptv", {})})
 
 
 async def private_iptv_refresh(request):
@@ -3191,13 +3187,7 @@ async def private_iptv_control(request):
                 await PRIVATE_IPTV_TASK
         PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
     state = "paused" if action == "pause" else "stopped" if action == "stop" else "running"
-    PRIVATE_IPTV_RUNTIME.update(
-        {
-            "enabled": bool(private_cfg.get("enabled")),
-            "state": state,
-            "message": f"Private IPTV automation {state}; live ffmpeg was not touched.",
-        }
-    )
+    PRIVATE_IPTV_RUNTIME.update({"enabled": bool(private_cfg.get("enabled")), "state": state, "message": f"Private IPTV automation {state}; live ffmpeg was not touched."})
     event(f"private IPTV automation {action}", "ok")
     return JSONResponse({"ok": True, "action": action, "private_iptv": private_iptv_public_runtime()})
 
@@ -3259,12 +3249,18 @@ async def remove_link(request):
     return JSONResponse({"ok": True, "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
 
 
-_SCRAPE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
+_SCRAPE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
+)
 _SCRAPE_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _EMBED_HOSTS = {"gooz.aapmains.net"}
-_PLAYLIST_HOST_RE = re.compile(r"https?://[a-zA-Z0-9-]+\.hereisman\.net/playlist/\d+/[^\s\"'<>&]+")
+_PLAYLIST_HOST_RE = re.compile(
+    r"https?://[a-zA-Z0-9-]+\.hereisman\.net/playlist/\d+/[^\s\"'<>&]+"
+)
 # Captures embed IDs from: iframe src, changeStream() onclick, and js assignment
-_GOOZ_EMBED_RE = re.compile(r"(?:gooz\.aapmains\.net/new-stream-embed/|changeStream\()(\d+)")
+_GOOZ_EMBED_RE = re.compile(
+    r"(?:gooz\.aapmains\.net/new-stream-embed/|changeStream\()(\d+)"
+)
 _M3U8_RE = re.compile(r"https?://[^\s\"'<>&]+\.m3u8(?:[^\s\"'<>&]*)?")
 _CONST_SOURCE_RE = re.compile(r"""const\s+source\s*=\s*["']([^"']+)["']""")
 _OPTION_VALUE_RE = re.compile(r"""<option[^>]+value=["']([^"']+)["']""", re.IGNORECASE)
@@ -3280,6 +3276,10 @@ _PRIVATE_IPTV_NUMERIC_DATE_RE = re.compile(r"\b(?:20\d{2})[ ._/-](\d{1,2})[ ._/-
 _PRIVATE_IPTV_SHORT_DATE_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})\b(?!\d)")
 # Clock time in a title, e.g. "5:00PM ET", "9:00 PM". Assumed US Eastern.
 _PRIVATE_IPTV_TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])\b")
+# A named matchup in a title ("ANKALAEV VS. GUSKOV"). An entry that names a bout
+# has already told us which card it is; if that did not match the tracked event,
+# it is someone else's card, not a generic slot we can fall back on.
+_PRIVATE_IPTV_VS_RE = re.compile(r"\b[a-z]{3,}\s+vs\.?\s+[a-z]{3,}", re.IGNORECASE)
 
 PRIVATE_IPTV_RUNTIME: dict[str, Any] = {
     "enabled": False,
@@ -3315,13 +3315,63 @@ def private_soursignal_links(config):
     return normalize_links(links)
 
 
-def private_probe_budget(config, proc=None, health_doc=None, force_probe=False):
-    """Decide whether an ffprobe of private-IPTV candidates is allowed now, respecting the provider connection_limit and reserving a spare slot while a healthy private stream is live."""
+def active_event_context():
+    """The card the auto-schedule is tracking, or None outside an event window."""
+    return ACTIVE_EVENT_CONTEXT
+
+
+def live_stream_is_event_matched(config, context=None):
+    """Whether the live ingest pool actually belongs to the tracked card.
+
+    ffmpeg reporting frames says a feed is *working*, not that it is the right
+    fight. With no source tagged for tonight's card the encode is, by
+    construction, carrying something else — the exact state that went unnoticed
+    for a whole event on 2026-08-01.
+    """
+    context = active_event_context() if context is None else context
+    if context is None:
+        return True
+    return bool(event_source_links(config, context.event_id))
+
+
+def sources_predate_current_segment(config, context=None, now=None):
+    """True when the card moved to a new segment after these sources were picked.
+
+    Each broadcast segment is a different provider channel, so a source list
+    chosen during the early prelims is stale the moment the main card opens even
+    though the encode is still perfectly healthy.
+    """
+    context = active_event_context() if context is None else context
+    if context is None or not context.segments:
+        return False
+    moment = now or datetime.now(UTC)
+    segment = context.current_segment(moment)
+    if segment is None:
+        return False
+    discovered = [
+        int(source.get("discovered_at") or 0)
+        for source in config.get("stream", {}).get("sources", [])
+        if source.get("enabled", True) and str(source.get("event_id") or "") == str(context.event_id)
+    ]
+    if not discovered:
+        return False
+    return max(discovered) < int(segment[0].timestamp() * 1000)
+
+
+def private_probe_budget(config, proc=None, health_doc=None, force_probe=False, context=None):
+    """Decide whether an ffprobe of private-IPTV candidates is allowed now, respecting the provider connection_limit and reserving a spare slot while a healthy private stream is live.
+
+    The spare-slot reservation is suspended while a tracked card is in its
+    window: during those few hours, confirming the feed is the right one is
+    worth more than holding a connection back.
+    """
     private_cfg = config.get("private_iptv", {})
     proc = proc or process_metrics()
+    context = active_event_context() if context is None else context
+    in_event_window = bool(context is not None and context.active)
     stream_uses_private_slot = bool(proc.get("managed") and private_soursignal_links(config))
     connection_limit = int(private_cfg.get("connection_limit", 2))
-    reserve_spare = bool(private_cfg.get("reserve_spare_when_streaming", True))
+    reserve_spare = bool(private_cfg.get("reserve_spare_when_streaming", True)) and not in_event_window
     decision = str((health_doc or {}).get("decision") or "").lower()
     allowed = True
     reason = ""
@@ -3339,25 +3389,77 @@ def private_probe_budget(config, proc=None, health_doc=None, force_probe=False):
         "probe_allowed": allowed,
         "probe_skipped_reason": reason,
         "health_decision": decision or "unknown",
+        "in_event_window": in_event_window,
     }
 
 
-def should_protect_live_private_stream(config, budget, force_probe=False):
+def should_protect_live_private_stream(config, budget, force_probe=False, context=None, mismatch_confirmed=False):
     """Keep a working fight feed pinned during background refreshes.
 
     A provider scan must never consume another playback connection, rewrite the
     source list, or restart ffmpeg while the managed private feed is producing
     usable output.  An explicit forced operator refresh is the only override;
     confirmed degraded/failed states remain eligible for recovery.
+
+    Health alone is not enough to earn protection, though. A feed that cannot be
+    the tracked card (``mismatch_confirmed``), or one picked before the card
+    moved to its next segment, is rescanned however well it is encoding —
+    protecting those is what pinned last week's channel through a whole event.
     """
     private_cfg = config.get("private_iptv", {})
     decision = str((budget or {}).get("health_decision") or "").lower()
+    context = active_event_context() if context is None else context
+    if mismatch_confirmed or (context is not None and context.active and sources_predate_current_segment(config, context)):
+        return False
     return bool(
         private_cfg.get("protect_live_stream_on_refresh", True)
         and not force_probe
         and (budget or {}).get("stream_uses_private_slot")
         and decision not in {"failed", "degraded", "stopped"}
     )
+
+
+def reset_switch_state(event_id):
+    """Start the per-card switch budget over when the tracked card changes."""
+    if SOURCE_SWITCH_STATE.get("event_id") == event_id:
+        return
+    SOURCE_SWITCH_STATE.update(
+        {
+            "event_id": event_id,
+            "switches": 0,
+            "last_switch_at": 0.0,
+            "mismatch_samples": 0,
+            "acquire_attempts": 0,
+            "last_reasons": [],
+            "last_error": "",
+        }
+    )
+
+
+def source_switch_allowed(config, *, force=False, stream_running=True):
+    """Whether the live encode may be restarted onto a different source now.
+
+    Every switch costs viewers a few seconds of black, so mid-fight flapping is
+    worse than a slightly worse feed. Returns (allowed, reason).
+    """
+    if force or not stream_running:
+        return True, ""
+    private_cfg = config.get("private_iptv", {})
+    cooldown = float(private_cfg.get("switch_cooldown_seconds", 300) or 0)
+    max_switches = int(private_cfg.get("max_switches_per_card", 6))
+    last = float(SOURCE_SWITCH_STATE.get("last_switch_at") or 0.0)
+    if SOURCE_SWITCH_STATE.get("switches", 0) >= max_switches:
+        return False, f"source switch budget for this card is spent ({max_switches})"
+    elapsed = time.monotonic() - last
+    if last and elapsed < cooldown:
+        return False, f"source switch cooldown: {int(cooldown - elapsed)}s remaining"
+    return True, ""
+
+
+def record_source_switch():
+    SOURCE_SWITCH_STATE["switches"] = int(SOURCE_SWITCH_STATE.get("switches", 0)) + 1
+    SOURCE_SWITCH_STATE["last_switch_at"] = time.monotonic()
+    SOURCE_SWITCH_STATE["mismatch_samples"] = 0
 
 
 def update_private_probe_runtime(config, budget=None, mode=None):
@@ -3510,11 +3612,16 @@ def infer_private_iptv_event_date(text, now):
     return None
 
 
-def infer_private_iptv_slot_start(text, now):
+def infer_private_iptv_slot_start(text, now, context=None):
     """Best-effort US-Eastern start time for this event portion so the managed
     stream can follow the live phase. An explicit '(7:00 PM ET)' wins; otherwise
     infer from the phase keyword (early prelims 5pm / prelims 7pm / main card 9pm).
-    Returns an ET-aware datetime, or None."""
+    Returns an ET-aware datetime, or None.
+
+    When the auto-schedule is tracking a card, ``context`` carries ESPN's real
+    per-segment start times and those replace the phase guesses — the hardcoded
+    5/7/9pm ET defaults are wrong for every European and APAC card (a 13:00Z
+    prelims block would otherwise read as eight hours away and be demoted)."""
     try:
         et = ZoneInfo("America/New_York")
     except Exception:
@@ -3527,6 +3634,9 @@ def infer_private_iptv_slot_start(text, now):
         if match.group(3).lower() == "pm":
             hour += 12
         minute = int(match.group(2))
+    elif context is not None and context.segments:
+        segment = event_context_segment_for(context, lowered)
+        return segment[0].astimezone(et) if segment else None
     elif "early prelim" in lowered:
         hour, minute = 17, 0
     elif "prelim" in lowered:
@@ -3540,13 +3650,47 @@ def infer_private_iptv_slot_start(text, now):
     return None
 
 
-def score_private_iptv_entry(entry, config, now=None):
-    """Score one m3u entry for fight-day relevance (keywords, event group/slot, main-event, date window, live phase) → (score, reasons)."""
+def event_context_segment_for(context, lowered_text):
+    """Match a provider title's phase wording to one of the card's real segments.
+
+    Falls back to the last segment (the main card) for a title that names no
+    phase at all, which is how the provider labels its marquee feed.
+    """
+    by_label = {label.lower(): (start, label) for start, label in context.segments}
+
+    def pick(*labels):
+        for label in labels:
+            if label in by_label:
+                return by_label[label]
+        return None
+
+    if "early prelim" in lowered_text:
+        return pick("early prelims", "prelims")
+    if "prelim" in lowered_text:
+        return pick("prelims", "early prelims")
+    if "main card" in lowered_text or re.search(r"\bvs?\.?\b", lowered_text):
+        return pick("main card")
+    return None
+
+
+def score_private_iptv_entry(entry, config, now=None, context=None):
+    """Score one m3u entry for fight-day relevance (event identity, keywords, event group/slot, main-event, date window, live phase) → (score, reasons).
+
+    ``context`` is the tracked card (an :class:`~obbyschedule.EventContext`) when
+    the auto-schedule is running. Naming one of tonight's fighters is by far the
+    strongest evidence a channel is the right one, so it outweighs every generic
+    signal combined.
+    """
     now = now or private_iptv_now(config)
     text = private_iptv_entry_text(entry)
     lowered = text.lower()
     score = 0
     reasons = []
+    if context is not None:
+        matched, hits = context.matches(text)
+        if matched:
+            score += 60
+            reasons.append(f"event match:{'/'.join(hits[:3])}")
     for keyword in config.get("keywords") or []:
         if keyword.lower() in lowered:
             score += 35 if keyword.lower() in {"ufc", "mma"} else 20
@@ -3583,7 +3727,7 @@ def score_private_iptv_entry(entry, config, now=None):
     # Event-phase awareness: strongly prefer the portion that is live NOW, and
     # demote portions that haven't started (they show a countdown/ads), so the
     # managed stream auto-follows early prelims -> prelims -> main card.
-    slot_start = infer_private_iptv_slot_start(text, now)
+    slot_start = infer_private_iptv_slot_start(text, now, context=context)
     if slot_start is not None:
         delta_min = (now.astimezone(slot_start.tzinfo) - slot_start).total_seconds() / 60.0
         if delta_min < -10:
@@ -3605,12 +3749,39 @@ def score_private_iptv_entry(entry, config, now=None):
     return score, reasons
 
 
-def select_private_iptv_candidates(entries, config, now=None, blacklist=None):
+def event_entry_is_plausible(entry, reasons, now, context):
+    """Whether a playlist entry could plausibly be the tracked card's feed.
+
+    Accepts either a positive identity match (a fighter surname or the event
+    number) or, for the many generically-titled event slots the provider ships
+    ("PPV 07 | MAIN CARD"), a date that lands on the card itself. Everything
+    else — including a perfectly well-formed UFC channel for a different card —
+    is out.
+    """
+    if any(reason.startswith("event match:") for reason in reasons):
+        return True
+    event_date = infer_private_iptv_event_date(private_iptv_entry_text(entry), now)
+    if event_date is None:
+        # No date and no name: only useful when it names no *other* card either,
+        # which is the case for the numbered generic slots.
+        return not _PRIVATE_IPTV_VS_RE.search(private_iptv_entry_text(entry))
+    card_dates = {
+        segment[0].astimezone(now.tzinfo).date()
+        for segment in context.segments
+    } or {now.date()}
+    return event_date.date() in card_dates
+
+
+def select_private_iptv_candidates(entries, config, now=None, blacklist=None, context=None, rejected=None):
     """Score and select fight-day private IPTV candidates.
 
     ``config`` is the ``private_iptv`` sub-config. ``blacklist`` (raw list or a
     precomputed :func:`blacklist_index` set) drops blocked entries up front so
     they never reach the expensive ffprobe stage or get re-selected each cycle.
+    ``context`` is the tracked card; when present, an entry must identify *that*
+    card (by fighter/event term, or failing that by carrying the card's own
+    date) or it is rejected outright. ``rejected`` collects near-miss entries
+    for the cockpit so "why is nothing on air?" is answerable.
     """
     now = now or private_iptv_now(config)
     bl_index = blacklist if isinstance(blacklist, set) else blacklist_index(blacklist or [])
@@ -3619,11 +3790,22 @@ def select_private_iptv_candidates(entries, config, now=None, blacklist=None):
         # Persistent blacklist: a blocked stream can never be re-selected.
         if bl_index and is_blacklisted(entry, bl_index):
             continue
-        score, reasons = score_private_iptv_entry(entry, config, now=now)
+        score, reasons = score_private_iptv_entry(entry, config, now=now, context=context)
+        if context is not None and not event_entry_is_plausible(entry, reasons, now, context):
+            # The Aug-1 failure in one line: a channel titled for last week's
+            # card names none of tonight's fighters and carries the wrong date,
+            # so it can no longer be selected however "UFC" it looks.
+            if rejected is not None and any(r.startswith("keyword:") for r in reasons):
+                rejected.append(
+                    {
+                        "title": entry.get("title"),
+                        "score": score,
+                        "reason": f"does not identify {context.short_name}",
+                    }
+                )
+            continue
         required_keywords = config.get("required_keywords") or ["ufc"]
-        if not any(
-            re.search(rf"\b{re.escape(keyword.lower())}\b", private_iptv_entry_text(entry).lower()) for keyword in required_keywords
-        ):
+        if not any(re.search(rf"\b{re.escape(keyword.lower())}\b", private_iptv_entry_text(entry).lower()) for keyword in required_keywords):
             continue
         # Require an actual fight keyword (ufc/mma/prelims/...) so the group/slot/
         # main-event bonuses can't drag unrelated PPV entries (other sports) over
@@ -3683,25 +3865,17 @@ async def ffprobe_video(url, config, timeout=12.0):
     ua = headers.get("User-Agent", _SCRAPE_UA)
     hdr_lines = "".join(f"{k}: {v}\r\n" for k, v in headers.items() if k.lower() in ("referer", "cookie"))
     cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-user_agent",
-        ua,
+        "ffprobe", "-v", "error", "-user_agent", ua,
         *(["-headers", hdr_lines] if hdr_lines else []),
-        "-analyzeduration",
-        "4000000",
-        "-probesize",
-        "4000000",
-        "-show_entries",
-        "stream=codec_type,codec_name,width,height",
-        "-of",
-        "json",
-        url,
+        "-analyzeduration", "4000000", "-probesize", "4000000",
+        "-show_entries", "stream=codec_type,codec_name,width,height",
+        "-of", "json", url,
     ]
     proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         if proc is not None:
@@ -3761,9 +3935,7 @@ async def assess_playback_candidate(url, config, headers=None, deep=True):
     elif media_playlists:
         score += 20
         reasons.append("master playlist")
-        nested_status, _nested_ct, nested_body = await fetch_small_head(
-            media_playlists[0], headers, timeout=float(config.get("probe_timeout_seconds", 10))
-        )
+        nested_status, _nested_ct, nested_body = await fetch_small_head(media_playlists[0], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
         nested_text = nested_body.decode("utf-8", errors="replace")
         nested_segments = [item for item in parse_hls_urls(nested_text, media_playlists[0]) if not item.split("?", 1)[0].endswith(".m3u8")]
         if nested_status < 400 and nested_segments:
@@ -3780,9 +3952,7 @@ async def assess_playback_candidate(url, config, headers=None, deep=True):
         score -= 20
         reasons.append("ended or tiny vod")
     if media_segments and deep:
-        seg_status, seg_ct, seg_body = await fetch_small_head(
-            media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10))
-        )
+        seg_status, seg_ct, seg_body = await fetch_small_head(media_segments[-1], headers, timeout=float(config.get("probe_timeout_seconds", 10)))
         if seg_status < 400 and seg_body and not looks_like_html(seg_body):
             score += 35
             reasons.append("segment readable")
@@ -3802,8 +3972,12 @@ def private_iptv_source_id(prefix, entry, index):
     return f"{prefix}-{slug or index + 1}"
 
 
-def merge_private_iptv_sources(config, accepted):
-    """Replace the auto-prefixed private sources in config with the accepted candidates (blacklisted ones dropped), keeping manual sources; returns the new source ids."""
+def merge_private_iptv_sources(config, accepted, context=None):
+    """Replace the auto-prefixed private sources in config with the accepted candidates (blacklisted ones dropped), keeping manual sources; returns the new source ids.
+
+    Each accepted source is stamped with the card it was discovered for, which
+    is what lets a later start refuse to ingest another event's channels.
+    """
     stream = config.setdefault("stream", {})
     auto_cfg = config.get("private_iptv", {})
     prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
@@ -3826,30 +4000,70 @@ def merge_private_iptv_sources(config, accepted):
         source_id = private_iptv_source_id(prefix, entry, index)
         label = entry.get("title") or (entry.get("attrs") or {}).get("tvg-name") or f"Private IPTV {index + 1}"
         url = entry.get("url")
-        auto_sources.append(
-            {
-                "id": source_id,
-                "label": label,
-                "url": url,
-                "type": source_type_for_url(None, url),
-                "enabled": True,
-                "headers": headers,
-                "notes": f"Auto-selected from private IPTV playlist; score {item.get('score')}; {', '.join(item.get('reasons') or [])}",
-            }
-        )
+        source = {
+            "id": source_id,
+            "label": label,
+            "url": url,
+            "type": source_type_for_url(None, url),
+            "enabled": True,
+            "headers": headers,
+            "notes": f"Auto-selected from private IPTV playlist; score {item.get('score')}; {', '.join(item.get('reasons') or [])}",
+        }
+        if context is not None:
+            source["event_id"] = context.event_id
+            source["discovered_at"] = now_ms()
+        auto_sources.append(source)
     stream["sources"] = normalize_sources([*auto_sources, *manual])
     sync_links_from_sources(stream)
     return [source["id"] for source in auto_sources]
 
 
-def disable_private_iptv_sources(config):
-    """Disable (don't remove) every auto-prefixed private-IPTV source in config; return True if any were changed."""
+def purge_foreign_event_sources(config, event_id):
+    """Drop auto-discovered sources that belong to a *different* card.
+
+    Run at every arming. Untagged sources (manual entries, and anything
+    discovered before this feature) are left alone — the operator owns those.
+    Returns the number of sources removed.
+    """
+    stream = config.setdefault("stream", {})
+    sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
+    kept = [source for source in sources if str(source.get("event_id") or event_id) == str(event_id)]
+    removed = len(sources) - len(kept)
+    if not removed:
+        return 0
+    stream["sources"] = normalize_sources(kept)
+    locked_id = str(stream.get("locked_source_id") or "")
+    if locked_id and not any(source.get("id") == locked_id for source in stream["sources"]):
+        stream["locked_source_id"] = ""
+    sync_links_from_sources(stream)
+    return removed
+
+
+def event_source_links(config, event_id):
+    """Ingest links discovered for ``event_id`` (locked source first, as ever)."""
+    if not event_id:
+        return []
+    return normalize_links(
+        [source.get("url") for source in ordered_stream_sources(config) if str(source.get("event_id") or "") == str(event_id)]
+    )
+
+
+def disable_private_iptv_sources(config, keep_event_id=None):
+    """Disable (don't remove) every auto-prefixed private-IPTV source in config; return True if any were changed.
+
+    ``keep_event_id`` spares the feeds discovered for a card that is currently
+    on air: one provider hiccup mid-event must not strip the link pool out from
+    under a working encode, which would leave the watchdog with nothing to
+    restart onto.
+    """
     stream = config.setdefault("stream", {})
     auto_cfg = config.get("private_iptv", {})
     prefix = auto_cfg.get("auto_source_prefix") or "private-iptv"
     changed = False
     sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
     for source in sources:
+        if keep_event_id and str(source.get("event_id") or "") == str(keep_event_id):
+            continue
         if str(source.get("id", "")).startswith(prefix + "-") and source.get("enabled", True):
             source["enabled"] = False
             changed = True
@@ -3908,40 +4122,23 @@ async def _scrape_fetch(url: str, referer: str | None = None) -> str:
     """Fetch a page with browser-like headers. Uses subprocess curl to handle
     brotli/zstd compression that older httpx builds may not support."""
     headers_args: list[str] = [
-        "-H",
-        f"User-Agent: {_SCRAPE_UA}",
-        "-H",
-        f"Accept: {_SCRAPE_ACCEPT}",
-        "-H",
-        "Accept-Language: en-US,en;q=0.5",
-        "-H",
-        "DNT: 1",
-        "-H",
-        "Sec-GPC: 1",
-        "-H",
-        "Upgrade-Insecure-Requests: 1",
-        "-H",
-        "Sec-Fetch-Dest: document",
-        "-H",
-        "Sec-Fetch-Mode: navigate",
-        "-H",
-        "Sec-Fetch-Site: same-origin",
-        "-H",
-        "Pragma: no-cache",
-        "-H",
-        "Cache-Control: no-cache",
+        "-H", f"User-Agent: {_SCRAPE_UA}",
+        "-H", f"Accept: {_SCRAPE_ACCEPT}",
+        "-H", "Accept-Language: en-US,en;q=0.5",
+        "-H", "DNT: 1",
+        "-H", "Sec-GPC: 1",
+        "-H", "Upgrade-Insecure-Requests: 1",
+        "-H", "Sec-Fetch-Dest: document",
+        "-H", "Sec-Fetch-Mode: navigate",
+        "-H", "Sec-Fetch-Site: same-origin",
+        "-H", "Pragma: no-cache",
+        "-H", "Cache-Control: no-cache",
     ]
     if referer:
         headers_args += ["-H", f"Referer: {referer}"]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "curl",
-            "-s",
-            "--compressed",
-            "--max-time",
-            "15",
-            "-L",
-            url,
+            "curl", "-s", "--compressed", "--max-time", "15", "-L", url,
             *headers_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -4025,17 +4222,9 @@ async def _validate_hls_candidate(url: str) -> bool:
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
-            "curl",
-            "-s",
-            "--compressed",
-            "--max-time",
-            "10",
-            "-L",
-            "-I",
-            "-H",
-            f"User-Agent: {_SCRAPE_UA}",
-            "-H",
-            "Accept: application/vnd.apple.mpegurl,*/*;q=0.8",
+            "curl", "-s", "--compressed", "--max-time", "10", "-L", "-I",
+            "-H", f"User-Agent: {_SCRAPE_UA}",
+            "-H", "Accept: application/vnd.apple.mpegurl,*/*;q=0.8",
             url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -4188,8 +4377,20 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
     config = load_config(fresh=True)
     private_cfg = config.get("private_iptv", {})
     proc = process_metrics()
+    context = active_event_context()
+    if context is not None:
+        reset_switch_state(context.event_id)
     health_doc = stream_health(config, proc, hls_metrics(config), force=True)
-    budget = private_probe_budget(config, proc=proc, health_doc=health_doc, force_probe=force_probe)
+    budget = private_probe_budget(config, proc=proc, health_doc=health_doc, force_probe=force_probe, context=context)
+    # A live encode whose sources are not tagged for the tracked card cannot be
+    # showing it. Require the mismatch to repeat before acting: a single sample
+    # taken mid-write of the source list would flap the stream for nothing.
+    mismatch_confirmed = False
+    if context is not None and context.active and budget.get("stream_uses_private_slot") and not live_stream_is_event_matched(config, context):
+        SOURCE_SWITCH_STATE["mismatch_samples"] = int(SOURCE_SWITCH_STATE.get("mismatch_samples", 0)) + 1
+        mismatch_confirmed = SOURCE_SWITCH_STATE["mismatch_samples"] >= int(private_cfg.get("switch_confirm_samples", 2))
+    else:
+        SOURCE_SWITCH_STATE["mismatch_samples"] = 0
     update_private_probe_runtime(config, budget, mode="pending")
     PRIVATE_IPTV_RUNTIME.update(
         {
@@ -4206,7 +4407,7 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
         PRIVATE_IPTV_RUNTIME.update({"state": "paused", "message": "Private IPTV automation is paused; live ffmpeg is unchanged."})
         return {"ok": True, "changed": False, "runtime": private_iptv_public_runtime()}
 
-    if should_protect_live_private_stream(config, budget, force_probe=force_probe):
+    if should_protect_live_private_stream(config, budget, force_probe=force_probe, context=context, mismatch_confirmed=mismatch_confirmed):
         prefix = private_cfg.get("auto_source_prefix") or "private-iptv"
         active_ids = [
             source.get("id")
@@ -4235,7 +4436,15 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             raise RuntimeError("private IPTV playlist URL was not found")
         playlist_text = await private_iptv_fetch_text(playlist_url, private_cfg, referer=provider_url)
         entries = parse_m3u_entries(playlist_text)
-        candidates = select_private_iptv_candidates(entries, private_cfg, blacklist=config.get("source_blacklist"))
+        rejected: list[dict[str, Any]] = []
+        candidates = select_private_iptv_candidates(
+            entries,
+            private_cfg,
+            blacklist=config.get("source_blacklist"),
+            context=context,
+            rejected=rejected,
+        )
+        SOURCE_SWITCH_STATE["last_reasons"] = rejected[:8]
         accepted = []
         probe_reasons = []
         should_probe = bool(private_cfg.get("probe_candidates", True) and budget.get("probe_allowed"))
@@ -4278,13 +4487,15 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             accepted = candidates
             update_private_probe_runtime(config, budget, mode="metadata-only")
             probe_reasons = [
-                {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])} for item in candidates
+                {"title": item["entry"].get("title"), "score": item.get("score"), "reasons": item.get("reasons", [])}
+                for item in candidates
             ]
 
         changed = False
         if accepted:
+            SOURCE_SWITCH_STATE["acquire_attempts"] = 0
             old_links = effective_stream_links(config)
-            active_ids = merge_private_iptv_sources(config, accepted)
+            active_ids = merge_private_iptv_sources(config, accepted, context=context)
             new_links = effective_stream_links(config)
             changed = old_links != new_links
             _reconcile_operator_stopped(config)
@@ -4304,10 +4515,26 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
             )
             if changed:
                 event("private IPTV sources refreshed", "ok", {"count": len(accepted), "reason": reason})
+                stream_live = bool(proc.get("managed"))
                 can_restart_live = bool(force_probe or budget.get("probe_allowed") or not budget.get("stream_uses_private_slot"))
-                restarted = await restart_managed_with_config("private IPTV sources refreshed") if can_restart_live else False
-                if not can_restart_live:
+                # Anti-flap: a source change is only worth a viewer-visible
+                # restart if this card has switch budget left and the last switch
+                # is old enough — unless the live feed is the wrong card, which
+                # always wins over "don't interrupt".
+                switch_ok, switch_block = source_switch_allowed(
+                    config,
+                    force=force_probe or mismatch_confirmed,
+                    stream_running=stream_live,
+                )
+                restarted = False
+                if can_restart_live and switch_ok:
+                    restarted = await restart_managed_with_config("private IPTV sources refreshed")
+                    if restarted and stream_live:
+                        record_source_switch()
+                elif not can_restart_live:
                     event("private IPTV source changes saved without restart; live private stream protected", "warn")
+                else:
+                    event(f"private IPTV source change held back: {switch_block}", "warn")
                 if not restarted and private_cfg.get("auto_start_when_active", True):
                     async with PROCESS_LOCK:
                         # Re-read operator intent from FRESH config inside the lock:
@@ -4325,7 +4552,13 @@ async def refresh_private_iptv_sources(reason="manual", force_probe=False):
                             STREAM_DESIRED_STATE = "running"
             return {"ok": True, "changed": changed, "runtime": private_iptv_public_runtime()}
 
-        disabled = disable_private_iptv_sources(config)
+        # Nothing verified this cycle. Count it against the card so the public
+        # backup tiles can be brought in as a fallback, and keep any feed that is
+        # already carrying this card rather than emptying the pool on a blip.
+        keep_event_id = context.event_id if context is not None and context.active else None
+        if context is not None and context.active:
+            SOURCE_SWITCH_STATE["acquire_attempts"] = int(SOURCE_SWITCH_STATE.get("acquire_attempts", 0)) + 1
+        disabled = disable_private_iptv_sources(config, keep_event_id=keep_event_id)
         if disabled:
             _reconcile_operator_stopped(config)
             save_config(config)
@@ -4391,7 +4624,6 @@ _GOOZ_REFERER = "https://gooz.aapmains.net/"
 def _proxy_url(raw_url: str) -> str:
     """Return the local /api/proxy-hls URL that fetches raw_url through this proxy."""
     from urllib.parse import quote
-
     return f"/api/proxy-hls?url={quote(raw_url, safe='')}"
 
 
@@ -4522,7 +4754,7 @@ def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
     if header_end == -1:
         header_end = raw_out.rfind(b"\n\n")
         separator_len = 2
-    body = raw_out[header_end + separator_len :] if header_end != -1 else raw_out
+    body = raw_out[header_end + separator_len:] if header_end != -1 else raw_out
     header_block = raw_out[:header_end] if header_end != -1 else b""
     last_header_block = header_block.split(b"\r\n\r\n")[-1].split(b"\n\n")[-1]
     ct = ""
@@ -4531,6 +4763,7 @@ def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
             ct = line.split(b":", 1)[1].strip().decode("utf-8", errors="replace")
             break
     return body, ct
+
 
 
 _M3U8_URI_RE = re.compile(r'URI="([^"]+)"')
@@ -4557,11 +4790,9 @@ def _rewrite_m3u8(text: str, raw_url: str) -> str:
         line = line.rstrip("\r")
         # Rewrite URI="..." attributes found in #EXT-X-KEY, #EXT-X-MAP, etc.
         if line.startswith("#") and "URI=" in line:
-
             def _sub_uri(m: re.Match) -> str:
                 """Rewrite a matched URI="..." attribute value through proxify."""
                 return f'URI="{proxify(m.group(1))}"'
-
             line = _M3U8_URI_RE.sub(_sub_uri, line)
             out_lines.append(line)
             continue
@@ -4580,7 +4811,6 @@ async def proxy_hls(request):
     No auth required; intended for client-side Source Changer playback.
     """
     from urllib.parse import unquote
-
     raw_url = unquote(request.query_params.get("url", "").strip())
     if not valid_stream_url(raw_url):
         return Response("bad url", status_code=400)
@@ -4638,7 +4868,6 @@ async def source_hls(request):
             status_code=404,
             headers=cors_headers,
         )
-
     class _ServerOneRequest:
         """Minimal request shim carrying the fixed ufc.m3u8 path param into hls_proxy."""
 
@@ -4776,7 +5005,9 @@ async def remove_public_stream(request):
     url = str(body.get("url") or "").strip()
     sources = normalize_public_sources(config.get("public_sources", []))
     config["public_sources"] = [
-        source for source in sources if not ((source_id and source.get("id") == source_id) or (url and source.get("url") == url))
+        source
+        for source in sources
+        if not ((source_id and source.get("id") == source_id) or (url and source.get("url") == url))
     ]
     save_config(config)
     event("public source removed", "warn", {"id": source_id, "url": url})
@@ -4826,9 +5057,7 @@ async def add_blacklist(request):
     # Immediate removal from both live lists.
     config["public_sources"] = [s for s in normalize_public_sources(config.get("public_sources", [])) if not is_blacklisted(s, bl_index)]
     stream = config.setdefault("stream", {})
-    stream["sources"] = [
-        s for s in normalize_sources(stream.get("sources", []), stream.get("links", [])) if not is_blacklisted(s, bl_index)
-    ]
+    stream["sources"] = [s for s in normalize_sources(stream.get("sources", []), stream.get("links", [])) if not is_blacklisted(s, bl_index)]
     sync_links_from_sources(stream)
     save_config(config)
     event("source blacklisted", "warn", {"url": url, "id": source_id, "label": label, "channel": channel})
@@ -4849,10 +5078,7 @@ async def remove_blacklist(request):
     remaining = [
         entry
         for entry in normalize_blacklist(config.get("source_blacklist", []))
-        if not (
-            (url and str(entry.get("url", "")).strip().lower() == url)
-            or (source_id and str(entry.get("id", "")).strip().lower() == source_id)
-        )
+        if not ((url and str(entry.get("url", "")).strip().lower() == url) or (source_id and str(entry.get("id", "")).strip().lower() == source_id))
     ]
     config["source_blacklist"] = remaining
     save_config(config)
@@ -4947,7 +5173,6 @@ async def scrape_streams(request):
 async def public_source(request):
     """Return the auto-scraped public stream sources as proxy URLs. No auth, CORS *."""
     from urllib.parse import quote as _quote
-
     cors = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
@@ -4960,17 +5185,14 @@ async def public_source(request):
         sources = list(_AUTO_SOURCES)
         refreshed_at = _AUTO_SOURCES_AT
     proxy_urls = [f"/api/proxy-hls?url={_quote(s, safe='')}" for s in sources]
-    return JSONResponse(
-        {
-            "ok": True,
-            "sources": proxy_urls,
-            "raw": sources,
-            "count": len(proxy_urls),
-            "refreshed_at": refreshed_at,
-            "next_refresh_in": max(0, int(_AUTO_SCRAPE_INTERVAL - (time.time() - refreshed_at))),
-        },
-        headers=cors,
-    )
+    return JSONResponse({
+        "ok": True,
+        "sources": proxy_urls,
+        "raw": sources,
+        "count": len(proxy_urls),
+        "refreshed_at": refreshed_at,
+        "next_refresh_in": max(0, int(_AUTO_SCRAPE_INTERVAL - (time.time() - refreshed_at))),
+    }, headers=cors)
 
 
 async def activate_link(request):
@@ -5019,9 +5241,7 @@ async def activate_source(request):
     url = str(body.get("url") or "").strip()
     stream = config.setdefault("stream", {})
     sources = normalize_sources(stream.get("sources", []), stream.get("links", []))
-    match = next(
-        (source for source in sources if (source_id and source.get("id") == source_id) or (url and source.get("url") == url)), None
-    )
+    match = next((source for source in sources if (source_id and source.get("id") == source_id) or (url and source.get("url") == url)), None)
     if not match:
         return JSONResponse({"ok": False, "error": "source not found"}, status_code=404)
     match["enabled"] = True
@@ -5062,14 +5282,7 @@ async def lock_source(request):
     if locked and previous_first != new_first:
         restarted = await restart_managed_with_config("operator locked a different source")
     event("source locked" if locked else "source unlocked", "ok", {"id": source_id})
-    return JSONResponse(
-        {
-            "ok": True,
-            "locked_source_id": stream["locked_source_id"],
-            "restarted": restarted,
-            "sources": source_statuses(config, process_metrics()),
-        }
-    )
+    return JSONResponse({"ok": True, "locked_source_id": stream["locked_source_id"], "restarted": restarted, "sources": source_statuses(config, process_metrics())})
 
 
 async def recover_soursignal_source(request):
@@ -5103,14 +5316,7 @@ async def recover_soursignal_source(request):
     restarted = await restart_managed_with_config("sour signal source recovered")
     if restarted:
         event("running stream picked up recovered source", "ok")
-    return JSONResponse(
-        {
-            "ok": True,
-            "source": public_source_status(source, proc=process_metrics()),
-            "links": config["stream"]["links"],
-            "sources": source_statuses(config, process_metrics()),
-        }
-    )
+    return JSONResponse({"ok": True, "source": public_source_status(source, proc=process_metrics()), "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
 
 
 async def probe_configured_source(source, config=None, budget=None):
@@ -5132,9 +5338,7 @@ async def probe_configured_source(source, config=None, budget=None):
         else:
             deep = not is_private_soursignal_source(source, private_cfg)
             async with PRIVATE_PROBE_LOCK:
-                assessment = await assess_playback_candidate(
-                    url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url), deep=deep
-                )
+                assessment = await assess_playback_candidate(url, normalize_private_iptv({}), headers=source.get("headers") or proxy_request_headers(url), deep=deep)
             if assessment.get("ok"):
                 state = "green"
             elif assessment.get("score", 0) >= 20:
@@ -5381,14 +5585,39 @@ async def clear_schedule_suppression():
     await SCHEDULER.persist()
 
 
+def schedule_start_links(config, context):
+    """The links a scheduled start is allowed to ingest, and why.
+
+    With a tracked card, only feeds discovered *for that card* qualify. The old
+    behaviour — start on whatever links happen to be on disk — is what put the
+    previous week's channels on air for the whole of 2026-08-01, because a stale
+    feed that still decodes looks identical to a good one from ffmpeg's side.
+    Public backup sources are pulled in once the private path has failed to
+    produce anything for several cycles, so a provider outage does not mean a
+    dark card.
+    """
+    if context is None:
+        return effective_stream_links(config), "no tracked card; using the configured link pool"
+    links = event_source_links(config, context.event_id)
+    if links:
+        return links, f"{len(links)} source(s) verified for {context.short_name}"
+    attempts = int(SOURCE_SWITCH_STATE.get("acquire_attempts", 0))
+    fallback_after = int(config.get("private_iptv", {}).get("public_fallback_after_attempts", 4))
+    if attempts >= fallback_after:
+        public = normalize_links(current_auto_sources())
+        if public:
+            return public, f"no private feed after {attempts} attempts; falling back to {len(public)} public source(s)"
+    return [], f"no source verified for {context.short_name} yet (attempt {attempts})"
+
+
 async def schedule_start_stream(reason):
     """Arm the stream for a scheduled card. Returns True once the cockpit is armed.
 
-    "Armed" deliberately means *the operator Stop is lifted*, not "ffmpeg is up".
-    If no links are configured yet, clearing the Stop is what un-pauses the
-    private-IPTV scraper, which then discovers sources and auto-starts the
-    encode on its own. Reporting success here is what lets the scheduler take
-    ownership so it also performs the stand-down later.
+    "Armed" deliberately means *the operator Stop is lifted and this card is
+    owned*, not "ffmpeg is up". Holding with the encode down is a legitimate
+    outcome: streaming an unidentified feed is worse than streaming nothing, and
+    reporting success is what keeps the scheduler in charge so it retries on the
+    acquisition cadence and still performs the stand-down at the end.
     """
     global STREAM_DESIRED_STATE
     if SCHEDULER is None:
@@ -5400,12 +5629,19 @@ async def schedule_start_stream(reason):
             return False
         config = load_config(fresh=True)
         set_operator_stopped(config, False)
+        context = active_event_context()
+        # Last week's sources can never survive into this card's link pool.
+        removed = purge_foreign_event_sources(config, context.event_id) if context is not None else 0
+        if removed:
+            event(f"auto-schedule dropped {removed} source(s) from a previous card", "warn")
+            save_config(config)
         if PROCESS and PROCESS.poll() is None:
             event(f"auto-schedule armed ({reason}); stream already running", "ok")
             return True
-        links = effective_stream_links(config)
+        links, detail = schedule_start_links(config, context)
         if not links:
-            event(f"auto-schedule armed ({reason}); waiting on the scraper for sources", "warn")
+            SOURCE_SWITCH_STATE["last_error"] = detail
+            event(f"auto-schedule armed ({reason}); holding: {detail}", "warn")
             return True
         try:
             start_managed_process(config, links, kill_existing=True)
@@ -5414,7 +5650,7 @@ async def schedule_start_stream(reason):
             event(f"auto-schedule start failed: {exc}", "bad")
             ERRORS.append({"ts": now_ms(), "level": "error", "line": f"auto-schedule start failed: {exc}"})
             return False
-        event(f"auto-schedule started the stream ({reason})", "ok")
+        event(f"auto-schedule started the stream ({reason}); {detail}", "ok")
         return True
 
 
@@ -5424,23 +5660,91 @@ async def schedule_stop_stream(reason):
     async with PROCESS_LOCK:
         STREAM_DESIRED_STATE = "stopped"
         WATCHDOG_LAST_ACTION = time.monotonic()
-        set_operator_stopped(load_config(fresh=True), True, StopReason.SCHEDULE.value)
+        config = load_config(fresh=True)
+        set_operator_stopped(config, True, StopReason.SCHEDULE.value)
+        # Retire this card's feeds. Left enabled they would be the first thing a
+        # future start reached for, a week after their tokens went dead.
+        if disable_private_iptv_sources(config):
+            config.setdefault("stream", {})["locked_source_id"] = ""
+            save_config(config)
         await stop_managed_process(f"stream stopped by auto-schedule: {reason}")
         event(f"auto-schedule stood the stream down ({reason})", "ok")
         return True
 
 
-async def schedule_force_source_refresh(reason):
-    """Kick a private-IPTV sweep during the pre-roll, when the spare slot is free."""
-    with contextlib.suppress(Exception):
-        await refresh_private_iptv_sources(reason=reason)
+class CockpitSourceResolver:
+    """The scheduler's view of source discovery (``obbyschedule.SourceResolver``).
+
+    Keeps the package free of any cockpit import: the scheduler hands over the
+    tracked card, and this bridges it to the private-IPTV scraper and the public
+    backup scraper.
+    """
+
+    async def refresh(self, reason, context=None):
+        """Resolve sources for the tracked card before anything goes on air."""
+        self.publish(context)
+        with contextlib.suppress(Exception):
+            await refresh_private_iptv_sources(reason=reason, force_probe=True)
+        # Public backup tiles carry ~3h tokens, so the copies from the last card
+        # are always dead by the time the next one starts.
+        with contextlib.suppress(Exception):
+            await refresh_public_backup_sources()
+
+    def publish(self, context):
+        """Point the scraper at a card (or clear it once the card is done)."""
+        global ACTIVE_EVENT_CONTEXT
+        ACTIVE_EVENT_CONTEXT = context
+        if context is None:
+            reset_switch_state(None)
+        else:
+            reset_switch_state(context.event_id)
+
+
+async def refresh_public_backup_sources():
+    """Re-scrape the public backup sources now instead of waiting for the loop."""
+    global _AUTO_SOURCES, _AUTO_SOURCES_AT
+    sources = await _run_auto_scrape()
+    if not sources or _AUTO_SOURCES_LOCK is None:
+        return list(_AUTO_SOURCES)
+    async with _AUTO_SOURCES_LOCK:
+        _AUTO_SOURCES = sources
+        _AUTO_SOURCES_AT = time.time()
+    event("public backup sources refreshed for the tracked card", "ok", {"count": len(sources)})
+    return sources
+
+
+def schedule_source_state(config=None):
+    """How source acquisition is going for the tracked card.
+
+    Answers the question the cockpit could not answer during the 2026-08-01
+    card: *which* feed is on air, whether it belongs to tonight's event, and if
+    nothing is on air, what was rejected and why.
+    """
+    context = active_event_context()
+    config = config or load_config()
+    matched = [
+        {"id": source.get("id"), "label": source.get("label"), "discovered_at": source.get("discovered_at")}
+        for source in ordered_stream_sources(config)
+        if context is not None and str(source.get("event_id") or "") == str(context.event_id)
+    ]
+    return {
+        "event_id": context.event_id if context else None,
+        "event_matched_sources": matched,
+        "event_matched": bool(matched),
+        "terms": list(context.terms) if context else [],
+        "acquire_attempts": int(SOURCE_SWITCH_STATE.get("acquire_attempts", 0)),
+        "switches": int(SOURCE_SWITCH_STATE.get("switches", 0)),
+        "mismatch_samples": int(SOURCE_SWITCH_STATE.get("mismatch_samples", 0)),
+        "rejected": list(SOURCE_SWITCH_STATE.get("last_reasons") or []),
+        "last_error": SOURCE_SWITCH_STATE.get("last_error") or "",
+    }
 
 
 def schedule_snapshot():
     """Compact scheduler state for the status payload and ``GET /api/schedule``."""
     if SCHEDULER is None:
         return {"enabled": False, "phase": "idle", "action": "idle", "reason": "scheduler not running"}
-    return SCHEDULER.snapshot()
+    return {**SCHEDULER.snapshot(), "source_state": schedule_source_state()}
 
 
 async def get_schedule(request):
@@ -5610,9 +5914,11 @@ async def watchdog_loop():
                 RUNTIME["watchdog_restarts"] += 1
                 event(f"watchdog restart: {reason}", "warn")
                 await stop_managed_process(f"stream stopped for watchdog: {reason}")
-                links = effective_stream_links(config)
+                # While a card is tracked the watchdog is held to the same bar as
+                # a scheduled start: recover onto this event's feeds or not at all.
+                links, detail = schedule_start_links(config, active_event_context())
                 if not links:
-                    event("watchdog skipped restart because no links are configured", "warn")
+                    event(f"watchdog skipped restart: {detail}", "warn")
                     continue
                 try:
                     start_managed_process(config, links, kill_existing=True)
@@ -5757,6 +6063,35 @@ async def hls_proxy(request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
+FFMPEG_LOG_RETENTION_DAYS = 14
+
+
+def prune_ffmpeg_logs(days=FFMPEG_LOG_RETENTION_DAYS):
+    """Delete ffmpeg attempt logs older than ``days``; returns how many went.
+
+    Runs once at boot in a worker thread. Blocking, so never call it on the
+    event loop — the directory can hold six figures' worth of files.
+    """
+    stream = load_config().get("stream", {})
+    log_dir = Path(stream.get("ffmpeg_log_dir") or "ffmpegLogs")
+    if not log_dir.is_absolute():
+        log_dir = APP_DIR / log_dir
+    if not log_dir.is_dir():
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for path in log_dir.glob("*.log"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info("pruned %d ffmpeg log(s) older than %d days", removed, days)
+    return removed
+
+
 async def index(request):
     """GET /: serve the cockpit SPA index.html."""
     return FileResponse(STATIC_DIR / "index.html")
@@ -5764,7 +6099,6 @@ async def index(request):
 
 def static_asset(name, media_type=None):
     """Return a route handler that serves the named file from STATIC_DIR with an optional media type."""
-
     async def handler(request):
         """Serve the bound static asset file."""
         return FileResponse(STATIC_DIR / name, media_type=media_type)
@@ -5778,18 +6112,7 @@ def static_asset(name, media_type=None):
 @asynccontextmanager
 async def lifespan(app):
     """ASGI lifespan: honor a persisted operator Stop, init the shared HTTP client and Arango queue, launch all background loops, and tear them down (stopping the encode) on shutdown."""
-    global \
-        WATCHDOG_TASK, \
-        ARANGO_QUEUE, \
-        ARANGO_WORKER_TASK, \
-        _AUTO_SCRAPE_TASK, \
-        _AUTO_SOURCES_LOCK, \
-        _HTTPX_CLIENT, \
-        SOURCE_HEALTH_TASK, \
-        PRIVATE_IPTV_TASK, \
-        STREAM_DESIRED_STATE, \
-        SCHEDULER, \
-        SCHEDULE_TASK
+    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK, STREAM_DESIRED_STATE, SCHEDULER, SCHEDULE_TASK
     # Honor a persisted operator Stop across restarts: keep the stream down and
     # both scrapers idle until a human Starts it. The watchdog + scraper loops all
     # re-check operator_stopped, so this only needs to seed the desired-state.
@@ -5806,6 +6129,10 @@ async def lifespan(app):
     )
     ARANGO_WORKER_TASK = asyncio.create_task(arango_worker_loop())
     event("obbystreams dashboard booted", "ok")
+    # Every ffmpeg attempt writes a log and nothing ever removed them: the
+    # directory had grown to ~150k files / 13GB. Prune off the event loop.
+    _BACKGROUND_TASKS.add(pruned := asyncio.create_task(asyncio.to_thread(prune_ffmpeg_logs)))
+    pruned.add_done_callback(_BACKGROUND_TASKS.discard)
     WATCHDOG_TASK = asyncio.create_task(watchdog_loop())
     SOURCE_HEALTH_TASK = asyncio.create_task(source_health_loop())
     PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
@@ -5818,7 +6145,7 @@ async def lifespan(app):
         load_config=lambda: load_config(),
         start_stream=schedule_start_stream,
         stop_stream=schedule_stop_stream,
-        refresh_sources=schedule_force_source_refresh,
+        sources=CockpitSourceResolver(),
         event_log=event,
     )
     SCHEDULE_TASK = asyncio.create_task(SCHEDULER.run(lambda: bool(PROCESS and PROCESS.poll() is None)))
@@ -5862,7 +6189,6 @@ async def lifespan(app):
                     _AUTO_SOURCES_AT = time.time()
                 logger.info("initial auto scrape: %d source(s)", len(sources))
         await _auto_scrape_loop()
-
     _AUTO_SCRAPE_TASK = asyncio.create_task(_scrape_then_loop())
     try:
         yield

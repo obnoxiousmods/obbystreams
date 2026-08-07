@@ -6,6 +6,7 @@ import { api, isUnauthorized } from "./api";
 import { absoluteUrl, encoderLabel, errorMessage, fmtAge, fmtBytes, fmtClock, fmtMetric, fmtPercent, toneFromLevel } from "./format";
 import { blacklistKey, blacklistPrimaryLabel, blockPayload, isOperatorStopped } from "./lib/blacklist";
 import {
+  acquisitionBannerText,
   cardProgress,
   formatCardTime,
   formatCountdown,
@@ -455,6 +456,46 @@ function StatusStrip({
  * far through it the cockpit is. Also hosts the "send a test embed" button so
  * the Discord webhook can be verified without waiting for a real event.
  */
+/**
+ * Source acquisition for the tracked card.
+ *
+ * Says which feed is on air and whether it belongs to tonight's event — the
+ * question the cockpit silently got wrong for a whole card on 2026-08-01, when
+ * it streamed the previous week's channels while reporting perfect health.
+ */
+export function SourceAcquisition({ schedule }: { schedule: ScheduleSnapshot | null | undefined }) {
+  const state = schedule?.source_state;
+  if (!schedule?.enabled || !state?.event_id) return null;
+
+  const acquiring = acquisitionBannerText(schedule);
+  if (acquiring) {
+    return (
+      <div className="sourceAcquisition warn">
+        <p>{acquiring}</p>
+        {state.rejected.length > 0 && (
+          <ul className="sourceRejects muted">
+            {state.rejected.slice(0, 4).map((item, index) => (
+              <li key={`${item.title ?? "candidate"}-${index}`}>
+                <span className="rejectTitle">{item.title ?? "untitled channel"}</span>
+                <span className="rejectReason"> — {item.reason}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
+  if (!state.event_matched) return null;
+  const count = state.event_matched_sources.length;
+  return (
+    <p className="sourceAcquisition muted">
+      ✅ {count} source{count === 1 ? "" : "s"} verified for this card
+      {state.switches ? ` · ${state.switches} switch${state.switches === 1 ? "" : "es"} so far` : ""}
+    </p>
+  );
+}
+
 export function SchedulePanel({
   schedule,
   pending,
@@ -523,6 +564,7 @@ export function SchedulePanel({
               🏆 {event.winner} — main event
             </p>
           )}
+          <SourceAcquisition schedule={schedule} />
           <p className="muted scheduleReason">
             {schedule.reason}
             {schedule.notifications_sent ? ` · ${schedule.notifications_sent} Discord notice(s) sent` : ""}

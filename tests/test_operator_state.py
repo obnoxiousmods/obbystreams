@@ -51,14 +51,20 @@ def test_reconcile_preserves_a_stop_persisted_after_snapshot(config_path):
 
 
 def test_watchdog_gate_blocks_restart_when_operator_stopped():
-    stopped = normalize_config({"stream": {"operator_stopped": True, "links": ["https://a.example.com/live.m3u8"]}})
-    running = normalize_config({"stream": {"operator_stopped": False, "links": ["https://a.example.com/live.m3u8"]}})
+    stopped = normalize_config(
+        {"stream": {"operator_stopped": True, "links": ["https://a.example.com/live.m3u8"]}}
+    )
+    running = normalize_config(
+        {"stream": {"operator_stopped": False, "links": ["https://a.example.com/live.m3u8"]}}
+    )
     assert should_watchdog_restart_exited_process(stopped, "running") is False
     assert should_watchdog_restart_exited_process(running, "running") is True
 
 
 def test_watchdog_gate_still_respects_desired_state_and_links():
-    running = normalize_config({"stream": {"operator_stopped": False, "links": ["https://a.example.com/live.m3u8"]}})
+    running = normalize_config(
+        {"stream": {"operator_stopped": False, "links": ["https://a.example.com/live.m3u8"]}}
+    )
     # desired_state stopped -> no restart even if operator flag is clear.
     assert should_watchdog_restart_exited_process(running, "stopped") is False
     # no links -> nothing to restart.

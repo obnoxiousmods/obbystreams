@@ -98,12 +98,37 @@ export function isCurrentEventSuppressed(schedule: ScheduleSnapshot | null | und
   return Boolean(suppressed && schedule?.event?.id === suppressed);
 }
 
+/**
+ * Whether the cockpit is armed for a card but holding with nothing on air.
+ *
+ * This is a deliberate state, not a fault: putting an unidentified feed on air
+ * is worse than putting nothing on. It still needs saying out loud, because
+ * from the outside it looks exactly like a broken scheduler.
+ */
+export function isAwaitingSource(schedule: ScheduleSnapshot | null | undefined): boolean {
+  return Boolean(schedule?.enabled && schedule?.awaiting_source);
+}
+
+/** The "still hunting for tonight's feed" line, or null when a feed is on air. */
+export function acquisitionBannerText(schedule: ScheduleSnapshot | null | undefined): string | null {
+  if (!isAwaitingSource(schedule)) return null;
+  const label = schedule?.event?.short_name ?? upcomingLabel(schedule) ?? "this card";
+  const rejected = schedule?.source_state?.rejected?.length ?? 0;
+  const attempts = schedule?.source_state?.acquire_attempts ?? 0;
+  const detail = rejected ? ` — ${rejected} candidate${rejected === 1 ? "" : "s"} rejected (wrong event)` : "";
+  const tries = attempts > 1 ? ` after ${attempts} sweeps` : "";
+  return `🔍 Acquiring a verified source for ${label}${tries}${detail}. Nothing goes on air until one matches.`;
+}
+
 /** The one-line banner shown while the stream is parked. */
 export function standbyBannerText(schedule: ScheduleSnapshot | null | undefined): string {
   // A vetoed card must not advertise a countdown it will never act on.
   if (isCurrentEventSuppressed(schedule)) {
     return "⏸ STOPPED for this card — auto-schedule resumes at the next event.";
   }
+  // Armed and hunting beats "standby": the card has already started.
+  const acquiring = acquisitionBannerText(schedule);
+  if (acquiring) return acquiring;
   const label = upcomingLabel(schedule);
   const countdown = formatCountdown(schedule?.countdown_seconds);
   if (!label) return "⏸ STANDBY — waiting for the next UFC card.";

@@ -6,6 +6,29 @@ All notable Obbystreams changes are tracked here.
 
 ### Added
 
+- **Event-aware source discovery.** The auto-schedule now hands the tracked
+  card's identity (fighter surnames, event number, ESPN's real per-segment
+  start times) to the private-IPTV scraper, and discovery runs *before* the
+  encode starts rather than after it. A feed must identify the tracked card to
+  be selected; with none verified the cockpit stays armed with the stream
+  **down** and retries every 60s rather than broadcasting an unidentified
+  channel. Sources carry `event_id`/`discovered_at`, a previous card's feeds are
+  purged at every arming and retired at stand-down, and `GET /api/schedule`
+  exposes a `source_state` block (matched sources, match terms, rejected
+  candidates with reasons, switch count) that the cockpit renders.
+  Fixes the 2026-08-01 card, which armed on time and then streamed the previous
+  week's channels for its entire duration while reporting healthy.
+- Mid-card source switching with anti-flap guardrails
+  (`switch_cooldown_seconds`, `switch_confirm_samples`, `max_switches_per_card`),
+  so the stream follows early prelims → prelims → main card and fails off a dead
+  or wrong feed without flapping during a fight.
+- Public backup sources are re-scraped at pre-roll (their tokens last ~3h) and
+  used as ingest links after `public_fallback_after_attempts` failed private
+  sweeps.
+- Stand-down backstop for a card ESPN never marks final (`stall_hours` +
+  `stall_idle_minutes`), and boot-time pruning of `ffmpegLogs/`, which had grown
+  to ~150k files / 13GB with no rotation.
+
 - **Persistent operator Stop**: `POST /api/stream/stop` now persists
   `stream.operator_stopped`, keeping the managed ffmpeg AND both scrapers idle
   until an explicit Start/Restart — surviving supervisor ticks and full
