@@ -24,7 +24,6 @@ class ScheduleProvider(Protocol):
 
     async def fetch_event(self, day: date) -> UfcEvent | None: ...
 
-
 class SourceResolver(Protocol):
     """The cockpit's source-discovery side, seen from the scheduler.
 

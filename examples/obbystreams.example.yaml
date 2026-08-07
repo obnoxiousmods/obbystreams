@@ -151,12 +151,16 @@ schedule:
   # Which calendar rows count as a card we stream.
   include_pattern: '^UFC\s+(\d+|Fight Night)'
   exclude_pattern: 'Contender Series|Road to UFC'
-  lead_minutes: 15
+  lead_minutes: 10
   # Post-fight grace before standing down, plus a hard failsafe if ESPN stalls.
-  end_grace_minutes: 20
+  end_grace_minutes: 30
   max_runtime_hours: 8
   calendar_refresh_seconds: 3600
   live_poll_seconds: 120
+  # Re-scrape until a deeply probed source matches the current segment.
+  acquisition_poll_seconds: 180
+  # Continue from the last validated detail through a temporary ESPN outage.
+  cache_max_age_hours: 72
   display_timezone: Canada/Pacific
   state_path: /etc/obbystreams/schedule_state.json
   notify:

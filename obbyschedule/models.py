@@ -241,6 +241,18 @@ class SchedulerAction(StrEnum):
     STOP = "stop"
 
 
+class StartStatus(StrEnum):
+    """Outcome of one cockpit start attempt.
+
+    ``AWAITING_SOURCE`` is intentionally distinct from failure: the scheduler
+    owns the card and should keep acquiring, but no encoder was launched.
+    """
+
+    STARTED = "started"
+    AWAITING_SOURCE = "awaiting_source"
+    FAILED = "failed"
+
+
 class MilestoneKind(StrEnum):
     """Which flavour of Discord notification a milestone produces."""
 
@@ -458,6 +470,19 @@ class Decision:
 
 
 @dataclass(frozen=True, slots=True)
+class StartResult:
+    """Structured result returned by the cockpit's scheduled-start bridge."""
+
+    status: StartStatus
+    detail: str = ""
+    source_confidence: str | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.status in {StartStatus.STARTED, StartStatus.AWAITING_SOURCE}
+
+
+@dataclass(frozen=True, slots=True)
 class NotifySettings:
     """Discord webhook configuration."""
 
@@ -514,14 +539,16 @@ class ScheduleSettings:
     scoreboard_url: str = DEFAULT_SCOREBOARD_URL
     include_pattern: str = DEFAULT_INCLUDE_PATTERN
     exclude_pattern: str = DEFAULT_EXCLUDE_PATTERN
-    lead_minutes: int = 15
-    end_grace_minutes: int = 20
+    lead_minutes: int = 10
+    end_grace_minutes: int = 30
     max_runtime_hours: int = 8
     calendar_refresh_seconds: int = 3600
     live_poll_seconds: int = 120
-    #: Tighter cadence while the card is in its window but nothing is on air, so
-    #: a feed that only appears at the bell is picked up in a minute, not five.
-    acquisition_poll_seconds: int = 60
+    #: Exact retry cadence while the current segment has no high-grade feed.
+    acquisition_poll_seconds: int = 180
+    #: A validated event may continue driving automation through a temporary
+    #: ESPN outage, but an ancient cache must never invent a new card.
+    cache_max_age_hours: int = 72
     #: Stand-down backstop for a card ESPN never marks final: this long after the
     #: last segment started with no bout completing, the card is over in practice.
     stall_hours: int = 6
@@ -541,12 +568,13 @@ class ScheduleSettings:
             scoreboard_url=_as_str(section.get("espn_scoreboard_url"), DEFAULT_SCOREBOARD_URL),
             include_pattern=_as_str(section.get("include_pattern"), DEFAULT_INCLUDE_PATTERN),
             exclude_pattern=_as_str(section.get("exclude_pattern"), DEFAULT_EXCLUDE_PATTERN),
-            lead_minutes=_as_int(section.get("lead_minutes"), 15, minimum=0, maximum=720),
-            end_grace_minutes=_as_int(section.get("end_grace_minutes"), 20, minimum=0, maximum=720),
+            lead_minutes=_as_int(section.get("lead_minutes"), 10, minimum=0, maximum=720),
+            end_grace_minutes=_as_int(section.get("end_grace_minutes"), 30, minimum=0, maximum=720),
             max_runtime_hours=_as_int(section.get("max_runtime_hours"), 8, minimum=1, maximum=24),
             calendar_refresh_seconds=_as_int(section.get("calendar_refresh_seconds"), 3600, minimum=300, maximum=86400),
             live_poll_seconds=_as_int(section.get("live_poll_seconds"), 120, minimum=30, maximum=3600),
-            acquisition_poll_seconds=_as_int(section.get("acquisition_poll_seconds"), 60, minimum=30, maximum=900),
+            acquisition_poll_seconds=_as_int(section.get("acquisition_poll_seconds"), 180, minimum=30, maximum=900),
+            cache_max_age_hours=_as_int(section.get("cache_max_age_hours"), 72, minimum=1, maximum=168),
             stall_hours=_as_int(section.get("stall_hours"), 6, minimum=1, maximum=24),
             stall_idle_minutes=_as_int(section.get("stall_idle_minutes"), 45, minimum=5, maximum=720),
             require_event_match=_as_bool(section.get("require_event_match"), True),
@@ -568,6 +596,7 @@ class ScheduleSettings:
             "calendar_refresh_seconds": self.calendar_refresh_seconds,
             "live_poll_seconds": self.live_poll_seconds,
             "acquisition_poll_seconds": self.acquisition_poll_seconds,
+            "cache_max_age_hours": self.cache_max_age_hours,
             "stall_hours": self.stall_hours,
             "stall_idle_minutes": self.stall_idle_minutes,
             "require_event_match": self.require_event_match,

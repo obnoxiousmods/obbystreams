@@ -165,6 +165,26 @@ def test_notification_ledger_survives_a_round_trip():
     assert revived.has_fired(EVENT_ID, "warn:360")
 
 
+def test_cached_event_and_shutdown_deadline_survive_a_round_trip():
+    state = ScheduleState(
+        current_event_id=EVENT_ID,
+        started_by_scheduler=True,
+        armed_at=FIRST_CARD.timestamp(),
+        hard_stop_at=(FIRST_CARD + timedelta(hours=8)).timestamp(),
+        cached_event=build_event(),
+        event_fetched_at=FIRST_CARD.timestamp(),
+        active_segment_key=FIRST_CARD.isoformat(),
+        last_source_refresh_at=FIRST_CARD.timestamp(),
+    )
+
+    revived = ScheduleState.from_json(state.to_json())
+
+    assert revived.cached_event == build_event()
+    assert revived.hard_stop_at == state.hard_stop_at
+    assert revived.active_segment_key == FIRST_CARD.isoformat()
+    assert revived.last_source_refresh_at == FIRST_CARD.timestamp()
+
+
 def test_ledger_is_pruned_to_recent_events():
     state = ScheduleState()
     for index in range(40):

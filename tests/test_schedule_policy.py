@@ -54,6 +54,13 @@ def armed_state(*, started_at=None, final_seen_at=None):
     return state
 
 
+def test_automation_defaults_match_the_broadcast_contract(settings):
+    assert settings.lead_minutes == 10
+    assert settings.end_grace_minutes == 30
+    assert settings.acquisition_poll_seconds == 180
+    assert settings.cache_max_age_hours == 72
+
+
 # ------------------------------------------------------------------- arming
 def test_idle_well_before_the_card(scheduler, settings):
     now = FIRST_CARD - timedelta(hours=25)
@@ -193,6 +200,22 @@ def test_max_runtime_failsafe_stops_a_card_espn_never_finalises(scheduler, setti
 
     assert decision.action is SchedulerAction.STOP
     assert "failsafe" in decision.reason
+
+
+def test_persisted_hard_stop_survives_complete_espn_loss(scheduler, settings):
+    state = armed_state()
+    state.hard_stop_at = (FIRST_CARD + timedelta(hours=settings.max_runtime_hours)).timestamp()
+
+    decision = scheduler.decide(
+        FIRST_CARD + timedelta(hours=settings.max_runtime_hours),
+        None,
+        state,
+        settings,
+        stream_running=True,
+    )
+
+    assert decision.action is SchedulerAction.STOP
+    assert decision.event_id == EVENT_ID
 
 
 def test_failsafe_wins_over_the_grace_hold(scheduler, settings):

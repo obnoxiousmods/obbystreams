@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from .espn import parse_iso
-from .models import CalendarEntry
+from .models import CalendarEntry, CardSegment, UfcEvent
 
 logger = logging.getLogger("obbystreams.schedule.state")
 
@@ -40,6 +40,69 @@ def _float_or_none(raw: Any) -> float | None:
         return None
 
 
+def _event_to_json(event: UfcEvent | None) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    return {
+        "event_id": event.event_id,
+        "name": event.name,
+        "short_name": event.short_name,
+        "venue": event.venue,
+        "city": event.city,
+        "is_final": event.is_final,
+        "main_event_bout": event.main_event_bout,
+        "main_event_winner": event.main_event_winner,
+        "fighters": list(event.fighters),
+        "cards": [
+            {
+                "start": card.start.isoformat(),
+                "label": card.label,
+                "bout_count": card.bout_count,
+                "completed_bouts": card.completed_bouts,
+                "bouts": list(card.bouts),
+            }
+            for card in event.cards
+        ],
+    }
+
+
+def _event_from_json(raw: Any) -> UfcEvent | None:
+    data = raw if isinstance(raw, dict) else {}
+    event_id = _text_or_none(data.get("event_id"))
+    name = _text_or_none(data.get("name"))
+    if not event_id or not name:
+        return None
+    cards: list[CardSegment] = []
+    raw_cards = data.get("cards")
+    for raw_card in raw_cards if isinstance(raw_cards, list) else []:
+        item = raw_card if isinstance(raw_card, dict) else {}
+        start = parse_iso(item.get("start"))
+        label = _text_or_none(item.get("label"))
+        if start is None or not label:
+            continue
+        try:
+            bout_count = max(0, int(item.get("bout_count") or 0))
+            completed_bouts = max(0, int(item.get("completed_bouts") or 0))
+        except (TypeError, ValueError):
+            continue
+        bouts = tuple(str(value) for value in item.get("bouts", []) if str(value).strip())
+        cards.append(CardSegment(start, label, bout_count, completed_bouts, bouts))
+    if not cards:
+        return None
+    return UfcEvent(
+        event_id=event_id,
+        name=name,
+        short_name=_text_or_none(data.get("short_name")) or name,
+        venue=_text_or_none(data.get("venue")) or "",
+        city=_text_or_none(data.get("city")) or "",
+        cards=tuple(sorted(cards, key=lambda card: card.start)),
+        is_final=bool(data.get("is_final", False)),
+        main_event_bout=_text_or_none(data.get("main_event_bout")),
+        main_event_winner=_text_or_none(data.get("main_event_winner")),
+        fighters=tuple(str(value) for value in data.get("fighters", []) if str(value).strip()),
+    )
+
+
 @dataclass(slots=True)
 class ScheduleState:
     """Everything the scheduler must remember across ticks and restarts."""
@@ -52,6 +115,10 @@ class ScheduleState:
     #: started stream is never auto-stopped.
     started_by_scheduler: bool = False
     started_at: float | None = None
+    #: When acquisition for the event began, even if no encoder was available.
+    armed_at: float | None = None
+    #: Absolute event-window deadline. It must remain enforceable without ESPN.
+    hard_stop_at: float | None = None
     #: When the card was first observed as decided; the grace period runs from here.
     final_seen_at: float | None = None
     #: Event the operator manually Stopped — do not re-arm it, but do arm the next one.
@@ -65,6 +132,15 @@ class ScheduleState:
     #: is still going" from "the feed ended two hours ago and nobody told us".
     progress_signature: str | None = None
     progress_seen_at: float | None = None
+    #: Last successfully parsed bout-level event, used through ESPN outages.
+    cached_event: UfcEvent | None = None
+    event_fetched_at: float = 0.0
+    espn_last_success_at: float = 0.0
+    espn_last_attempt_at: float = 0.0
+    espn_consecutive_failures: int = 0
+    espn_last_error: str | None = None
+    active_segment_key: str | None = None
+    last_source_refresh_at: float = 0.0
 
     def note_progress(self, signature: str, *, moment: float) -> bool:
         """Record the card's completion fingerprint; True when it changed."""
@@ -110,18 +186,39 @@ class ScheduleState:
             self.suppressed_event_id = None
         return True
 
-    def begin_event(self, event_id: str, *, by_scheduler: bool) -> None:
+    def arm_event(self, event_id: str, *, moment: float, hard_stop_at: float | None) -> None:
+        self.current_event_id = event_id
+        self.started_by_scheduler = True
+        self.armed_at = self.armed_at or moment
+        self.hard_stop_at = hard_stop_at
+        self.final_seen_at = None
+
+    def begin_event(self, event_id: str, *, by_scheduler: bool, moment: float | None = None, hard_stop_at: float | None = None) -> None:
         self.current_event_id = event_id
         self.started_by_scheduler = by_scheduler
-        self.started_at = time.time()
+        stamp = time.time() if moment is None else moment
+        self.armed_at = self.armed_at or stamp
+        self.started_at = stamp
+        if hard_stop_at is not None:
+            self.hard_stop_at = hard_stop_at
         self.final_seen_at = None
+
+    def note_encoder_started(self, *, moment: float) -> bool:
+        if self.started_at is not None:
+            return False
+        self.started_at = moment
+        return True
 
     def finish_event(self, event_id: str) -> None:
         self.handled_event_id = event_id
         self.current_event_id = None
         self.started_by_scheduler = False
         self.started_at = None
+        self.armed_at = None
+        self.hard_stop_at = None
         self.final_seen_at = None
+        self.active_segment_key = None
+        self.last_source_refresh_at = 0.0
 
     def _prune(self) -> None:
         if len(self.notified) <= MAX_TRACKED_EVENTS:
@@ -144,12 +241,22 @@ class ScheduleState:
             "current_event_id": self.current_event_id,
             "started_by_scheduler": self.started_by_scheduler,
             "started_at": self.started_at,
+            "armed_at": self.armed_at,
+            "hard_stop_at": self.hard_stop_at,
             "final_seen_at": self.final_seen_at,
             "suppressed_event_id": self.suppressed_event_id,
             "handled_event_id": self.handled_event_id,
             "notified": self.notified,
             "progress_signature": self.progress_signature,
             "progress_seen_at": self.progress_seen_at,
+            "cached_event": _event_to_json(self.cached_event),
+            "event_fetched_at": self.event_fetched_at,
+            "espn_last_success_at": self.espn_last_success_at,
+            "espn_last_attempt_at": self.espn_last_attempt_at,
+            "espn_consecutive_failures": self.espn_consecutive_failures,
+            "espn_last_error": self.espn_last_error,
+            "active_segment_key": self.active_segment_key,
+            "last_source_refresh_at": self.last_source_refresh_at,
         }
 
     @classmethod
@@ -178,12 +285,22 @@ class ScheduleState:
             current_event_id=_text_or_none(data.get("current_event_id")),
             started_by_scheduler=bool(data.get("started_by_scheduler", False)),
             started_at=_float_or_none(data.get("started_at")),
+            armed_at=_float_or_none(data.get("armed_at")),
+            hard_stop_at=_float_or_none(data.get("hard_stop_at")),
             final_seen_at=_float_or_none(data.get("final_seen_at")),
             suppressed_event_id=_text_or_none(data.get("suppressed_event_id")),
             handled_event_id=_text_or_none(data.get("handled_event_id")),
             notified=notified,
             progress_signature=_text_or_none(data.get("progress_signature")),
             progress_seen_at=_float_or_none(data.get("progress_seen_at")),
+            cached_event=_event_from_json(data.get("cached_event")),
+            event_fetched_at=_float_or_none(data.get("event_fetched_at")) or 0.0,
+            espn_last_success_at=_float_or_none(data.get("espn_last_success_at")) or 0.0,
+            espn_last_attempt_at=_float_or_none(data.get("espn_last_attempt_at")) or 0.0,
+            espn_consecutive_failures=max(0, int(data.get("espn_consecutive_failures") or 0)),
+            espn_last_error=_text_or_none(data.get("espn_last_error")),
+            active_segment_key=_text_or_none(data.get("active_segment_key")),
+            last_source_refresh_at=_float_or_none(data.get("last_source_refresh_at")) or 0.0,
         )
 
 

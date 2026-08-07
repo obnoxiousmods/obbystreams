@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from obbyschedule import EspnScheduleProvider, ScheduleSettings, UfcScheduler
+from obbyschedule import EspnScheduleProvider, ScheduleSettings, StartResult, StartStatus, UfcScheduler
 from obbyschedule.models import CalendarEntry
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -54,10 +54,12 @@ class Recorder:
         self.contexts = []
         self.published = []
         self.embeds = []
+        self.satisfied = False
+        self.start_result = True
 
     async def start(self, reason):
         self.started.append(reason)
-        return True
+        return self.start_result
 
     async def stop(self, reason):
         self.stopped.append(reason)
@@ -69,6 +71,9 @@ class Recorder:
 
     def publish(self, context):
         self.published.append(context)
+
+    def is_satisfied(self, _context):
+        return self.satisfied
 
 
 class FakeNotifier:
@@ -193,7 +198,77 @@ async def test_poll_tightens_while_no_source_is_on_air(tmp_path):
 
     delay = await scheduler.tick(stream_running=False, now=CARD_START - timedelta(minutes=5))
 
-    assert delay == 60
+    assert delay <= 180
+
+
+@pytest.mark.asyncio
+async def test_unsatisfied_source_is_rescraped_on_exact_three_minute_cadence(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    opened = CARD_START - timedelta(minutes=10)
+
+    await scheduler.tick(stream_running=False, now=opened)
+    await scheduler.tick(stream_running=True, now=opened + timedelta(seconds=179))
+    assert len(recorder.refreshed) == 1
+
+    await scheduler.tick(stream_running=True, now=opened + timedelta(seconds=180))
+    assert len(recorder.refreshed) == 2
+    assert recorder.refreshed[-1] == "source quality acquisition"
+
+
+@pytest.mark.asyncio
+async def test_each_new_segment_forces_a_refresh_even_with_a_good_feed(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    recorder.satisfied = True
+
+    await scheduler.tick(stream_running=False, now=CARD_START - timedelta(minutes=10))
+    await scheduler.tick(stream_running=True, now=CARD_START + timedelta(minutes=30))
+    assert len(recorder.refreshed) == 1
+
+    # This fixture has Prelims at 13:00Z and Main card at 16:00Z. A healthy
+    # prelim feed must not suppress acquisition at the main-card boundary.
+    await scheduler.tick(stream_running=True, now=CARD_START + timedelta(hours=3))
+    assert len(recorder.refreshed) == 2
+    assert recorder.refreshed[-1] == "segment boundary: Main card"
+
+
+@pytest.mark.asyncio
+async def test_awaiting_source_is_owned_without_claiming_the_encoder_started(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    recorder.start_result = StartResult(StartStatus.AWAITING_SOURCE, "no verified current-segment feed")
+    opened = CARD_START - timedelta(minutes=10)
+
+    await scheduler.tick(stream_running=False, now=opened)
+
+    assert scheduler.state.started_by_scheduler is True
+    assert scheduler.state.armed_at == opened.timestamp()
+    assert scheduler.state.started_at is None
+    assert scheduler.state.hard_stop_at is not None
+    assert scheduler.snapshot(opened)["run_state"] == "acquiring"
+
+    # If the source appears between ticks and the cockpit starts ffmpeg, the
+    # first positive observation records the real encoder start separately.
+    await scheduler.tick(stream_running=True, now=opened + timedelta(minutes=3))
+    assert scheduler.state.started_at == (opened + timedelta(minutes=3)).timestamp()
+
+
+@pytest.mark.asyncio
+async def test_recent_event_cache_bridges_a_detail_feed_outage(tmp_path):
+    scheduler, recorder = build(tmp_path, "pre")
+    opened = CARD_START - timedelta(minutes=10)
+    await scheduler.tick(stream_running=False, now=opened)
+    cached_event_id = scheduler.event.event_id
+
+    class EmptyDetailProvider(FakeProvider):
+        async def fetch_event(self, day):
+            self.event_calls += 1
+
+    scheduler.bind(provider=EmptyDetailProvider(scheduler.settings, "pre"))
+    await scheduler.tick(stream_running=True, now=opened + timedelta(minutes=3))
+
+    assert scheduler.event is not None
+    assert scheduler.event.event_id == cached_event_id
+    assert scheduler.snapshot(opened + timedelta(minutes=3))["data_health"]["status"] == "stale-cache"
+    assert recorder.stopped == []
 
 
 @pytest.mark.asyncio
@@ -219,7 +294,7 @@ async def test_tick_stands_down_after_the_grace_period(tmp_path):
     assert recorder.stopped == []
 
     # Once the grace elapses the stream comes down and standby resumes.
-    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=21))
+    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=31))
 
     assert len(recorder.stopped) == 1
     assert scheduler.state.handled_event_id == "600059667"
@@ -352,7 +427,7 @@ async def test_adopts_a_running_stream_and_stands_it_down(tmp_path):
     scheduler.bind(provider=FakeProvider(scheduler.settings, "final"))
     finished_at = CARD_START + timedelta(hours=5)
     await scheduler.tick(stream_running=True, now=finished_at)
-    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=21))
+    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=31))
 
     assert len(recorder.stopped) == 1
     assert scheduler.state.started_by_scheduler is False
@@ -397,11 +472,12 @@ async def test_polling_backs_off_once_the_card_is_stood_down(tmp_path):
     await scheduler.tick(stream_running=True, now=finished_at)
     scheduler.state.started_by_scheduler = True
     scheduler.state.started_at = CARD_START.timestamp()
-    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=21))
+    await scheduler.tick(stream_running=True, now=finished_at + timedelta(minutes=31))
     assert scheduler.state.handled_event_id == "600059667"
 
     delay = await scheduler.tick(stream_running=False, now=finished_at + timedelta(minutes=25))
     assert delay >= 3600
+    assert _recorder.refreshed == []
 
 
 @pytest.mark.asyncio
@@ -481,3 +557,73 @@ async def test_load_upcoming_event_works_outside_the_poll_window(tmp_path):
     event = await scheduler.load_upcoming_event(CARD_START - timedelta(days=5))
     assert event is not None
     assert event.cards
+
+
+@pytest.mark.asyncio
+async def test_a_dark_feed_announces_itself_once(tmp_path):
+    """The 2026-08-04 blackout lasted three days because it was silent. A
+    scheduler that cannot see the calendar cannot warn about a card, so it has to
+    warn about itself - once per outage, not once per failed fetch."""
+    from obbyschedule import scheduler as scheduler_module
+    from obbyschedule.espn import FEED_HEALTH
+
+    scheduler, recorder = build(tmp_path, "pre")
+    FEED_HEALTH.__init__()
+    FEED_HEALTH.failure("403 Forbidden", 403)
+    FEED_HEALTH.failure("403 Forbidden", 403)
+    # Never succeeded since boot, so staleness cannot exonerate it.
+    assert FEED_HEALTH.consecutive_failures >= scheduler_module.FEED_DARK_FAILURES
+
+    await scheduler._alert_if_feed_is_dark()
+    await scheduler._alert_if_feed_is_dark()
+
+    alarms = [t for t in titles(recorder) if "feed is down" in t]
+    assert len(alarms) == 1, f"expected exactly one alarm, got {titles(recorder)}"
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_feed_re_arms_the_alarm(tmp_path):
+    """Otherwise the second outage of the day passes in silence."""
+    from obbyschedule import scheduler as scheduler_module
+    from obbyschedule.espn import FEED_HEALTH
+
+    scheduler, recorder = build(tmp_path, "pre")
+    FEED_HEALTH.__init__()
+    FEED_HEALTH.failure("403", 403)
+    FEED_HEALTH.failure("403", 403)
+    await scheduler._alert_if_feed_is_dark()
+
+    FEED_HEALTH.success(200, "python-httpx/0.28.1")
+    await scheduler._alert_if_feed_is_dark()
+
+    # A feed that answered seconds ago is not an outage yet, however many
+    # requests have failed since - the staleness gate is what separates a blip
+    # from a blackout.
+    FEED_HEALTH.failure("403", 403)
+    FEED_HEALTH.failure("403", 403)
+    await scheduler._alert_if_feed_is_dark()
+    assert len([t for t in titles(recorder) if "feed is down" in t]) == 1
+
+    # Once it has been dark for the threshold, it alarms again.
+    assert FEED_HEALTH.last_success_at is not None
+    FEED_HEALTH.last_success_at = (
+        FEED_HEALTH.last_success_at - scheduler_module.FEED_DARK_SECONDS - 60
+    )
+    await scheduler._alert_if_feed_is_dark()
+
+    alarms = [t for t in titles(recorder) if "feed is down" in t]
+    assert len(alarms) == 2, "the alarm did not re-arm after recovery"
+
+
+@pytest.mark.asyncio
+async def test_one_flaky_fetch_is_not_an_outage(tmp_path):
+    """A single failed request must not page anyone."""
+    from obbyschedule.espn import FEED_HEALTH
+
+    scheduler, recorder = build(tmp_path, "pre")
+    FEED_HEALTH.__init__()
+    FEED_HEALTH.failure("timeout", None)
+
+    await scheduler._alert_if_feed_is_dark()
+
+    assert not [t for t in titles(recorder) if "feed is down" in t]

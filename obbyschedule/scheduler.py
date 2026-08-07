@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from .espn import EspnScheduleProvider
+from .espn import FEED_HEALTH, EspnScheduleProvider
 from .models import (
     CalendarEntry,
     Decision,
@@ -33,16 +33,25 @@ from .models import (
     NotifySettings,
     SchedulerAction,
     ScheduleSettings,
+    StartResult,
+    StartStatus,
     UfcEvent,
+    normalize_match_text,
 )
 from .notify import DiscordNotifier
 from .protocols import Notifier, ScheduleProvider, SourceResolver
 from .state import ScheduleState, ScheduleStateStore
 
+#: How dark the feed must go before it is worth waking anyone: two consecutive
+#: failures of the hourly calendar refresh plus half an hour of staleness is a
+#: real outage rather than one flaky request.
+FEED_DARK_FAILURES = 2
+FEED_DARK_SECONDS = 1800
+
 logger = logging.getLogger("obbystreams.schedule")
 
 ConfigLoader = Callable[[], Mapping[str, Any]]
-StreamAction = Callable[[str], Awaitable[bool]]
+StreamAction = Callable[[str], Awaitable[bool | StartResult]]
 EventLogger = Callable[[str, str], None]
 
 #: How long after an event's scheduled start we still consider it "current"
@@ -92,7 +101,10 @@ class UfcScheduler:
         # stubbable in tests) without the scheduler knowing the difference.
         self._provider: ScheduleProvider = EspnScheduleProvider(client, self._settings)
         self._notifier: Notifier = DiscordNotifier(client, self._settings.notify)
+        self._feed_alert_sent = False
         self._event: UfcEvent | None = None
+        self._using_cached_event = False
+        self._last_start_result: StartResult | None = None
         self._last_decision = Decision(SchedulerAction.IDLE, "not started yet")
         self._loaded = False
         # The API endpoints call ensure_loaded() too, so guard the first load
@@ -199,25 +211,32 @@ class UfcScheduler:
         """
         if not settings.enabled:
             return Decision(SchedulerAction.IDLE, "auto-schedule disabled")
+        moment = now.timestamp()
+        # Ownership and the absolute event deadline are persisted precisely so
+        # an ESPN outage cannot strand ffmpeg online forever.
+        derived_hard_stop = (
+            event.first_card_start + timedelta(hours=settings.max_runtime_hours)
+        ).timestamp() if event is not None and event.first_card_start is not None else None
+        hard_stop_at = state.hard_stop_at or derived_hard_stop
+        if state.started_by_scheduler and hard_stop_at is not None and moment >= hard_stop_at:
+            event_id = event.event_id if event is not None else state.current_event_id
+            phase = event.phase(now, settings) if event is not None else EventPhase.LIVE
+            return Decision(
+                SchedulerAction.STOP,
+                f"max runtime failsafe: absolute event-window limit ({settings.max_runtime_hours}h) reached",
+                phase,
+                event_id,
+            )
         if event is None:
-            return Decision(SchedulerAction.IDLE, "no event in range")
+            return Decision(SchedulerAction.IDLE, "ESPN unavailable; retaining last lifecycle state")
 
         first = event.first_card_start
         if first is None:
             return Decision(SchedulerAction.IDLE, "event has no published card times", event_id=event.event_id)
 
         phase = event.phase(now, settings)
-        moment = now.timestamp()
-
         # --- stand-down paths: only ever unwind what this scheduler armed -----
         if state.started_by_scheduler and state.current_event_id == event.event_id:
-            if state.started_at is not None and moment - state.started_at >= settings.max_runtime_hours * 3600:
-                return Decision(
-                    SchedulerAction.STOP,
-                    f"max runtime failsafe ({settings.max_runtime_hours}h) reached",
-                    phase,
-                    event.event_id,
-                )
             if event.is_final and state.final_seen_at is not None:
                 grace = settings.end_grace_minutes * 60
                 if moment - state.final_seen_at >= grace:
@@ -385,12 +404,63 @@ class UfcScheduler:
                 state.mark_fired(event.event_id, f"card:{card.key}")
 
     # ---- async orchestration -------------------------------------------
+    async def _alert_if_feed_is_dark(self) -> None:
+        """Say something in Discord when the scoreboard stops answering.
+
+        The 2026-08-04 blackout lasted three days because it was *silent*: ESPN
+        began refusing the cockpit's user-agent, nothing else here reads ESPN, and
+        the only trace was a state file that quietly stopped being written. A
+        scheduler that cannot see the calendar cannot warn anyone about a card, so
+        it has to be able to warn about itself.
+
+        Fires once per dark spell and re-arms only after a successful read, so a
+        broken feed cannot become its own spam.
+        """
+        health = FEED_HEALTH.snapshot()
+        failures = int(health.get("consecutive_failures") or 0)
+        stale = health.get("stale_seconds")
+        if failures == 0:
+            self._feed_alert_sent = False
+            return
+        dark = failures >= FEED_DARK_FAILURES and (stale is None or stale >= FEED_DARK_SECONDS)
+        if not dark or self._feed_alert_sent or not self._notifier.active:
+            return
+        self._feed_alert_sent = True
+        when = "never since boot" if stale is None else f"{stale / 3600:.1f}h ago"
+        await self._notifier.send_embed(
+            {
+                "title": "\u26a0\ufe0f UFC schedule feed is down",
+                "description": (
+                    f"The ESPN scoreboard has refused **{failures}** consecutive "
+                    f"requests. Last successful read: **{when}**.\n\n"
+                    "Card alerts and the auto-schedule are blind until this "
+                    "recovers. Sent once per outage."
+                ),
+                "color": 0xE74C3C,
+                "fields": [
+                    {
+                        "name": "Last error",
+                        "value": f"```{str(health.get('last_error') or 'unknown')[:400]}```",
+                        "inline": False,
+                    }
+                ],
+            }
+        )
+
     async def refresh_calendar(self, *, force: bool = False) -> tuple[CalendarEntry, ...]:
         """Re-fetch the season calendar when the cache is stale."""
         age = time.time() - self._state.calendar_fetched_at
         if not force and self._state.calendar and age < self._settings.calendar_refresh_seconds:
             return self._state.calendar
         calendar = await self._provider.fetch_calendar()
+        if isinstance(self._provider, EspnScheduleProvider):
+            await self._alert_if_feed_is_dark()
+            health = FEED_HEALTH.snapshot()
+            self._state.espn_last_attempt_at = float(health.get("last_attempt_at") or time.time())
+            self._state.espn_consecutive_failures = int(health.get("consecutive_failures") or 0)
+            self._state.espn_last_error = str(health.get("last_error") or "") or None
+            if health.get("last_success_at"):
+                self._state.espn_last_success_at = float(health["last_success_at"])
         if calendar:
             self._state.calendar = calendar
             self._state.calendar_fetched_at = time.time()
@@ -410,14 +480,46 @@ class UfcScheduler:
         utc_day = target.start.astimezone(UTC).date()
         if utc_day != eastern_day:
             days.append(utc_day)
+        candidates: list[UfcEvent] = []
         for day in days:
-            event = await self._provider.fetch_event(day)
-            if event is None:
-                continue
-            first = event.first_card_start
-            if first is None or abs((first - target.start).total_seconds()) <= 36 * 3600:
-                return event
+            fetch_many = getattr(self._provider, "fetch_events", None)
+            if callable(fetch_many):
+                candidates.extend(await fetch_many(day))
+            else:
+                event = await self._provider.fetch_event(day)
+                if event is not None:
+                    candidates.append(event)
+        if candidates:
+            target_terms = set(normalize_match_text(target.label).split())
+
+            def rank(event: UfcEvent) -> tuple[int, float]:
+                event_terms = set(normalize_match_text(event.name).split())
+                overlap = len(target_terms & event_terms)
+                first = event.first_card_start or target.start
+                return (-overlap, abs((first - target.start).total_seconds()))
+
+            return min(candidates, key=rank)
         return None
+
+    def cached_event_for(self, target: CalendarEntry, now: datetime) -> UfcEvent | None:
+        """A recent, matching event that may bridge an ESPN outage."""
+        cached = self._state.cached_event
+        if cached is None or not self._state.event_fetched_at:
+            return None
+        age = now.timestamp() - self._state.event_fetched_at
+        if age < 0 or age > self._settings.cache_max_age_hours * 3600:
+            return None
+        target_terms = set(normalize_match_text(target.label).split())
+        cached_terms = set(normalize_match_text(cached.name).split())
+        if len(target_terms & cached_terms) < 2:
+            return None
+        return cached
+
+    @staticmethod
+    def segment_for(event: UfcEvent, now: datetime) -> Any:
+        """Current broadcast segment, or the first segment during pre-roll."""
+        started = [card for card in event.cards if card.start <= now]
+        return started[-1] if started else (event.cards[0] if event.cards else None)
 
     async def announce_coming_up(self, event: UfcEvent, *, force: bool = False) -> bool:
         """Post the 'Coming up' card once per event.
@@ -469,7 +571,7 @@ class UfcScheduler:
             else:
                 logger.warning("discord milestone %s for %s not delivered; will retry", milestone.key, event.event_id)
 
-    async def apply(self, decision: Decision, event: UfcEvent, context: EventContext | None = None) -> None:
+    async def apply(self, decision: Decision, event: UfcEvent, context: EventContext | None = None, *, now: datetime | None = None) -> None:
         """Carry out a START/STOP verdict against the cockpit.
 
         Discovery runs *before* the start, not after it. The other order is what
@@ -478,19 +580,31 @@ class UfcScheduler:
         then declined to touch a stream that was — by ffmpeg's measure — healthy.
         """
         if decision.action is SchedulerAction.START:
-            if self._sources is not None:
-                # The pre-roll is the one window where the spare provider
-                # connection is free, so resolve sources for *this* card first
-                # rather than waiting up to 15 minutes for the next sweep.
-                with contextlib.suppress(Exception):
-                    await self._sources.refresh(f"auto-schedule: {decision.reason}", context)
-            if await self._start_stream(f"auto-schedule: {decision.reason}"):
-                self._state.begin_event(event.event_id, by_scheduler=True)
+            raw_result = await self._start_stream(f"auto-schedule: {decision.reason}")
+            result = raw_result if isinstance(raw_result, StartResult) else StartResult(
+                StartStatus.STARTED if raw_result else StartStatus.FAILED
+            )
+            self._last_start_result = result
+            stamp = (now or datetime.now(UTC)).timestamp()
+            hard_stop_at = (
+                event.first_card_start + timedelta(hours=self._settings.max_runtime_hours)
+            ).timestamp() if event.first_card_start else None
+            if result.accepted:
+                if result.status is StartStatus.STARTED:
+                    self._state.begin_event(
+                        event.event_id,
+                        by_scheduler=True,
+                        moment=stamp,
+                        hard_stop_at=hard_stop_at,
+                    )
+                else:
+                    self._state.arm_event(event.event_id, moment=stamp, hard_stop_at=hard_stop_at)
                 self._state.suppressed_event_id = None
                 await self.persist()
-                self._log(f"armed for {event.name} ({decision.reason})", "ok")
+                level = "ok" if result.status is StartStatus.STARTED else "warn"
+                self._log(f"armed for {event.name} ({result.detail or decision.reason})", level)
             else:
-                logger.warning("auto-schedule start failed for %s", event.event_id)
+                logger.warning("auto-schedule start failed for %s: %s", event.event_id, result.detail)
         elif decision.action is SchedulerAction.STOP:
             if await self._stop_stream(f"auto-schedule: {decision.reason}"):
                 self._state.finish_event(event.event_id)
@@ -558,10 +672,37 @@ class UfcScheduler:
             return max(60.0, min(float(settings.calendar_refresh_seconds), remaining))
 
         event = await self.load_event(target)
+        self._using_cached_event = False
+        if isinstance(self._provider, EspnScheduleProvider):
+            health = FEED_HEALTH.snapshot()
+            self._state.espn_last_attempt_at = float(health.get("last_attempt_at") or moment.timestamp())
+            self._state.espn_consecutive_failures = int(health.get("consecutive_failures") or 0)
+            self._state.espn_last_error = str(health.get("last_error") or "") or None
+        if event is not None:
+            self._state.cached_event = event
+            self._state.event_fetched_at = moment.timestamp()
+            if isinstance(self._provider, EspnScheduleProvider):
+                health = FEED_HEALTH.snapshot()
+                self._state.espn_last_attempt_at = float(health.get("last_attempt_at") or moment.timestamp())
+                self._state.espn_last_success_at = float(health.get("last_success_at") or moment.timestamp())
+                self._state.espn_consecutive_failures = int(health.get("consecutive_failures") or 0)
+                self._state.espn_last_error = str(health.get("last_error") or "") or None
+            await self.persist()
+        else:
+            event = self.cached_event_for(target, moment)
+            self._using_cached_event = event is not None
         self._event = event
         if event is None:
-            self._last_decision = Decision(SchedulerAction.IDLE, f"ESPN has no bout detail for {target.label} yet")
-            self.publish_context(None)
+            # Keep an existing published context and owned hard deadline intact;
+            # clearing both is what made a feed outage disable shutdown too.
+            self._last_decision = self.decide(moment, None, self._state, settings, stream_running=stream_running)
+            if (
+                self._last_decision.action is SchedulerAction.STOP
+                and self._state.current_event_id
+                and await self._stop_stream(f"auto-schedule: {self._last_decision.reason}")
+            ):
+                self._state.finish_event(self._state.current_event_id)
+                await self.persist()
             return float(settings.live_poll_seconds)
 
         # Hand the card's identity to the source scraper on every tick, so the
@@ -588,10 +729,59 @@ class UfcScheduler:
         if self._state.note_progress(event.progress_signature, moment=moment.timestamp()):
             await self.persist()
 
+        # Segment boundaries are explicit acquisition boundaries. While a feed
+        # is absent or below the resolver's high-grade threshold, re-scrape on
+        # the configured three-minute cadence. A healthy exact/current-segment
+        # feed makes this a cheap no-op until the next boundary.
+        segment = self.segment_for(event, moment)
+        segment_key = segment.key if segment is not None else None
+        segment_changed = bool(segment_key and segment_key != self._state.active_segment_key)
+        source_satisfied = False
+        if self._sources is not None:
+            checker = getattr(self._sources, "is_satisfied", None)
+            if callable(checker):
+                with contextlib.suppress(Exception):
+                    source_satisfied = bool(checker(context))
+        refresh_due = moment.timestamp() - self._state.last_source_refresh_at >= settings.acquisition_poll_seconds
+        in_window = event.phase(moment, settings) in {EventPhase.PRE_ROLL, EventPhase.LIVE}
+        acquisition_allowed = (
+            not event.is_final
+            and event.event_id not in {self._state.handled_event_id, self._state.suppressed_event_id}
+        )
+        if (
+            self._sources is not None
+            and acquisition_allowed
+            and in_window
+            and (segment_changed or (not source_satisfied and refresh_due))
+        ):
+            if segment_changed and segment is not None:
+                reason = (
+                    f"pre-roll acquisition: {segment.label}"
+                    if moment < segment.start
+                    else f"segment boundary: {segment.label}"
+                )
+            else:
+                reason = "source quality acquisition"
+            try:
+                await self._sources.refresh(reason, context)
+            except Exception as exc:
+                logger.warning("scheduled source refresh failed: %s", exc)
+            self._state.last_source_refresh_at = moment.timestamp()
+            self._state.active_segment_key = segment_key
+            await self.persist()
+
         # Take ownership of a stream that was already up when the card started,
         # so the post-card stand-down still happens.
         if self.should_adopt(moment, event, self._state, settings, stream_running=stream_running):
-            self._state.begin_event(event.event_id, by_scheduler=True)
+            hard_stop_at = (
+                event.first_card_start + timedelta(hours=settings.max_runtime_hours)
+            ).timestamp() if event.first_card_start else None
+            self._state.begin_event(
+                event.event_id,
+                by_scheduler=True,
+                moment=moment.timestamp(),
+                hard_stop_at=hard_stop_at,
+            )
             await self.persist()
             self._log(f"adopted the running stream for {event.name}; will stand down when it ends", "warn")
 
@@ -601,7 +791,9 @@ class UfcScheduler:
         decision = self.decide(moment, event, self._state, settings, stream_running=stream_running)
         self._last_decision = decision
         if decision.acts:
-            await self.apply(decision, event, context)
+            await self.apply(decision, event, context, now=moment)
+        if self._state.started_by_scheduler and stream_running and self._state.note_encoder_started(moment=moment.timestamp()):
+            await self.persist()
         if decision.action is SchedulerAction.START:
             await self.note_arming_progress(event, stream_running=stream_running, now=moment)
         elif stream_running:
@@ -636,10 +828,18 @@ class UfcScheduler:
             return float(settings.calendar_refresh_seconds)
         pre_roll = first - timedelta(minutes=settings.lead_minutes)
         if now >= pre_roll:
-            # Armed with nothing on air: retry acquisition on the tighter cadence
-            # until a feed for this card is verified.
-            if self._arm_attempts:
-                return float(min(settings.acquisition_poll_seconds, settings.live_poll_seconds))
+            # Wake exactly when the three-minute acquisition deadline is due;
+            # simply sleeping min(180, 120) drifts refreshes to four minutes.
+            context = event.context(now, settings)
+            checker = getattr(self._sources, "is_satisfied", None) if self._sources is not None else None
+            satisfied = False
+            if callable(checker):
+                with contextlib.suppress(Exception):
+                    satisfied = bool(checker(context))
+            if not satisfied:
+                elapsed = max(0.0, now.timestamp() - self._state.last_source_refresh_at)
+                until_refresh = max(1.0, settings.acquisition_poll_seconds - elapsed)
+                return min(float(settings.live_poll_seconds), until_refresh)
             return float(settings.live_poll_seconds)
 
         moments = [pre_roll]
@@ -682,8 +882,10 @@ class UfcScheduler:
             "notify_enabled": settings.notify.active,
             "lead_minutes": settings.lead_minutes,
             "end_grace_minutes": settings.end_grace_minutes,
+            "acquisition_poll_seconds": settings.acquisition_poll_seconds,
             "phase": EventPhase.IDLE.value,
             "action": self._last_decision.action.value,
+            "run_state": "standby",
             "reason": self._last_decision.reason,
             "started_by_scheduler": self._state.started_by_scheduler,
             "suppressed_event_id": self._state.suppressed_event_id,
@@ -696,6 +898,26 @@ class UfcScheduler:
             # rather than the real first bout, which ESPN only exposes in the
             # event detail. The two can differ by hours, so the UI says so.
             "countdown_is_estimate": True,
+            "data_health": {
+                "status": "stale-cache" if self._using_cached_event else (
+                    "unavailable" if self._state.espn_consecutive_failures else "healthy"
+                ),
+                "using_cached_event": self._using_cached_event,
+                "last_success_at": self._state.espn_last_success_at or None,
+                "last_attempt_at": self._state.espn_last_attempt_at or None,
+                "consecutive_failures": self._state.espn_consecutive_failures,
+                "last_error": self._state.espn_last_error,
+                "event_cache_age_seconds": max(0, int(moment.timestamp() - self._state.event_fetched_at)) if self._state.event_fetched_at else None,
+            },
+            "lifecycle": {
+                "armed_at": self._state.armed_at,
+                "encoder_started_at": self._state.started_at,
+                "hard_stop_at": self._state.hard_stop_at,
+                "active_segment_key": self._state.active_segment_key,
+                "last_source_refresh_at": self._state.last_source_refresh_at or None,
+                "start_status": self._last_start_result.status.value if self._last_start_result else None,
+                "start_detail": self._last_start_result.detail if self._last_start_result else None,
+            },
         }
 
         upcoming = target or next_entry
@@ -708,6 +930,16 @@ class UfcScheduler:
 
         if event is not None:
             payload["phase"] = event.phase(moment, settings).value
+            if event.is_final:
+                payload["run_state"] = "wrapping" if self._state.started_by_scheduler else "stopped"
+            elif self._last_start_result and self._last_start_result.status is StartStatus.AWAITING_SOURCE:
+                payload["run_state"] = "acquiring"
+            elif self._state.started_by_scheduler and self._state.started_at:
+                payload["run_state"] = "live"
+            elif event.phase(moment, settings) is EventPhase.PRE_ROLL:
+                payload["run_state"] = "acquiring"
+            else:
+                payload["run_state"] = "pending"
             first = event.first_card_start
             payload["event"] = {
                 "id": event.event_id,
@@ -726,6 +958,7 @@ class UfcScheduler:
                         "bouts": card.bout_count,
                         "completed": card.completed_bouts,
                         "all_final": card.all_final,
+                        "bouts_list": list(card.bouts),
                     }
                     for card in event.cards
                 ],

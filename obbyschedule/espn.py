@@ -5,7 +5,7 @@ unauthenticated, and reachable from lucy. Two shapes matter:
 
 * ``leagues[0].calendar`` — every card of the season as ``{label, startDate, endDate}``.
   ``startDate`` is the *earliest* segment (prelims), which is exactly the anchor
-  the 15-minute pre-roll is measured against.
+  the 10-minute pre-roll is measured against.
 * ``events[].competitions[]`` — one row per bout, each with its own ``date`` and
   ``status.type.completed``. Distinct dates are the broadcast segments, and the
   completion flags are how we know the card is over.
@@ -17,6 +17,7 @@ recorded JSON with no network.
 from __future__ import annotations
 
 import logging
+import time
 from collections import OrderedDict
 from datetime import UTC, date, datetime
 from typing import Any
@@ -41,7 +42,71 @@ logger = logging.getLogger("obbystreams.schedule.espn")
 #: 200, while a Firefox UA, "obbystreams/1.0 (+https://s.obby.ca)" and any agent
 #: carrying a URL return 403. It is also the honest thing to send - the scheduler
 #: is a script reading a public JSON API, not a browser.
-_ESPN_HEADERS = {"User-Agent": f"python-httpx/{httpx.__version__}"}
+_ESPN_HEADERS = {"User-Agent": f"python-httpx/{httpx.__version__}", "Accept": "application/json"}
+
+#: Agents to fall back through when ESPN refuses one. All three were verified
+#: against the live endpoint; browser strings and anything carrying a URL are
+#: refused, which is exactly what broke this in the first place.
+_ESPN_USER_AGENTS: tuple[str, ...] = (
+    f"python-httpx/{httpx.__version__}",
+    "curl/8.16.0",
+    "Wget/1.25.0",
+)
+
+#: Access refusals can differ by agent; transient gateway/rate-limit failures
+#: also deserve bounded retries before the persisted event cache takes over.
+_RETRYABLE_STATUS = frozenset({401, 403, 408, 425, 429, 502, 503, 504})
+
+
+def _preferred_user_agents() -> tuple[str, ...]:
+    """The agent that worked last, then the others."""
+    current = FEED_HEALTH.user_agent
+    if current and current in _ESPN_USER_AGENTS:
+        return (current, *(a for a in _ESPN_USER_AGENTS if a != current))
+    return _ESPN_USER_AGENTS
+
+
+class FeedHealth:
+    """Process-local health of the ESPN dependency."""
+
+    def __init__(self) -> None:
+        self.consecutive_failures = 0
+        self.last_attempt_at: float | None = None
+        self.last_success_at: float | None = None
+        self.last_status_code: int | None = None
+        self.last_error = ""
+        #: The agent ESPN last accepted, so the next fetch tries it first.
+        self.user_agent = ""
+
+    def success(self, status_code: int, user_agent: str = "") -> None:
+        self.consecutive_failures = 0
+        self.last_attempt_at = time.time()
+        self.last_success_at = self.last_attempt_at
+        self.last_status_code = status_code
+        self.last_error = ""
+        if user_agent:
+            self.user_agent = user_agent
+
+    def failure(self, error: str, status_code: int | None) -> None:
+        self.consecutive_failures += 1
+        self.last_attempt_at = time.time()
+        self.last_status_code = status_code
+        self.last_error = error
+
+    def snapshot(self) -> dict[str, Any]:
+        stale = None if self.last_success_at is None else max(0, time.time() - self.last_success_at)
+        return {
+            "consecutive_failures": self.consecutive_failures,
+            "last_attempt_at": self.last_attempt_at,
+            "last_success_at": self.last_success_at,
+            "last_status_code": self.last_status_code,
+            "last_error": self.last_error[:240] or None,
+            "stale_seconds": round(stale) if stale is not None else None,
+            "user_agent": self.user_agent,
+        }
+
+
+FEED_HEALTH = FeedHealth()
 
 #: Bouts in these states never complete (scratched from the card), so they must
 #: not hold the event open forever.
@@ -139,19 +204,44 @@ class EspnScheduleProvider:
     async def fetch_scoreboard(self, day: date | None = None) -> dict[str, Any]:
         """GET the scoreboard, optionally for a specific day. Returns {} on any failure."""
         params = {"dates": day.strftime("%Y%m%d")} if day is not None else None
-        try:
-            response = await self._client.get(
-                self._settings.scoreboard_url,
-                params=params,
-                timeout=15.0,
-                headers=_ESPN_HEADERS,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("espn scoreboard fetch failed (%s): %s", day or "current", exc)
-            return {}
-        return _mapping(payload)
+        status_code: int | None = None
+        last_error = ""
+        # Try whichever agent worked last, then the rest. ESPN's agent filtering
+        # is the one thing here that changes without warning - it is what caused
+        # the 2026-08-04 blackout - so a refusal costs one retried request rather
+        # than an outage nobody notices for three days.
+        for agent in _preferred_user_agents():
+            try:
+                response = await self._client.get(
+                    self._settings.scoreboard_url,
+                    params=params,
+                    timeout=15.0,
+                    headers={**_ESPN_HEADERS, "User-Agent": agent},
+                )
+                status_code = response.status_code
+                response.raise_for_status()
+                payload = _mapping(response.json())
+                if not payload or not any(key in payload for key in ("leagues", "events")):
+                    raise ValueError("response did not contain ESPN scoreboard fields")
+            except httpx.HTTPStatusError as exc:
+                last_error = str(exc)
+                if exc.response.status_code in _RETRYABLE_STATUS:
+                    continue
+                break
+            except httpx.HTTPError as exc:
+                last_error = str(exc)
+                continue
+            except ValueError as exc:
+                last_error = str(exc)
+                break
+            else:
+                if agent != FEED_HEALTH.user_agent:
+                    logger.warning("espn scoreboard: using user-agent %r", agent)
+                FEED_HEALTH.success(status_code, agent)
+                return payload
+        FEED_HEALTH.failure(last_error, status_code)
+        logger.warning("espn scoreboard fetch failed (%s): %s", day or "current", last_error)
+        return {}
 
     async def fetch_calendar(self) -> tuple[CalendarEntry, ...]:
         """The season calendar, filtered to the cards we actually stream."""
@@ -160,6 +250,10 @@ class EspnScheduleProvider:
     async def fetch_event(self, day: date) -> UfcEvent | None:
         """The card on ``day``, with per-bout status. None when ESPN has nothing matching."""
         return self.parse_events(await self.fetch_scoreboard(day), self._settings)
+
+    async def fetch_events(self, day: date) -> tuple[UfcEvent, ...]:
+        """Return every matching event so the scheduler can correlate exactly."""
+        return self.parse_all_events(await self.fetch_scoreboard(day), self._settings)
 
     # ---- pure parsers --------------------------------------------------
     @staticmethod
@@ -191,6 +285,19 @@ class EspnScheduleProvider:
             if event is not None:
                 return event
         return None
+
+    @staticmethod
+    def parse_all_events(payload: dict[str, Any], settings: ScheduleSettings) -> tuple[UfcEvent, ...]:
+        events: list[UfcEvent] = []
+        for row in _sequence(payload.get("events")):
+            item = _mapping(row)
+            name = _text(item.get("name")) or _text(item.get("shortName"))
+            if not name or not settings.matches(name):
+                continue
+            event = EspnScheduleProvider.parse_event(item)
+            if event is not None:
+                events.append(event)
+        return tuple(events)
 
     @staticmethod
     def parse_event(payload: dict[str, Any]) -> UfcEvent | None:

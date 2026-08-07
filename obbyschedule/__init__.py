@@ -1,6 +1,6 @@
 """UFC auto-schedule for the obbystreams cockpit.
 
-Brings the managed encode up ~15 minutes before a card's first segment, stands
+Brings the managed encode up 10 minutes before a card's first segment, stands
 it back down once every bout is decided, and posts countdown / go-live / wrap-up
 embeds to Discord along the way.
 
@@ -21,6 +21,8 @@ from .models import (
     NotifySettings,
     SchedulerAction,
     ScheduleSettings,
+    StartResult,
+    StartStatus,
     StopReason,
     UfcEvent,
 )
@@ -47,6 +49,8 @@ __all__ = [
     "ScheduleStateStore",
     "SchedulerAction",
     "SourceResolver",
+    "StartResult",
+    "StartStatus",
     "StopReason",
     "UfcEvent",
     "UfcScheduler",

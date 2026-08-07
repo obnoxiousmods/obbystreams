@@ -298,6 +298,7 @@ export interface ScheduleCard {
   bouts: number;
   completed: number;
   all_final: boolean;
+  bouts_list?: string[];
 }
 
 export interface ScheduleEvent {
@@ -330,13 +331,43 @@ export interface RejectedSource {
 export interface SourceState {
   event_id: string | null;
   event_matched: boolean;
-  event_matched_sources: { id: string; label: string; discovered_at?: number }[];
+  event_matched_sources: {
+    id: string;
+    label: string;
+    discovered_at?: number;
+    match_confidence?: "exact" | "dated" | "generic-ufc";
+    segment_label?: string;
+    selection_score?: number;
+    probe_score?: number;
+  }[];
   terms: string[];
   acquire_attempts: number;
   switches: number;
   mismatch_samples: number;
   rejected: RejectedSource[];
   last_error: string;
+  selected_confidence?: "exact" | "dated" | "generic-ufc" | "public-generic" | null;
+  refresh_interval_seconds?: number;
+}
+
+export interface ScheduleDataHealth {
+  status: "healthy" | "retrying" | "stale-cache" | "unavailable";
+  using_cached_event: boolean;
+  last_success_at?: number | null;
+  last_attempt_at?: number | null;
+  consecutive_failures: number;
+  last_error?: string | null;
+  event_cache_age_seconds?: number | null;
+}
+
+export interface ScheduleLifecycle {
+  armed_at?: number | null;
+  encoder_started_at?: number | null;
+  hard_stop_at?: number | null;
+  active_segment_key?: string | null;
+  last_source_refresh_at?: number | null;
+  start_status?: "started" | "awaiting_source" | "failed" | null;
+  start_detail?: string | null;
 }
 
 /** State of the UFC auto-schedule, as returned by /api/schedule and /api/status. */
@@ -345,8 +376,10 @@ export interface ScheduleSnapshot {
   notify_enabled?: boolean;
   lead_minutes?: number;
   end_grace_minutes?: number;
+  acquisition_poll_seconds?: number;
   phase?: EventPhase;
   action?: "idle" | "start" | "stop";
+  run_state?: "standby" | "pending" | "acquiring" | "starting" | "live" | "degraded" | "wrapping" | "stopped" | "error";
   reason?: string;
   started_by_scheduler?: boolean;
   suppressed_event_id?: string | null;
@@ -361,6 +394,8 @@ export interface ScheduleSnapshot {
   awaiting_source?: boolean;
   arm_attempts?: number;
   source_state?: SourceState;
+  data_health?: ScheduleDataHealth;
+  lifecycle?: ScheduleLifecycle;
 }
 
 export interface ArangoStatus {

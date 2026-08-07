@@ -133,7 +133,7 @@ private_iptv:
     - 24/7
   date_window_hours: 30
   require_date_window_match: true
-  event_refresh_interval_seconds: 90
+  event_refresh_interval_seconds: 180
   switch_cooldown_seconds: 300
   switch_confirm_samples: 2
   max_switches_per_card: 6
@@ -153,7 +153,8 @@ Important keys:
 - `connection_limit`: total sour-signal/private upstream readers allowed by the provider. Default `2`.
 - `reserve_spare_when_streaming`: keeps the spare private slot free while managed ffmpeg is healthy, so scheduled automation does not look like another viewer. Automatically suspended while the auto-schedule has a card in its window — during those few hours, confirming the feed is the right one is worth more than holding a connection back.
 - `switch_cooldown_seconds` / `switch_confirm_samples` / `max_switches_per_card`: anti-flap budget for mid-card source changes. Every switch restarts ffmpeg, so a swap needs the cooldown to have elapsed and the card to have switches left; a feed confirmed to be the *wrong card* (over `switch_confirm_samples` consecutive cycles) overrides the cooldown.
-- `event_refresh_interval_seconds`: discovery cadence while a tracked card is in its window and nothing is on air.
+- `event_refresh_interval_seconds`: legacy private-loop event cadence. The schedule's
+  `acquisition_poll_seconds` controls the authoritative 180-second acquisition cadence.
 - `public_fallback_after_attempts`: failed private sweeps before the public backup sources are used as ingest links, so a provider outage does not mean a dark card.
 - `keep_stream_live_when_inactive`: keeps the current managed ffmpeg stream running when automation finds no active fight-day source. Default `true`.
 - `disable_stream_when_inactive`: legacy switch for disabling auto-created private sources when inactive. It only stops ffmpeg when `keep_stream_live_when_inactive` is explicitly `false`.

@@ -1,7 +1,8 @@
 # UFC auto-schedule
 
-Turns the operator **Stop** into a **standby**: the cockpit wakes itself up ~15 minutes before a
-UFC card's first segment, follows the card, and stands itself back down once every bout is decided.
+Turns the operator **Stop** into a **standby**: the cockpit wakes itself up 10 minutes before a
+UFC card's earliest published segment, follows every segment, and stands itself back down 30 minutes
+after every bout is decided.
 Along the way it posts countdown / go-live / wrap-up embeds to Discord.
 
 Motivation: before this, the NVENC transcode ran 24/7 (~39 W) even hours after a card ended, because
@@ -48,10 +49,10 @@ forever.
 
 `UfcScheduler.decide()` — evaluated fresh every tick (level-triggered, so a restart self-heals):
 
-* **START** once `now >= first_card_start - lead_minutes` (default 15), if the card is not finished,
+* **START** once `now >= first_card_start - lead_minutes` (default 10), if the card is not finished,
   not suppressed, and nothing is already running. Clears the operator Stop and kicks a private-IPTV
   refresh — the pre-roll is the one window where the spare provider connection is free.
-* **STOP** once every bout is decided **and** `end_grace_minutes` (default 20) has elapsed since the
+* **STOP** once every bout is decided **and** `end_grace_minutes` (default 30) has elapsed since the
   card was first observed final, **or** when `max_runtime_hours` (default 8) trips as a failsafe if
   ESPN stalls. The failsafe is checked first so a stuck grace stamp cannot defeat it.
 * **Re-arm** if the encode goes down mid-card (a crash the watchdog could not recover, or a scraper
@@ -136,12 +137,13 @@ schedule:
   espn_scoreboard_url: https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard
   include_pattern: '^UFC\s+(\d+|Fight Night)'
   exclude_pattern: 'Contender Series|Road to UFC'
-  lead_minutes: 15
-  end_grace_minutes: 20
+  lead_minutes: 10
+  end_grace_minutes: 30
   max_runtime_hours: 8
   calendar_refresh_seconds: 3600
   live_poll_seconds: 120
-  acquisition_poll_seconds: 60   # retry cadence while armed with nothing on air
+  acquisition_poll_seconds: 180  # retry until the current segment has a high-grade source
+  cache_max_age_hours: 72        # validated detail survives a temporary ESPN outage
   stall_hours: 6                 # stand-down backstop when ESPN never marks the card final
   stall_idle_minutes: 45
   require_event_match: true      # a feed must identify the tracked card
@@ -188,16 +190,21 @@ Four things changed:
    The scheduler publishes it every tick through the `SourceResolver` protocol, implemented in the
    cockpit by `CockpitSourceResolver`. Names are folded to ASCII (`normalize_match_text`), because
    ESPN says `Medić` and the provider says `MEDIC`.
-2. **Discovery runs before the start, not after.** `UfcScheduler.apply()` refreshes sources first.
+2. **Discovery runs before the start, not after.** `UfcScheduler.tick()` refreshes sources before
+   applying its START decision.
    Previously the encode came up on stale links and the refresh that followed then declined to touch
    a stream that looked healthy — `should_protect_live_private_stream` pinned the mistake for hours.
    Protection is now forfeited by a feed that cannot be the tracked card, or one chosen before the
    card moved to its next segment.
 3. **Unverified means nothing goes on air.** `schedule_start_links()` only returns feeds tagged with
    the tracked `event_id`; with none, the cockpit stays armed with the encode *down* and retries on
-   `acquisition_poll_seconds` (60s). Discord gets a warning if the card starts with nothing found.
-   Public backup sources are pulled in after `public_fallback_after_attempts` failed sweeps.
-4. **Switching is bounded.** Every swap costs viewers a few seconds, so `switch_cooldown_seconds`,
+   `acquisition_poll_seconds` (180s). Discord gets a warning if the card starts with nothing found.
+   Public backup sources are pulled in after `public_fallback_after_attempts` failed sweeps, but only
+   after the card is live; an unidentified fallback is never aired during pre-roll.
+4. **Segments switch dynamically.** ESPN can publish one segment (main card only), two (prelims +
+   main), or three (early prelims + prelims + main). The earliest one opens pre-roll, and every later
+   boundary forces discovery and selects only current-segment feeds.
+5. **Switching is bounded.** Every swap costs viewers a few seconds, so `switch_cooldown_seconds`,
    `switch_confirm_samples` and `max_switches_per_card` stop it flapping mid-fight. A *confirmed
    wrong-card* feed overrides the cooldown: that is a correction, not an improvement.
 

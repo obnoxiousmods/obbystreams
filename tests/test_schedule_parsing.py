@@ -195,6 +195,26 @@ async def test_espn_is_not_fetched_with_the_scraper_user_agent():
     assert "httpx" in seen["ua"]
 
 
+@pytest.mark.asyncio
+async def test_espn_transient_failure_is_retried_before_using_cache():
+    import httpx
+
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, json={"error": "temporary gateway failure"})
+        return httpx.Response(200, json={"leagues": [], "events": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        payload = await EspnScheduleProvider(client, ScheduleSettings()).fetch_scoreboard()
+
+    assert attempts == 2
+    assert payload == {"leagues": [], "events": []}
+
+
 def test_card_segments_carry_their_matchups():
     """The embeds show what is actually fighting, not just a bout count. ESPN
     returns bouts in running order, so the headliner is last."""
@@ -206,3 +226,57 @@ def test_card_segments_carry_their_matchups():
         if card.bouts:
             assert all(" vs. " in bout for bout in card.bouts)
             assert len(card.bouts) <= card.bout_count
+
+
+@pytest.mark.asyncio
+async def test_a_refused_user_agent_is_retried_with_another():
+    """ESPN's agent filtering is the one thing here that changes without warning -
+    it is what caused the 2026-08-04 blackout - so a refusal has to cost one
+    retried request, not an outage nobody notices for three days."""
+    import httpx
+
+    from obbyschedule.espn import FEED_HEALTH
+
+    FEED_HEALTH.__init__()
+    tried: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        agent = request.headers.get("User-Agent", "")
+        tried.append(agent)
+        if len(tried) == 1:
+            return httpx.Response(403, text="Forbidden")
+        return httpx.Response(200, json={"leagues": [], "events": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = EspnScheduleProvider(client, ScheduleSettings())
+        payload = await provider.fetch_scoreboard()
+
+    assert payload != {}, "gave up after the first refusal"
+    assert len(tried) == 2
+    assert tried[0] != tried[1]
+    assert FEED_HEALTH.consecutive_failures == 0
+    assert FEED_HEALTH.user_agent == tried[1], "did not remember the agent that worked"
+
+
+@pytest.mark.asyncio
+async def test_a_real_server_error_is_not_retried_across_agents():
+    """A 500 means the same thing whoever asks; retrying it three times only
+    multiplies load on an endpoint that is already unwell."""
+    import httpx
+
+    from obbyschedule.espn import FEED_HEALTH
+
+    FEED_HEALTH.__init__()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, text="boom")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = EspnScheduleProvider(client, ScheduleSettings())
+        assert await provider.fetch_scoreboard() == {}
+
+    assert calls == 1
+    assert FEED_HEALTH.consecutive_failures == 1

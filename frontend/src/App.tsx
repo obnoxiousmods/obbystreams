@@ -486,12 +486,21 @@ export function SourceAcquisition({ schedule }: { schedule: ScheduleSnapshot | n
     );
   }
 
-  if (!state.event_matched) return null;
+  const confidence = state.selected_confidence;
+  const degraded = confidence === "generic-ufc" || confidence === "public-generic";
+  if (!state.event_matched && !degraded) return null;
   const count = state.event_matched_sources.length;
+  const sourceDescription = degraded
+    ? confidence === "public-generic"
+      ? "public UFC fallback playing"
+      : "generic UFC fallback playing"
+    : `${count} source${count === 1 ? "" : "s"} verified for this card`;
   return (
-    <p className="sourceAcquisition muted">
-      ✅ {count} source{count === 1 ? "" : "s"} verified for this card
+    <p className={`sourceAcquisition ${degraded ? "warn" : "muted"}`}>
+      {degraded ? "⚠️" : "✅"} {sourceDescription}
+      {confidence ? ` · ${confidence}` : ""}
       {state.switches ? ` · ${state.switches} switch${state.switches === 1 ? "" : "es"} so far` : ""}
+      {state.refresh_interval_seconds ? ` · rescans every ${Math.round(state.refresh_interval_seconds / 60)}m until high-grade` : ""}
     </p>
   );
 }
@@ -548,6 +557,13 @@ export function SchedulePanel({
               {event.city ? ` · ${event.city}` : ""}
             </p>
           )}
+          {schedule.data_health && schedule.data_health.status !== "healthy" && (
+            <p className="sourceAcquisition warn">
+              ⚠️ ESPN {schedule.data_health.status}
+              {schedule.data_health.using_cached_event ? " — safely following the last validated card schedule" : ""}
+              {schedule.data_health.consecutive_failures ? ` · ${schedule.data_health.consecutive_failures} consecutive failure(s)` : ""}
+            </p>
+          )}
           {event?.cards?.length ? (
             <ul className="scheduleCards">
               {event.cards.map((card) => (
@@ -565,6 +581,12 @@ export function SchedulePanel({
             </p>
           )}
           <SourceAcquisition schedule={schedule} />
+          {schedule.lifecycle?.hard_stop_at ? (
+            <p className="muted scheduleReason">
+              Safety shutdown {new Date(schedule.lifecycle.hard_stop_at * 1000).toLocaleString()}
+              {schedule.lifecycle.start_status ? ` · ${schedule.lifecycle.start_status}` : ""}
+            </p>
+          ) : null}
           <p className="muted scheduleReason">
             {schedule.reason}
             {schedule.notifications_sent ? ` · ${schedule.notifications_sent} Discord notice(s) sent` : ""}
