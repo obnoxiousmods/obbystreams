@@ -6,6 +6,7 @@ intent as a side effect.
 """
 
 from app import (
+    boot_stream_desired_state,
     load_config,
     normalize_config,
     operator_stopped,
@@ -72,6 +73,19 @@ def test_watchdog_gate_still_respects_desired_state_and_links():
     assert should_watchdog_restart_exited_process(no_links, "running") is False
 
 
+def test_auto_scheduled_service_always_boots_into_safe_standby():
+    scheduled = normalize_config({"schedule": {"enabled": True}})
+    legacy = normalize_config({"schedule": {"enabled": False}})
+    manually_stopped = normalize_config({
+        "schedule": {"enabled": False},
+        "stream": {"operator_stopped": True},
+    })
+
+    assert boot_stream_desired_state(scheduled) == "stopped"
+    assert boot_stream_desired_state(legacy) == "running"
+    assert boot_stream_desired_state(manually_stopped) == "stopped"
+
+
 def test_start_managed_process_does_not_touch_operator_state(monkeypatch):
     import app
 
@@ -99,6 +113,7 @@ def test_start_managed_process_does_not_touch_operator_state(monkeypatch):
     # cleanup module globals we touched
     app.PROCESS = None
     app.STARTED_AT = None
+    app.MANAGED_LINKS = ()
 
 
 # --- Auto-schedule interplay with the operator Stop ---------------------------
@@ -158,3 +173,42 @@ def test_schedule_settings_are_bounded():
     cfg = normalize_config({"schedule": {"lead_minutes": 99999, "live_poll_seconds": 1}})
     assert cfg["schedule"]["lead_minutes"] == 720
     assert cfg["schedule"]["live_poll_seconds"] == 30
+
+
+def test_an_unkillable_encode_is_reported_not_raised():
+    """SIGKILL cannot land on a process wedged in uninterruptible sleep. This used
+    to raise out through the Stop endpoint, which had already persisted
+    operator_stopped=True - so the operator saw a 500, the encode kept running,
+    and the watchdog was disarmed by the very flag Stop had just written."""
+    import subprocess
+
+    from app import terminate_process_tree
+
+    class _Unkillable:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
+
+    # Must return, not raise, and must report that the kill did not take.
+    assert terminate_process_tree(_Unkillable(), timeout=0) is False
+
+
+def test_a_normal_encode_still_reports_a_successful_kill():
+    from app import terminate_process_tree
+
+    class _Cooperative:
+        pid = 4243
+        waited = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    assert terminate_process_tree(_Cooperative(), timeout=1) is True

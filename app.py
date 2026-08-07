@@ -4851,6 +4851,10 @@ _GOOZ_REFERER = "https://gooz.aapmains.net/"
 # ---------------------------------------------------------------------------
 # HLS proxy — shared upstream fetch/cache and m3u8 URL rewriting for viewers.
 # ---------------------------------------------------------------------------
+#: Ceiling on a single proxied body. HLS segments are seconds of video - a few
+#: MB at most - so anything past this is not a segment, and buffering it would
+#: put the process that supervises the encode at risk of an OOM kill.
+MAX_PROXY_BODY = 24 * 1024 * 1024
 #: Fail-closed key used only when no dashboard session token is configured.
 #: Random per process, so signatures minted by one boot never verify against
 #: another - a deployment with no secret proxies nothing rather than everything.
@@ -4979,7 +4983,16 @@ async def _proxy_upstream_fetch(raw_url: str) -> tuple[bytes, str]:
             current_headers = proxy_request_headers(next_url)
         assert response is not None  # the loop always runs at least once
         response.raise_for_status()
-        return response.content, response.headers.get("content-type", "")
+        body = response.content
+        if len(body) > MAX_PROXY_BODY:
+            # .content materialises the whole body in memory, and the cache below
+            # is capped in ENTRIES (5000) not bytes - so a handful of large
+            # targets could hold gigabytes resident and OOM the process that also
+            # supervises the encode. Refuse rather than buffer.
+            raise RuntimeError(
+                f"upstream body {len(body)} exceeds the {MAX_PROXY_BODY} byte proxy limit"
+            )
+        return body, response.headers.get("content-type", "")
     except (httpx.HTTPError, httpx.DecodingError) as exc:
         logger.debug("httpx proxy fetch failed for %s, trying curl fallback: %s", raw_url, exc)
         return await _proxy_upstream_fetch_curl(raw_url, headers)
@@ -5002,6 +5015,10 @@ async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> t
         # curl cannot re-validate a Location hop the way the httpx path does.
         "--max-redirs",
         "0",
+        # Same ceiling the httpx path enforces: communicate() buffers all stdout,
+        # so without this the fallback is the OOM vector the primary path is not.
+        "--max-filesize",
+        str(MAX_PROXY_BODY),
         "--proto",
         "=http,https",
         "-D",
@@ -5030,12 +5047,36 @@ async def _proxy_upstream_fetch_curl(raw_url: str, headers: dict[str, str]) -> t
 
 
 def _split_curl_headers_body(raw_out: bytes) -> tuple[bytes, str]:
-    """Split curl's `-D -` output into (body, content_type), using the last header block to skip redirect/100-continue preambles."""
-    header_end = raw_out.rfind(b"\r\n\r\n")
-    separator_len = 4
-    if header_end == -1:
-        header_end = raw_out.rfind(b"\n\n")
-        separator_len = 2
+    """Split curl's `-D -` output into (body, content_type).
+
+    Walks header blocks forward from the start, consuming 1xx/3xx preambles
+    (100-continue, or a redirect chain if one is ever enabled) and stopping at
+    the first final response.
+
+    It used to take the LAST b"\r\n\r\n" in the whole output. That scans the
+    body as well, so any such sequence occurring naturally inside a binary
+    MPEG-TS payload became the split point and silently truncated the segment -
+    which was then cached and served to every viewer for the next 120 seconds.
+    """
+    offset = 0
+    header_end, separator_len = -1, 4
+    while offset < len(raw_out):
+        end, sep = raw_out.find(b"\r\n\r\n", offset), 4
+        if end == -1:
+            end, sep = raw_out.find(b"\n\n", offset), 2
+        if end == -1:
+            break
+        header_end, separator_len = end, sep
+        block = raw_out[offset:end]
+        status = 0
+        if block.startswith(b"HTTP/"):
+            parts = block.split(b"\r\n", 1)[0].split(b"\n", 1)[0].split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                status = int(parts[1])
+        # A 1xx or 3xx block is a preamble; anything else is the real response.
+        if not (100 <= status < 200 or 300 <= status < 400):
+            break
+        offset = end + sep
     body = raw_out[header_end + separator_len:] if header_end != -1 else raw_out
     header_block = raw_out[:header_end] if header_end != -1 else b""
     last_header_block = header_block.split(b"\r\n\r\n")[-1].split(b"\n\n")[-1]
@@ -5802,7 +5843,22 @@ def terminate_process_tree(proc, timeout=5):
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=timeout)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # SIGKILL cannot land on a process wedged in uninterruptible sleep -
+            # a stalled write to the output directory, or a wedged encoder ioctl.
+            # This used to raise out through stop_managed_process and the Stop
+            # endpoint, which had ALREADY persisted operator_stopped=True: the
+            # operator got a 500, the encode kept running, and the watchdog was
+            # now disarmed by the very flag Stop had just written, so nothing
+            # ever reaped it. Report the failure instead of exploding on it.
+            logger.error(
+                "ffmpeg pid %s survived SIGKILL after %ss; leaving it orphaned",
+                proc.pid,
+                timeout,
+            )
+            return False
     return True
 
 
@@ -6266,11 +6322,24 @@ async def stop_stream(request):
         # Pressing Stop *during* a card means "not this one" — suppress only the
         # event currently being tracked so the scheduler still arms the next one.
         suppressed = await suppress_current_schedule_event()
-        stopped = await stop_managed_process("stream stopped by operator (persisted; scrapers paused)")
+        # Never let a failed kill become a 500 with operator_stopped already
+        # persisted: that combination disarms the watchdog while the encode is
+        # still running, and nothing reaps it afterwards.
+        try:
+            stopped = await stop_managed_process(
+                "stream stopped by operator (persisted; scrapers paused)"
+            )
+        except Exception:
+            logger.exception("operator stop failed to terminate the encode")
+            stopped = False
+        orphan_pid = PROCESS.pid if PROCESS is not None and PROCESS.poll() is None else None
+        if orphan_pid is not None:
+            event(f"stop left ffmpeg pid {orphan_pid} running", "bad")
         return JSONResponse(
             {
-                "ok": True,
+                "ok": orphan_pid is None,
                 "stopped": stopped,
+                "orphan_pid": orphan_pid,
                 "operator_stopped": True,
                 "stop_reason": StopReason.MANUAL.value,
                 "suppressed_event_id": suppressed,

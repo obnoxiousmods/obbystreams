@@ -221,3 +221,29 @@ def test_access_log_redacts_provider_tokens():
     assert "url=<redacted>" in rendered
     assert "/api/proxy-hls" in rendered, "redaction destroyed the useful part of the line"
     assert "200" in rendered
+
+
+def test_split_curl_headers_body_does_not_split_on_binary_payload():
+    """An MPEG-TS segment can contain b"\\r\\n\\r\\n" by coincidence. Scanning
+    backwards for the last one truncated the segment, and the truncated bytes
+    were then cached and served to every viewer for 120 seconds."""
+    from app import _split_curl_headers_body
+
+    payload = b"\x47\x40\x11\x10" + b"\r\n\r\n" + b"\xff" * 64
+    raw = b"HTTP/2 200\r\ncontent-type: video/mp2t\r\n\r\n" + payload
+
+    body, content_type = _split_curl_headers_body(raw)
+
+    assert body == payload, "binary payload was truncated at an embedded separator"
+    assert content_type == "video/mp2t"
+
+
+def test_split_curl_headers_body_skips_a_100_continue_preamble():
+    from app import _split_curl_headers_body
+
+    raw = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nBODY"
+
+    body, content_type = _split_curl_headers_body(raw)
+
+    assert body == b"BODY"
+    assert content_type == "text/plain"
