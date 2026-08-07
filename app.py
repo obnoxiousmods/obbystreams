@@ -40,6 +40,7 @@ import contextlib
 import csv
 import glob
 import hashlib
+import hmac
 import html
 import io
 import ipaddress
@@ -72,6 +73,35 @@ from starlette.staticfiles import StaticFiles
 from obbyschedule import EventContext, ScheduleSettings, StartResult, StartStatus, StopReason, UfcScheduler
 
 logger = logging.getLogger("obbystreams")
+
+
+class _RedactProxyTargets(logging.Filter):
+    """Keep provider tokens out of the access log.
+
+    Every /api/proxy-hls request carries the upstream URL in its query string,
+    and those URLs are signed provider links - bearer credentials with a few
+    hours of life. uvicorn's access logger writes the full request line, so the
+    journal had hundreds of them in cleartext, readable by anyone in the
+    systemd-journal group and to anyone who is ever sent a log excerpt.
+
+    Rewrites the query to `url=<redacted>` in place; the path, status and client
+    are untouched, so the log stays just as useful for debugging.
+    """
+
+    _PATTERN = re.compile(r"(\burl=)[^\s\"']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            record.args = tuple(
+                self._PATTERN.sub(r"\1<redacted>", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactProxyTargets())
 CONFIG_PATH = Path(os.environ.get("OBBYSTREAMS_CONFIG", "/etc/obbystreams/obbystreams.yaml"))
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -91,6 +121,10 @@ LOGS: deque[dict] = deque(maxlen=600)
 ERRORS: deque[dict] = deque(maxlen=200)
 PROCESS = None
 STARTED_AT = None
+# Exact ingest pool handed to the currently managed ffmpeg process. Config can
+# change while ffmpeg is still running, so source verification must compare
+# against what was actually launched rather than merely what is now on disk.
+MANAGED_LINKS: tuple[str, ...] = ()
 READER_TASK = None
 PROCESS_LOCK = asyncio.Lock()
 PRIVATE_PROBE_LOCK = asyncio.Lock()
@@ -2287,6 +2321,18 @@ def should_watchdog_restart_exited_process(config, desired_state):
     )
 
 
+def boot_stream_desired_state(config):
+    """Safe process intent after a service/host restart.
+
+    Auto-schedule owns starts when enabled, so boot into standby and let its
+    first event-aware tick choose verified links. This closes the restart race
+    where the watchdog could launch stale configured links before ESPN context
+    had loaded.
+    """
+    schedule_enabled = ScheduleSettings.from_config(config.get("schedule")).enabled
+    return "stopped" if operator_stopped(config) or schedule_enabled else "running"
+
+
 # ---------------------------------------------------------------------------
 # HLS output & process metrics — read the transcode's playlist/segment state.
 # ---------------------------------------------------------------------------
@@ -3349,14 +3395,20 @@ def live_stream_is_event_matched(config, context=None):
     return bool(event_source_links(config, context.event_id))
 
 
-def live_stream_is_high_grade(config, context=None, now=None):
-    """Whether the current segment has an exact/dated, deeply probed source."""
+def live_stream_is_high_grade(config, context=None, now=None, actual_links=None):
+    """Whether ffmpeg actually carries an exact/dated, deeply probed source."""
     context = active_event_context() if context is None else context
     if context is None:
         return False
     urls = set(event_source_links(config, context.event_id, context=context, now=now))
+    restrict_to_actual = actual_links is not None
+    if actual_links is None and PROCESS and PROCESS.poll() is None:
+        actual_links = MANAGED_LINKS
+        restrict_to_actual = True
+    actual = set(actual_links or ())
     return any(
         source.get("url") in urls
+        and (not restrict_to_actual or source.get("url") in actual)
         and source.get("match_confidence") in {"exact", "dated"}
         and int(source.get("probe_score") or 0) >= 80
         for source in ordered_stream_sources(config)
@@ -4457,7 +4509,15 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
         reset_switch_state(context.event_id)
     health_doc = stream_health(config, proc, hls_metrics(config), force=True)
     segment_transition = bool(context is not None and context.active and sources_predate_current_segment(config, context))
-    quality_upgrade = bool(context is not None and context.active and not live_stream_is_high_grade(config, context))
+    quality_upgrade = bool(
+        context is not None
+        and context.active
+        and not live_stream_is_high_grade(
+            config,
+            context,
+            actual_links=MANAGED_LINKS if proc.get("managed") else None,
+        )
+    )
     budget = private_probe_budget(config, proc=proc, health_doc=health_doc, force_probe=force_probe, context=context)
     # A live encode whose sources are not tagged for the tracked card cannot be
     # showing it. Require the mismatch to repeat before acting: a single sample
@@ -4483,6 +4543,17 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
     if private_cfg.get("paused"):
         PRIVATE_IPTV_RUNTIME.update({"state": "paused", "message": "Private IPTV automation is paused; live ffmpeg is unchanged."})
         return {"ok": True, "changed": False, "runtime": private_iptv_public_runtime()}
+    if context is not None and context.is_final:
+        # The last 30 minutes are a hold, not another acquisition phase. Keep
+        # the feed already on air stable until the scheduler performs the final
+        # stop; a background provider sweep must not restart ffmpeg post-fight.
+        PRIVATE_IPTV_RUNTIME.update(
+            {
+                "state": "wrapping",
+                "message": "Card is final; holding the current feed through the post-fight grace period.",
+            }
+        )
+        return {"ok": True, "changed": False, "protected": True, "runtime": private_iptv_public_runtime()}
 
     if should_protect_live_private_stream(config, budget, force_probe=force_probe, context=context, mismatch_confirmed=mismatch_confirmed):
         prefix = private_cfg.get("auto_source_prefix") or "private-iptv"
@@ -4667,7 +4738,10 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
                     "reasons": probe_reasons[:8],
                 }
             )
-            if changed:
+            live_replacement = bool(
+                proc.get("managed") and (mismatch_confirmed or segment_transition or quality_upgrade)
+            )
+            if changed or live_replacement:
                 event("private IPTV sources refreshed", "ok", {"count": len(accepted), "reason": reason})
                 stream_live = bool(proc.get("managed"))
                 can_restart_live = bool(force_probe or budget.get("probe_allowed") or not budget.get("stream_uses_private_slot"))
@@ -4777,10 +4851,62 @@ _GOOZ_REFERER = "https://gooz.aapmains.net/"
 # ---------------------------------------------------------------------------
 # HLS proxy — shared upstream fetch/cache and m3u8 URL rewriting for viewers.
 # ---------------------------------------------------------------------------
+#: Fail-closed key used only when no dashboard session token is configured.
+#: Random per process, so signatures minted by one boot never verify against
+#: another - a deployment with no secret proxies nothing rather than everything.
+_PROXY_FALLBACK_KEY = secrets.token_bytes(32)
+
+#: Lifetime of a signed proxy URL. Long enough to outlast a live playlist and any
+#: reasonable player buffer, short enough that a link scraped out of somebody's
+#: devtools stops working the same evening.
+_PROXY_SIG_TTL = 6 * 3600
+
+
+def _proxy_signing_key() -> bytes:
+    """Key for proxy URL signatures, derived from the dashboard session token.
+
+    Deliberately derived rather than a new config value: the token already exists,
+    is already secret, and rotating it should invalidate outstanding proxy links
+    too. Falls back to a per-process random key so a deployment without a token
+    fails closed (nothing verifies) instead of open (everything verifies).
+    """
+    token = str((load_config().get("dashboard") or {}).get("session_token") or "")
+    if not token:
+        return _PROXY_FALLBACK_KEY
+    return hashlib.sha256(f"obbystreams-proxy-v1:{token}".encode()).digest()
+
+
+def _proxy_signature(raw_url: str, expires: int) -> str:
+    return hmac.new(
+        _proxy_signing_key(), f"{expires}:{raw_url}".encode(), hashlib.sha256
+    ).hexdigest()[:32]
+
+
+def _proxy_signature_valid(raw_url: str, expires: str, signature: str) -> bool:
+    """Whether this exact URL was minted by us and has not expired."""
+    try:
+        deadline = int(expires)
+    except (TypeError, ValueError):
+        return False
+    if deadline < time.time():
+        return False
+    return hmac.compare_digest(_proxy_signature(raw_url, deadline), signature or "")
+
+
 def _proxy_url(raw_url: str) -> str:
-    """Return the local /api/proxy-hls URL that fetches raw_url through this proxy."""
+    """Return the local /api/proxy-hls URL that fetches raw_url through this proxy.
+
+    The URL is signed. Every address this proxy is legitimately asked for is one
+    it emitted itself - entry points come from the configured source list and
+    everything below them is rewritten by _rewrite_m3u8 - so a signature can be
+    required without breaking playback, and it is the only thing that stops the
+    endpoint being an open web proxy for the whole internet.
+    """
     from urllib.parse import quote
-    return f"/api/proxy-hls?url={quote(raw_url, safe='')}"
+
+    expires = int(time.time()) + _PROXY_SIG_TTL
+    signature = _proxy_signature(raw_url, expires)
+    return f"/api/proxy-hls?url={quote(raw_url, safe='')}&exp={expires}&sig={signature}"
 
 
 async def _proxy_fetch(raw_url: str) -> tuple[bytes, str]:
@@ -4959,6 +5085,41 @@ def _rewrite_m3u8(text: str, raw_url: str) -> str:
     return "\n".join(out_lines) + "\n"
 
 
+def _redact_url(raw_url: str) -> str:
+    """scheme://host/<last path element> — never the query string.
+
+    Provider URLs carry signed tokens in the path and query, and those are bearer
+    credentials. They were being written to the journal in full by the access log
+    and by this module's own warnings.
+    """
+    try:
+        parsed = urlparse(raw_url)
+    except ValueError:
+        return "<unparseable>"
+    tail = (parsed.path or "/").rsplit("/", 1)[-1] or "/"
+    return f"{parsed.scheme}://{parsed.netloc}/…/{tail}"
+
+
+def _is_configured_proxy_target(raw_url: str) -> bool:
+    """Whether this exact URL is one an operator configured as a source.
+
+    Exact match, not host match: a host allow-list would still let anyone fetch
+    arbitrary paths on a provider we happen to use, spending our credentials on
+    their errand via source_headers_for_url.
+    """
+    config = load_config()
+    known: set[str] = set()
+    for entry in config.get("public_sources") or []:
+        if isinstance(entry, dict) and entry.get("url"):
+            known.add(str(entry["url"]))
+    for entry in (config.get("stream") or {}).get("sources") or []:
+        if isinstance(entry, dict) and entry.get("url"):
+            known.add(str(entry["url"]))
+        elif isinstance(entry, str):
+            known.add(entry)
+    return raw_url in known
+
+
 async def proxy_hls(request):
     """
     Shared HLS reverse proxy — one upstream fetch per playlist/segment
@@ -4980,8 +5141,28 @@ async def proxy_hls(request):
     if request.method == "OPTIONS":
         return Response("", headers=cors_headers)
 
+    # Only fetch what we ourselves published. Without this the endpoint is an
+    # open web proxy: it is unauthenticated and publicly routed by nginx, and it
+    # was being used as one - 115 requests over seven days from addresses that
+    # have nothing to do with this service, including a search crawler.
+    #
+    # Two things count as ours: a URL we signed (every address inside a playlist
+    # is rewritten by _rewrite_m3u8, so all derived traffic is signed), and a
+    # configured source, which is how a viewer enters a stream in the first
+    # place. Everything else is somebody else's errand.
+    if not (
+        _proxy_signature_valid(
+            raw_url,
+            request.query_params.get("exp", ""),
+            request.query_params.get("sig", ""),
+        )
+        or _is_configured_proxy_target(raw_url)
+    ):
+        logger.warning("proxy_hls refused an unsigned target: %s", _redact_url(raw_url))
+        return Response("forbidden", status_code=403, headers=cors_headers)
+
     if not await url_is_safe_public_async(raw_url):
-        logger.warning("proxy_hls blocked non-public target %s", raw_url)
+        logger.warning("proxy_hls blocked non-public target %s", _redact_url(raw_url))
         return Response("forbidden host", status_code=403, headers=cors_headers)
 
     try:
@@ -5627,13 +5808,14 @@ def terminate_process_tree(proc, timeout=5):
 
 async def stop_managed_process(reason, kill_orphans=True):
     """Terminate the managed encode (and its reader task), reset health/state, optionally kill orphan encodes; return whether anything was stopped."""
-    global PROCESS, READER_TASK, STARTED_AT
+    global MANAGED_LINKS, PROCESS, READER_TASK, STARTED_AT
     proc = PROCESS
     if not proc or proc.poll() is not None:
         if proc and proc.poll() is not None:
             RUNTIME["last_exit_code"] = proc.poll()
         PROCESS = None
         STARTED_AT = None
+        MANAGED_LINKS = ()
         STREAM_HEALTH_SCORER.reset()
         killed = await asyncio.to_thread(kill_existing_streams) if kill_orphans else []
         if killed:
@@ -5647,6 +5829,7 @@ async def stop_managed_process(reason, kill_orphans=True):
     RUNTIME["last_exit_code"] = proc.poll()
     PROCESS = None
     STARTED_AT = None
+    MANAGED_LINKS = ()
     STREAM_HEALTH_SCORER.reset()
     killed = await asyncio.to_thread(kill_existing_streams) if kill_orphans else []
     if killed:
@@ -5660,7 +5843,7 @@ def start_managed_process(config, links, kill_existing=True):
 
     Raises ValueError if no links, OSError if the process can't be launched.
     """
-    global PROCESS, STARTED_AT, READER_TASK
+    global MANAGED_LINKS, PROCESS, READER_TASK, STARTED_AT
     links = normalize_links(links if links is not None else effective_stream_links(config))
     if not links:
         raise ValueError("no links configured")
@@ -5676,6 +5859,7 @@ def start_managed_process(config, links, kill_existing=True):
         RUNTIME["start_failures"] += 1
         raise
     STARTED_AT = now_ms()
+    MANAGED_LINKS = tuple(links)
     # NOTE: intentionally does NOT touch STREAM_DESIRED_STATE / operator_stopped.
     # Desired state is owned solely by the explicit start/stop/restart endpoints,
     # so watchdog- and scraper-initiated starts can never silently re-arm a stream
@@ -5804,22 +5988,30 @@ async def schedule_start_stream(reason):
         if removed:
             event(f"auto-schedule dropped {removed} source(s) from a previous card", "warn")
             save_config(config)
-        if PROCESS and PROCESS.poll() is None:
-            event(f"auto-schedule armed ({reason}); stream already running", "ok")
-            return StartResult(StartStatus.STARTED, "stream already running")
         links, detail = schedule_start_links(config, context)
         if not links:
+            if PROCESS and PROCESS.poll() is None:
+                # A decoding process is not evidence that it carries this card.
+                # Take the wrong/unidentified feed off air while acquisition
+                # continues, otherwise a stale 24/7 source can look perfectly
+                # healthy and survive the entire event.
+                await stop_managed_process("unverified running feed quarantined by auto-schedule")
+                STREAM_DESIRED_STATE = "stopped"
             SOURCE_SWITCH_STATE["last_error"] = detail
             event(f"auto-schedule armed ({reason}); holding: {detail}", "warn")
             return StartResult(StartStatus.AWAITING_SOURCE, detail)
         try:
+            replacing = bool(PROCESS and PROCESS.poll() is None)
+            if replacing:
+                await stop_managed_process("stream stopped to install a verified UFC source")
             start_managed_process(config, links, kill_existing=True)
             STREAM_DESIRED_STATE = "running"
         except (OSError, ValueError) as exc:
             event(f"auto-schedule start failed: {exc}", "bad")
             ERRORS.append({"ts": now_ms(), "level": "error", "line": f"auto-schedule start failed: {exc}"})
             return StartResult(StartStatus.FAILED, str(exc))
-        event(f"auto-schedule started the stream ({reason}); {detail}", "ok")
+        verb = "replaced the running feed" if replacing else "started the stream"
+        event(f"auto-schedule {verb} ({reason}); {detail}", "ok")
         confidence = schedule_best_source_confidence(config, context)
         if "public source" in detail:
             confidence = "public-generic"
@@ -5880,11 +6072,37 @@ class CockpitSourceResolver:
         if str(health.get("decision") or "").lower() != "healthy":
             return False
         current_urls = set(event_source_links(config, context.event_id, context=context))
-        sources = [source for source in ordered_stream_sources(config) if source.get("url") in current_urls]
+        actual_urls = set(MANAGED_LINKS)
+        sources = [
+            source
+            for source in ordered_stream_sources(config)
+            if source.get("url") in current_urls and source.get("url") in actual_urls
+        ]
         return any(
             int(source.get("probe_score") or 0) >= 80
             and source.get("match_confidence") in {"exact", "dated"}
             for source in sources
+        )
+
+    def is_stream_acceptable(self, context):
+        """Whether ffmpeg's *actual* ingest pool may stay on air for this segment.
+
+        This is deliberately separate from ``is_satisfied``. A deeply probed
+        generic fallback is acceptable after the bell while exact acquisition
+        continues, whereas a stale or future-segment process must be replaced
+        even if its output health is green.
+        """
+        if context is None or not process_metrics().get("managed"):
+            return False
+        config = load_config()
+        allowed = set(event_source_links(config, context.event_id, context=context))
+        actual = set(MANAGED_LINKS)
+        if actual & allowed:
+            return True
+        return bool(
+            str(context.phase) == "live"
+            and SOURCE_SWITCH_STATE.get("selected_confidence") == "public-generic"
+            and actual.intersection(current_auto_sources())
         )
 
     def publish(self, context):
@@ -6101,8 +6319,12 @@ async def watchdog_loop():
                         WATCHDOG_LAST_ACTION = now
                         RUNTIME["watchdog_restarts"] += 1
                         event("watchdog restart: managed process exited", "warn")
+                        links, detail = schedule_start_links(config, active_event_context())
+                        if not links:
+                            event(f"watchdog skipped restart: {detail}", "warn")
+                            continue
                         try:
-                            start_managed_process(config, effective_stream_links(config), kill_existing=True)
+                            start_managed_process(config, links, kill_existing=True)
                         except (OSError, ValueError) as exc:
                             event(f"watchdog restart failed: {exc}", "bad")
                             ERRORS.append({"ts": now_ms(), "level": "error", "line": f"watchdog restart failed: {exc}"})
@@ -6320,12 +6542,15 @@ def static_asset(name, media_type=None):
 async def lifespan(app):
     """ASGI lifespan: honor a persisted operator Stop, init the shared HTTP client and Arango queue, launch all background loops, and tear them down (stopping the encode) on shutdown."""
     global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK, STREAM_DESIRED_STATE, SCHEDULER, SCHEDULE_TASK
-    # Honor a persisted operator Stop across restarts: keep the stream down and
-    # both scrapers idle until a human Starts it. The watchdog + scraper loops all
-    # re-check operator_stopped, so this only needs to seed the desired-state.
-    if operator_stopped(load_config()):
-        STREAM_DESIRED_STATE = "stopped"
+    # Auto-scheduled installations always boot into standby. The schedule's
+    # first event-aware tick is the only path that may select links and start
+    # ffmpeg, so the watchdog can never win startup with last week's feed.
+    initial_config = load_config()
+    STREAM_DESIRED_STATE = boot_stream_desired_state(initial_config)
+    if operator_stopped(initial_config):
         event("boot: operator Stop is in effect; stream + scrapers idle until Start", "warn")
+    elif STREAM_DESIRED_STATE == "stopped":
+        event("boot: auto-schedule standby; waiting for a verified UFC event source", "ok")
     _AUTO_SOURCES_LOCK = asyncio.Lock()
     ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
     _HTTPX_CLIENT = httpx.AsyncClient(

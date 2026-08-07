@@ -99,9 +99,28 @@ async def test_proxy_cache_does_not_release_lock_acquired_by_waiter():
 
 
 def test_proxy_url_encodes_url():
-    assert _proxy_url("https://example.com/stream.m3u8?token=a/b") == (
+    built = _proxy_url("https://example.com/stream.m3u8?token=a/b")
+
+    assert built.startswith(
         "/api/proxy-hls?url=https%3A%2F%2Fexample.com%2Fstream.m3u8%3Ftoken%3Da%2Fb"
     )
+
+
+def test_proxy_url_is_signed_and_verifies_only_for_that_exact_url():
+    """The signature is the only thing standing between this endpoint and being
+    an open web proxy, so it has to be bound to the URL, not just present."""
+    from urllib.parse import parse_qs, urlparse
+
+    from app import _proxy_signature_valid
+
+    target = "https://example.com/stream.m3u8"
+    query = parse_qs(urlparse(_proxy_url(target)).query)
+    exp, sig = query["exp"][0], query["sig"][0]
+
+    assert _proxy_signature_valid(target, exp, sig)
+    assert not _proxy_signature_valid("https://evil.example/x.m3u8", exp, sig)
+    assert not _proxy_signature_valid(target, exp, "0" * 32)
+    assert not _proxy_signature_valid(target, "0", sig), "an expired link still verified"
 
 
 def test_rewrite_m3u8_rewrites_relative_segments():
@@ -177,3 +196,28 @@ async def test_assess_playback_candidate_accepts_media_playlist(monkeypatch):
     assert result["ok"] is True
     assert "media segments" in result["reasons"]
     assert "segment readable" in result["reasons"]
+
+
+def test_access_log_redacts_provider_tokens():
+    """Proxy URLs are signed provider links - bearer credentials with hours of
+    life - and uvicorn's access logger writes the whole request line. The journal
+    held hundreds of them in cleartext."""
+    import logging
+
+    from app import _RedactProxyTargets
+
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1,
+        '%s - "%s %s HTTP/1.1" %d',
+        ("1.2.3.4:0", "GET",
+         "/api/proxy-hls?url=https%3A%2F%2Fcdn.example%2Fsecure%2FSECRETTOKEN%2Fx.m3u8", 200),
+        None,
+    )
+
+    assert _RedactProxyTargets().filter(record)
+    rendered = record.getMessage()
+
+    assert "SECRETTOKEN" not in rendered, f"token survived redaction: {rendered}"
+    assert "url=<redacted>" in rendered
+    assert "/api/proxy-hls" in rendered, "redaction destroyed the useful part of the line"
+    assert "200" in rendered
