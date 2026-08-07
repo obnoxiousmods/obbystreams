@@ -19,3 +19,6 @@ ffmpegLogs/
 !.env.example
 obbystreams.yaml
 secrets/
+
+# Local pre-change snapshots of app.py. Recovery copies, not source history.
+app.py.bak-*
