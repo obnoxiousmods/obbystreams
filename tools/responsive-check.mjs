@@ -19,7 +19,32 @@ const viewports = [
   { name: "laptop", width: 1366, height: 768, mobile: false },
   { name: "desktop", width: 1440, height: 900, mobile: false },
   { name: "wide-desktop", width: 1920, height: 1080, mobile: false },
+  { name: "wqhd", width: 2560, height: 1440, mobile: false },
+  { name: "ultrawide", width: 3440, height: 1440, mobile: false },
 ];
+
+// Full-page height ceiling per viewport width. The cockpit was 5405px at 1920 and
+// 10534px before the layout overhaul; these are the post-overhaul numbers with a
+// little headroom. Ratchet them DOWN as the layout tightens — a regression that
+// re-inflates the page is exactly what this catches.
+const HEIGHT_BUDGET = {
+  320: 6300,
+  360: 6000,
+  393: 5500,
+  430: 5600,
+  768: 5000,
+  1024: 4400,
+  1366: 4200,
+  1440: 4200,
+  1920: 2800,
+  2560: 2900,
+  3440: 2900,
+};
+
+// A side-by-side child that stops more than this far above the bottom of its
+// region is dead column space — the defect that left ~2000px blank beside a
+// short player and squeezed telemetry into a 615px column.
+const DEAD_SPACE_LIMIT = 900;
 
 function systemChromiumPath() {
   const candidates = [
@@ -84,6 +109,33 @@ function mockStatus() {
         ],
       },
     },
+    // Without these the source cards never render, so the fixture never exercised
+    // the badge row, the truncating URL chip, or the per-source More menu — the
+    // densest and most breakage-prone part of the narrow layout.
+    sources: [
+      {
+        id: "source-primary",
+        label: "PPV EVENT 03: UFC FN Long Card Name vs Other Fighter (8.8 8:00 PM ET)",
+        url: "https://edge-a.example.net/live/events/obbystreams-primary/index.m3u8?token=mobile-layout-proof",
+        type: "soursignal",
+        health: "green",
+        health_message: "Source page reachable",
+        preferred: true,
+        locked: false,
+        viewer_count: 12,
+      },
+      {
+        id: "source-backup",
+        label: "LIVE EVENT 01 5pm Backup Feed",
+        url: "https://backup.example.net/live/secondary/playlist.m3u8",
+        type: "hls",
+        health: "yellow",
+        health_message: "Source page did not respond",
+        preferred: false,
+        locked: true,
+        viewer_count: 0,
+      },
+    ],
     managed_process: {
       managed: true,
       pid: 1842,
@@ -301,9 +353,10 @@ async function collectLayoutIssues(page) {
       ".stagePanel",
       ".videoSurface",
       ".playerBottomRail",
-      ".primaryGrid",
+      ".stageRow",
       ".rightRail",
-      ".lowerGrid",
+      ".sourcesRow",
+      ".telemetryRow",
       ".footerStatus",
       ".panel",
       ".metricTile",
@@ -332,7 +385,10 @@ async function collectLayoutIssues(page) {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
       if (style.display === "none" || style.visibility === "hidden" || rect.width === 0 || rect.height === 0) continue;
-      if (element instanceof HTMLInputElement && element.type === "range") {
+      // A control wrapped in a label is tapped via the label, so the label is the
+      // real target. Applies to sliders and to checkboxes like Auto-schedule,
+      // whose native box is intentionally small next to its text.
+      if (element instanceof HTMLInputElement && (element.type === "range" || element.type === "checkbox")) {
         const label = element.closest("label");
         const labelRect = label?.getBoundingClientRect();
         if (labelRect && labelRect.width >= 34 && labelRect.height >= 34) continue;
@@ -346,7 +402,39 @@ async function collectLayoutIssues(page) {
         });
       }
     }
-    return { overflow, offenders, smallTargets };
+    // Dead column space, measured PER GRID ROW: group the region's children by
+    // their top offset, then within each row report how far above the row's
+    // deepest child each sibling stops. Comparing against the whole region's
+    // bottom instead would count the next row's height as dead space.
+    const deadSpace = [];
+    for (const region of document.querySelectorAll(".stageRow")) {
+      const rows = new Map();
+      for (const el of region.children) {
+        const rect = el.getBoundingClientRect();
+        if (rect.height === 0) continue;
+        const key = Math.round(rect.top);
+        if (!rows.has(key)) rows.set(key, []);
+        rows.get(key).push({ el, rect });
+      }
+      for (const members of rows.values()) {
+        if (members.length < 2) continue; // a lone child in its row cannot strand a sibling
+        const rowBottom = Math.max(...members.map((m) => m.rect.bottom));
+        for (const { el, rect } of members) {
+          const tail = Math.round(rowBottom - rect.bottom);
+          if (tail > 0) {
+            deadSpace.push({ region: region.className, child: el.className.toString().slice(0, 40), tail });
+          }
+        }
+      }
+    }
+
+    return {
+      overflow,
+      offenders,
+      smallTargets,
+      pageHeight: Math.round(document.documentElement.scrollHeight),
+      deadSpace,
+    };
   });
 }
 
@@ -358,6 +446,23 @@ async function checkViewport(browser, viewport) {
     hasTouch: viewport.mobile,
   });
   const page = await context.newPage();
+
+  // Nothing may leave this machine. Fonts are self-hosted and vendored into the
+  // repo precisely so the cockpit never depends on a font CDN; this is the guard
+  // that keeps it that way.
+  const externalRequests = [];
+  page.on("request", (request) => {
+    let url;
+    try {
+      url = new URL(request.url());
+    } catch {
+      return;
+    }
+    if (url.protocol === "data:" || url.protocol === "blob:") return;
+    if (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1") return;
+    externalRequests.push(request.url());
+  });
+
   await page.addInitScript((key) => window.localStorage.setItem(key, "responsive-token"), TOKEN_KEY);
   await installRoutes(page);
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -369,13 +474,32 @@ async function checkViewport(browser, viewport) {
     throw new Error(`${viewport.name}: layout issues ${JSON.stringify(layout, null, 2)}`);
   }
 
+  const budget = HEIGHT_BUDGET[viewport.width];
+  if (budget && layout.pageHeight > budget) {
+    throw new Error(`${viewport.name}: page is ${layout.pageHeight}px tall, budget is ${budget}px`);
+  }
+
+  const dead = layout.deadSpace.filter((entry) => entry.tail > DEAD_SPACE_LIMIT);
+  if (dead.length) {
+    throw new Error(`${viewport.name}: dead column space ${JSON.stringify(dead, null, 2)}`);
+  }
+
+  if (externalRequests.length) {
+    throw new Error(`${viewport.name}: external requests ${JSON.stringify([...new Set(externalRequests)], null, 2)}`);
+  }
+
   await assertDropdownWithinViewport(page, ".encoderDropdown .dropdownButton", viewport.name);
-  await assertDropdownWithinViewport(page, ".playerMenu .dropdownButton", viewport.name);
+  // Was ".playerMenu .dropdownButton", a selector no component has ever rendered
+  // (the CSS has orphan .playerMenu rules; the JSX uses .playerMoreMenu, which is
+  // a hand-rolled popover, not a ModernDropdown). The per-source More menu is a
+  // real second case, and a useful one: it sits inside the multicol source row
+  // near the right viewport edge.
+  await assertDropdownWithinViewport(page, ".sourceMenu .dropdownButton", viewport.name);
 
   const screenshotPath = join(screenshotDir, `${viewport.name}-${viewport.width}x${viewport.height}.png`);
   await page.screenshot({ path: screenshotPath, fullPage: true });
   await context.close();
-  return screenshotPath;
+  return { screenshotPath, pageHeight: layout.pageHeight };
 }
 
 const server = startVite();
@@ -391,8 +515,10 @@ try {
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
   });
   for (const viewport of viewports) {
-    const screenshotPath = await checkViewport(browser, viewport);
-    console.log(`ok ${viewport.name} ${viewport.width}x${viewport.height} -> ${screenshotPath}`);
+    const { screenshotPath, pageHeight } = await checkViewport(browser, viewport);
+    const budget = HEIGHT_BUDGET[viewport.width];
+    const budgetNote = budget ? ` height=${pageHeight}/${budget}` : ` height=${pageHeight}`;
+    console.log(`ok ${viewport.name} ${viewport.width}x${viewport.height}${budgetNote} -> ${screenshotPath}`);
   }
 } finally {
   if (browser) await browser.close();

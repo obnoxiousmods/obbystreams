@@ -59,7 +59,7 @@ type PictureInPictureVideo = HTMLVideoElement & {
   requestPictureInPicture?: () => Promise<PictureInPictureWindow>;
 };
 
-type PlayerIconName = "play" | "pause" | "volume" | "muted" | "settings" | "pip" | "fullscreen" | "retry";
+type PlayerIconName = "play" | "pause" | "volume" | "muted" | "settings" | "pip" | "fullscreen" | "retry" | "stop";
 
 function PlayerIcon({ name }: { name: PlayerIconName }) {
   const commonProps = {
@@ -133,6 +133,12 @@ function PlayerIcon({ name }: { name: PlayerIconName }) {
         <svg {...commonProps}>
           <path d="M20 12a8 8 0 1 1-2.34-5.66" />
           <path d="M20 4v6h-6" />
+        </svg>
+      );
+    case "stop":
+      return (
+        <svg {...commonProps}>
+          <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" stroke="none" />
         </svg>
       );
     default:
@@ -322,34 +328,166 @@ function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: Ton
   return <span className={`badge tone-${tone}`}>{children}</span>;
 }
 
+/* One versioned key for all cockpit UI preferences, so there is a single thing
+   to clear when debugging and a shape change can't poison old tabs. Every access
+   is guarded: Safari private mode throws on setItem. */
+const UI_PREFS_KEY = "obbystreams_ui_v1";
+
+type UiPrefs = { panels?: Record<string, boolean> };
+
+function readUiPrefs(): UiPrefs {
+  try {
+    return (JSON.parse(window.localStorage.getItem(UI_PREFS_KEY) || "{}") || {}) as UiPrefs;
+  } catch {
+    return {};
+  }
+}
+
+function writePanelOpen(panelId: string, open: boolean) {
+  try {
+    const prefs = readUiPrefs();
+    window.localStorage.setItem(
+      UI_PREFS_KEY,
+      JSON.stringify({ ...prefs, panels: { ...prefs.panels, [panelId]: open } }),
+    );
+  } catch {
+    /* storage unavailable — collapse state stays in memory for this session */
+  }
+}
+
+/* True below the `lg` breakpoint. Used only to pick a panel's *initial* state,
+   so it does not need to react to resizes. */
+function isNarrowViewport() {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+  return window.matchMedia("(max-width: 63.999rem)").matches;
+}
+
+function usePanelOpen(panelId: string | undefined, defaultOpen: boolean) {
+  const [open, setOpen] = useState(() => {
+    if (!panelId) return defaultOpen;
+    const stored = readUiPrefs().panels?.[panelId];
+    return typeof stored === "boolean" ? stored : defaultOpen;
+  });
+  const set = useCallback(
+    (next: boolean) => {
+      setOpen(next);
+      if (panelId) writePanelOpen(panelId, next);
+    },
+    [panelId],
+  );
+  return [open, set] as const;
+}
+
 function Panel({
   title,
   meta,
   children,
   className = "",
+  panelId,
+  collapsible = false,
+  defaultOpen = true,
 }: {
   title: string;
   meta?: ReactNode;
   children: ReactNode;
   className?: string;
+  panelId?: string;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
 }) {
+  const [open, setOpen] = usePanelOpen(collapsible ? panelId : undefined, defaultOpen);
+  const bodyId = `${panelId ?? "panel"}-body`;
+  const canCollapse = collapsible && Boolean(panelId);
   return (
-    <section className={`panel ${className}`}>
+    <section className={`panel ${className}${canCollapse && !open ? " isCollapsed" : ""}`}>
       <div className="panelHeader">
-        <h2>{title}</h2>
+        {canCollapse ? (
+          <button
+            type="button"
+            className="panelToggle"
+            aria-expanded={open}
+            aria-controls={bodyId}
+            onClick={() => setOpen(!open)}
+          >
+            <span className="panelChevron" aria-hidden="true" />
+            <h2>{title}</h2>
+          </button>
+        ) : (
+          <h2>{title}</h2>
+        )}
         {meta ? <div className="panelMeta">{meta}</div> : null}
       </div>
-      {children}
+      <div className="panelBody" id={bodyId} hidden={canCollapse && !open}>
+        {children}
+      </div>
     </section>
   );
 }
 
-function MetricTile({ label, value, tone = "neutral" }: { label: string; value: ReactNode; tone?: Tone }) {
+/* Flag a value that just changed, so the tile can flash once. Opt-in per tile:
+   the status poll runs every 2.5s, so flashing a clock would strobe. */
+function useFlash(value: unknown, ms = 420) {
+  const previous = useRef(value);
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    if (previous.current === value) return;
+    previous.current = value;
+    setOn(true);
+    const timer = window.setTimeout(() => setOn(false), ms);
+    return () => window.clearTimeout(timer);
+  }, [value, ms]);
+  return on;
+}
+
+function MetricTile({
+  label,
+  value,
+  tone = "neutral",
+  flash = false,
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: Tone;
+  flash?: boolean;
+}) {
+  const changed = useFlash(flash ? value : undefined);
   return (
-    <div className={`metricTile tone-${tone}`}>
+    <div className={`metricTile tone-${tone}${changed ? " isChanged" : ""}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+/* Middle-truncating URL with a copy button. Pure CSS: the head span ellipsises
+   while the tail stays whole, so the useful end of a signed URL survives. Full
+   value is on `title`. Replaces `overflow-wrap: anywhere`, which shredded URLs
+   across three lines and dragged the document's min-content width with it. */
+function UrlChip({ url, tail = 16, label = "URL" }: { url: string; tail?: number; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  const head = url.length > tail ? url.slice(0, -tail) : url;
+  const end = url.length > tail ? url.slice(-tail) : "";
+  return (
+    <span className="urlChip" title={url}>
+      <span className="urlChipHead">{head}</span>
+      {end ? <span className="urlChipTail">{end}</span> : null}
+      <button
+        type="button"
+        className="urlChipCopy secondary compactButton"
+        aria-label={`Copy ${label}`}
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(url);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1400);
+          } catch {
+            /* clipboard blocked (no permission / insecure context) */
+          }
+        }}
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </span>
   );
 }
 
@@ -431,8 +569,25 @@ function StatusStrip({
   const lag = typeof hls.live_lag_seconds === "number" ? hls.live_lag_seconds : null;
   const rateTone: Tone = rate == null ? "neutral" : rate >= 0.98 ? "ok" : rate >= 0.9 ? "warn" : "bad";
 
+  // Condense once the header has scrolled away, so stream state stays visible
+  // mid-page without a full tile row following you down. A 1px sentinel plus
+  // IntersectionObserver — no scroll handler, no layout thrash.
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const [condensed, setCondensed] = useState(false);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || typeof IntersectionObserver !== "function") return;
+    const observer = new IntersectionObserver(([entry]) => setCondensed(!entry.isIntersecting), {
+      threshold: 1,
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   return (
-    <section className="statusStrip" aria-label="stream status">
+    <>
+    <div ref={sentinelRef} className="statusSentinel" aria-hidden="true" />
+    <section className={`statusStrip${condensed ? " isCondensed" : ""}`} aria-label="stream status">
       <div className={`rateBadge rate-${rateTone}`} title="Real-time encode rate: output content-seconds vs wall-clock. 1.00× = keeping up.">
         <span className="rateDot" aria-hidden="true" />
         <span className="rateValue">{rate == null ? "—" : `${rate.toFixed(2)}×`}</span>
@@ -441,13 +596,16 @@ function StatusStrip({
           <span className="rateLag">{lag == null ? "no output" : `${lag.toFixed(1)}s behind live`}</span>
         </span>
       </div>
-      <MetricTile label="Run" value={runText} tone={runTone} />
-      <MetricTile label="Health" value={`${health.level || "warn"}: ${health.state || "unknown"}`} tone={healthTone} />
-      <MetricTile label="Encoder" value={stream.encoder || "auto"} />
-      <MetricTile label="GPU" value={gpu ? (gpu.available ? gpu.level || "online" : "offline") : "checking"} tone={gpuTone} />
-      <MetricTile label="ArangoDB" value={arango ? (arango.connected ? "connected" : "offline") : "checking"} tone={arangoTone} />
-      <MetricTile label="Updated" value={fmtClock(status?.server_time)} />
+      {/* `flash` only on tiles whose change is meaningful. Never on Updated —
+          it changes every poll and would strobe. */}
+      <MetricTile label="Run" value={runText} tone={runTone} flash />
+      <MetricTile label="Health" value={`${health.level || "warn"}: ${health.state || "unknown"}`} tone={healthTone} flash />
+      <MetricTile label="Encoder" value={stream.encoder || "auto"} flash />
+      <MetricTile label="GPU" value={gpu ? (gpu.available ? gpu.level || "online" : "offline") : "checking"} tone={gpuTone} flash />
+      <MetricTile label="ArangoDB" value={arango ? (arango.connected ? "connected" : "offline") : "checking"} tone={arangoTone} flash />
+      <MetricTile label="Updated" value={status ? fmtClock(status.server_time) : <span className="skeleton">00:00:00 XX</span>} />
     </section>
+    </>
   );
 }
 
@@ -621,13 +779,18 @@ export function CommandHeader({
   // With auto-schedule on, Stop parks the cockpit rather than killing it, so the
   // banner has to say "standby" instead of claiming the stream is down for good.
   const mode = standbyMode(status, operatorStopped);
+  const startLabel = pendingAction === "start" ? "Starting" : operatorStopped ? "Resume" : "Start";
+  const restartLabel = pendingAction === "restart" ? "Restarting" : "Restart";
+  const stopLabel = pendingAction === "stop" ? "Stopping" : "Stop";
 
   return (
     <header className="commandHeader">
       <div>
         <p className="kicker">Obbystreams</p>
         <h1>Stream Control Center</h1>
-        <p className="monoLine">{hlsUrl}</p>
+        <p className="monoLine">
+          <UrlChip url={hlsUrl} label="public HLS URL" />
+        </p>
         {mode === "standby" && (
           <p className="standbyBanner" role="status">
             {standbyBannerText(schedule)}
@@ -651,19 +814,42 @@ export function CommandHeader({
             <span>Auto-schedule</span>
           </label>
         )}
+        {/* Icon + label. Below `sm` the label is visually hidden and the row
+            stays one line — four stacked full-width buttons used to eat ~200px
+            of a phone screen before any data. aria-label mirrors the visible
+            word so the accessible name is unchanged either way. */}
         <button
           type="button"
           className={operatorStopped ? "resumeButton" : undefined}
           disabled={busy || Boolean(proc.managed)}
+          aria-label={startLabel}
+          title={startLabel}
           onClick={() => onStreamAction("start")}
         >
-          {pendingAction === "start" ? "Starting" : operatorStopped ? "Resume" : "Start"}
+          <PlayerIcon name="play" />
+          <span className="actionLabel">{startLabel}</span>
         </button>
-        <button type="button" className="secondary" disabled={busy} onClick={() => onStreamAction("restart")}>
-          {pendingAction === "restart" ? "Restarting" : "Restart"}
+        <button
+          type="button"
+          className="secondary"
+          disabled={busy}
+          aria-label={restartLabel}
+          title={restartLabel}
+          onClick={() => onStreamAction("restart")}
+        >
+          <PlayerIcon name="retry" />
+          <span className="actionLabel">{restartLabel}</span>
         </button>
-        <button type="button" className="danger" disabled={busy || !canStop} onClick={() => onStreamAction("stop")}>
-          {pendingAction === "stop" ? "Stopping" : "Stop"}
+        <button
+          type="button"
+          className="danger"
+          disabled={busy || !canStop}
+          aria-label={stopLabel}
+          title={stopLabel}
+          onClick={() => onStreamAction("stop")}
+        >
+          <PlayerIcon name="stop" />
+          <span className="actionLabel">{stopLabel}</span>
         </button>
       </div>
     </header>
@@ -1287,7 +1473,7 @@ function ProcessPanel({
   onSetEncoder: (encoder: EncoderMode) => Promise<void>;
 }) {
   return (
-    <Panel title="Process" meta={<Badge tone={proc?.managed ? "ok" : "warn"}>{proc?.managed ? "runtime" : "stopped"}</Badge>}>
+    <Panel title="Process" meta={<Badge tone={proc?.managed ? "ok" : "warn"}>{proc?.managed ? "runtime" : "stopped"}</Badge>} panelId="process" collapsible>
       <EncoderControl encoder={encoder} pending={pendingEncoder} onSetEncoder={onSetEncoder} />
       <div className="metricGrid two">
         <MetricTile label="PID" value={proc?.pid || "n/a"} />
@@ -1371,7 +1557,7 @@ function GpuPanel({ gpu }: { gpu: GpuTelemetryPayload | null }) {
   ].filter(Boolean);
 
   return (
-    <Panel title="NVIDIA SMI" meta={<Badge tone={gpu?.available ? toneFromLevel(gpu.level) : gpu ? "bad" : "neutral"}>{gpu?.checked_at ? `${fmtClock(gpu.checked_at)} | 5s` : "5s"}</Badge>} className="gpuPanel">
+    <Panel title="NVIDIA SMI" meta={<Badge tone={gpu?.available ? toneFromLevel(gpu.level) : gpu ? "bad" : "neutral"}>{gpu?.checked_at ? `${fmtClock(gpu.checked_at)} | 5s` : "5s"}</Badge>} className="gpuPanel" panelId="gpu" collapsible defaultOpen={!isNarrowViewport()}>
       <p className="panelMessage">{gpu?.message || "Waiting for GPU telemetry."}</p>
       <div className="metricGrid two">
         <MetricTile label="Driver" value={summary.driver_version || "n/a"} />
@@ -1492,7 +1678,9 @@ export function SourcesPanel({
                   <Badge>{source.viewer_count || 0} watching</Badge>
                 </div>
               </div>
-              <p>{url}</p>
+              <p>
+                <UrlChip url={url} label="source URL" />
+              </p>
               {source.health_message && <p className="sourceMeta">{source.health_message}</p>}
               <div className="linkActions">
                 <a className="buttonLink compactButton" href={url} target="_blank" rel="noreferrer">
@@ -1501,20 +1689,48 @@ export function SourcesPanel({
                 <button type="button" className="compactButton streamNow" disabled={pending || source.preferred} onClick={() => onActivate(source)}>
                   {source.preferred ? "Active" : "Switch"}
                 </button>
-                <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onLock(source, !source.locked)}>
-                  {source.locked ? "Unlock" : "Lock"}
-                </button>
-                {recoverable && (
-                  <button type="button" className="secondary compactButton" disabled={pending} onClick={() => onRecover(source)}>
-                    Recover
-                  </button>
-                )}
-                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onBlock(source)} title="Blacklist this source so it never reappears">
-                  Block
-                </button>
-                <button type="button" className="danger compactButton" disabled={pending} onClick={() => onRemove(url)}>
-                  Remove
-                </button>
+                {/* Six buttons per card wrapped onto two rows and put two
+                    destructive actions one mis-tap away. Open and Switch are the
+                    everyday pair; the rest live behind More. */}
+                <ModernDropdown
+                  className="sourceMenu"
+                  label="Source actions"
+                  buttonLabel="More"
+                  mode="menu"
+                  disabled={pending}
+                  items={[
+                    {
+                      value: "lock",
+                      label: source.locked ? "Unlock" : "Lock",
+                      description: source.locked ? "Allow automatic switching again" : "Pin this source against auto-switching",
+                      onSelect: () => void onLock(source, !source.locked),
+                    },
+                    ...(recoverable
+                      ? [
+                          {
+                            value: "recover" as const,
+                            label: "Recover",
+                            description: "Re-acquire the sour-signal link",
+                            onSelect: () => void onRecover(source),
+                          },
+                        ]
+                      : []),
+                    {
+                      value: "block",
+                      label: "Block",
+                      description: "Blacklist this source so it never reappears",
+                      tone: "danger" as const,
+                      onSelect: () => void onBlock(source),
+                    },
+                    {
+                      value: "remove",
+                      label: "Remove",
+                      description: "Delete it from the source list",
+                      tone: "danger" as const,
+                      onSelect: () => void onRemove(url),
+                    },
+                  ]}
+                />
               </div>
             </div>
             );
@@ -1544,7 +1760,7 @@ function PrivateIptvPanel({
   const candidates = runtime?.candidate_count || 0;
   const entries = runtime?.playlist_entries || 0;
   return (
-    <Panel title="Private IPTV Automation" meta={<Badge tone={tone}>{state}</Badge>} className="linksPanel privateIptvPanel">
+    <Panel title="Private IPTV Automation" meta={<Badge tone={tone}>{state}</Badge>} className="linksPanel privateIptvPanel" panelId="privateIptv" collapsible>
       <div className="automationSummary">
         <span>{runtime?.enabled ? "Enabled" : "Disabled"}</span>
         <span>{accepted}/{candidates} accepted</span>
@@ -1632,7 +1848,7 @@ export function PublicStreamsPanel({
   }
 
   return (
-    <Panel title="Public Streams" meta={<Badge>{sources.length} available</Badge>} className="linksPanel">
+    <Panel title="Public Streams" meta={<Badge>{sources.length} available</Badge>} className="linksPanel" panelId="publicStreams" collapsible>
       <form className="addLink scrapeForm" onSubmit={submitScrape}>
         <input
           value={scrapeUrl}
@@ -1667,8 +1883,14 @@ export function PublicStreamsPanel({
                   <Badge>{source.enabled === false ? "disabled" : "proxied"}</Badge>
                 </div>
               </div>
-              <p>{source.url}</p>
-              {source.playback_url && <p className="sourceMeta">Playback {source.playback_url}</p>}
+              <p>
+                <UrlChip url={source.url || "n/a"} label="source URL" />
+              </p>
+              {source.playback_url && (
+                <p className="sourceMeta">
+                  Playback <UrlChip url={source.playback_url} label="playback URL" />
+                </p>
+              )}
               <div className="linkActions">
                 <a className="buttonLink compactButton" href={source.playback_url || source.url} target="_blank" rel="noreferrer">
                   Test
@@ -1700,7 +1922,7 @@ export function BlacklistPanel({
   onUnblock: (entry: BlacklistEntry) => Promise<void>;
 }) {
   return (
-    <Panel title="Blacklist" meta={<Badge tone={entries.length ? "warn" : "neutral"}>{entries.length} blocked</Badge>} className="linksPanel">
+    <Panel title="Blacklist" meta={<Badge tone={entries.length ? "warn" : "neutral"}>{entries.length} blocked</Badge>} className="linksPanel" panelId="blacklist" collapsible defaultOpen={!isNarrowViewport()}>
       <p className="panelHint">Blocked sources never reappear from scraping and are hidden from viewers until unblocked.</p>
       <div className="linksList">
         {entries.length ? (
@@ -1713,7 +1935,11 @@ export function BlacklistPanel({
                   <strong>{primary}</strong>
                   {entry.reason && <Badge tone="neutral">{entry.reason}</Badge>}
                 </div>
-                {entry.url && <p>{entry.url}</p>}
+                {entry.url && (
+                  <p>
+                    <UrlChip url={entry.url} label="blocked URL" />
+                  </p>
+                )}
                 {entry.channel && entry.channel !== primary && <p className="sourceMeta">Channel {entry.channel}</p>}
                 <div className="linkActions">
                   <button type="button" className="compactButton streamNow" disabled={pending} onClick={() => onUnblock(entry)}>
@@ -1743,7 +1969,7 @@ function TelemetryPanel({
   logs: LogEntry[];
 }) {
   return (
-    <Panel title="Telemetry" meta={<Badge>ffmpeg + hls</Badge>} className="telemetryPanel">
+    <Panel title="Telemetry" meta={<Badge>ffmpeg + hls</Badge>} className="telemetryPanel" panelId="telemetry" collapsible defaultOpen={!isNarrowViewport()}>
       <div className="metricGrid three">
         <MetricTile label="Media sequence" value={hls?.media_sequence || "n/a"} />
         <MetricTile label="Target duration" value={hls?.target_duration ? `${hls.target_duration}s` : "n/a"} />
@@ -1788,10 +2014,27 @@ function TelemetryPanel({
 
 function FeedBlock({ title, empty, children }: { title: string; empty: string; children: ReactNode }) {
   const hasChildren = Array.isArray(children) ? children.length > 0 : Boolean(children);
+  const [expanded, setExpanded] = useState(false);
   return (
     <div className="subsection">
-      <h3>{title}</h3>
-      <div className="feedBox">{hasChildren ? children : <EmptyLine>{empty}</EmptyLine>}</div>
+      <div className="feedHead">
+        <h3>{title}</h3>
+        {hasChildren ? (
+          <button
+            type="button"
+            className="secondary compactButton feedExpand"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((open) => !open)}
+          >
+            {expanded ? "Collapse" : "Expand"}
+          </button>
+        ) : null}
+      </div>
+      {/* .feedScroll carries the fade mask that signals there is more below —
+         the box used to just clip mid-sentence with no affordance. */}
+      <div className={`feedScroll${expanded ? " isExpanded" : ""}`}>
+        <div className="feedBox">{hasChildren ? children : <EmptyLine>{empty}</EmptyLine>}</div>
+      </div>
     </div>
   );
 }
@@ -1800,10 +2043,10 @@ function FooterStatus({ hls, sessionState }: { hls?: HlsMetrics; sessionState: s
   return (
     <footer className="footerStatus">
       <span className="inlineMetric">
-        Dashboard HLS <strong>{hls?.dashboard_hls_url || "/hls/ufc.m3u8"}</strong>
+        Dashboard HLS <UrlChip url={hls?.dashboard_hls_url || "/hls/ufc.m3u8"} label="dashboard HLS URL" />
       </span>
       <span className="inlineMetric">
-        Public HLS <strong>{hls?.public_hls_url || "n/a"}</strong>
+        Public HLS <UrlChip url={hls?.public_hls_url || "n/a"} label="public HLS URL" />
       </span>
       <span className="inlineMetric">
         Session <strong>{sessionState}</strong>
@@ -2223,7 +2466,12 @@ export default function App() {
       <CommandHeader status={status} pendingAction={pendingAction} onStreamAction={streamAction} onToggleSchedule={toggleSchedule} />
       <StatusStrip status={status} gpu={gpu} arango={arango} />
       <SchedulePanel schedule={status?.schedule} pending={pendingSchedule} onTest={sendScheduleTest} onComingUp={sendComingUp} />
-      <section className="primaryGrid">
+      {/* Stage: player, vitals rail and GPU are three direct children of one
+          12-column grid, so their spans can be retuned per breakpoint. GpuPanel
+          is deliberately NOT inside the rail — it is the tallest of the vitals
+          panels, and pairing it with the rail is what used to leave ~2000px of
+          dead column beside a short player. At 3xl it becomes a third column. */}
+      <section className="stageRow">
         <LivePlayer
           proc={proc}
           hls={hls}
@@ -2244,14 +2492,19 @@ export default function App() {
             pendingEncoder={pendingEncoder}
             onSetEncoder={setEncoderMode}
           />
-          <GpuPanel gpu={gpu} />
         </aside>
+        <GpuPanel gpu={gpu} />
       </section>
-      <section className="lowerGrid">
+      {/* The four short source panels tile 2-up / 3-up / 4-up as width allows. */}
+      <section className="sourcesRow">
         <SourcesPanel sources={configuredSources} pending={pendingLinks} onAdd={addLink} onRemove={removeLink} onActivate={activateSource} onLock={lockSource} onRecover={recoverSource} onBlock={blockSource} />
         <PrivateIptvPanel runtime={status?.private_iptv} pending={pendingPrivateIptv} onRefresh={refreshPrivateIptv} onControl={controlPrivateIptv} />
         <PublicStreamsPanel sources={publicStreams} pending={pendingLinks} onAdd={addPublicStream} onRemove={removePublicStream} onScrape={scrapeLinks} onBlock={blockSource} />
         <BlacklistPanel entries={blacklist} pending={pendingLinks} onUnblock={unblockSource} />
+      </section>
+      {/* Telemetry is the densest panel in the cockpit, so it gets the full
+          width and its feeds sit side by side instead of stacking. */}
+      <section className="telemetryRow">
         <TelemetryPanel hls={hls} errors={errors} events={status?.events || []} logs={status?.logs || []} />
       </section>
       <FooterStatus hls={hls} sessionState={sessionState} />

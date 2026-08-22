@@ -58,6 +58,16 @@ Use focused checks during development, but include the full command list in PR v
 - Prefer existing formatting and API helpers in `frontend/src/api.ts`, `frontend/src/format.ts`, and `frontend/src/types.ts`.
 - Use Tailwind and the local design tokens already in `frontend/src/styles.css`; do not introduce a second component framework.
 - Use purple as the accent color and avoid reverting to green status-heavy theming.
+- Use the surface/ink/status tokens, the fluid `--text-*` scale, and the
+  `--gutter`/`--pad-panel` rhythm rather than one-off hexes and ad-hoc spacing.
+- Media queries are mobile-first `min-width` only; do not add `max-width` blocks,
+  and do not redefine the `sm`/`md`/`lg`/`xl` breakpoints. See `docs/frontend.md`.
+- Fonts are self-hosted from `frontend/src/fonts/`. Never add a font CDN or any
+  other external request; `npm run test:responsive` fails the build if one appears.
+- Run `npm run test:responsive` for any layout or styling change, and ratchet its
+  `HEIGHT_BUDGET` down when the layout gets tighter.
+- Deploying the frontend must never restart `obbystreams` — that kills the live
+  ffmpeg encode and drops every viewer. `npm run build` alone is sufficient.
 
 ## Documentation Guidelines
 

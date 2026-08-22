@@ -1,5 +1,58 @@
 @import "tailwindcss";
 
+/* ──────────────────────────────────────────────────────────────────────────
+   Self-hosted variable fonts.
+
+   Vendored woff2 (latin subset, wght axis) live in ./fonts/. The url() below
+   is RELATIVE on purpose: Vite treats it as an asset import, hashes it into
+   static/assets/ and rewrites the reference to /static/assets/... — correct in
+   both dev and prod under `base: "/static/"`. Never reference a font CDN; this
+   host has been bitten by Cloudflare Fonts rewriting before.
+
+   `font-weight: 100 900` (not the deprecated format("woff2-variations")) is
+   what makes these variable.
+   ────────────────────────────────────────────────────────────────────────── */
+@font-face {
+  font-family: "InterVar";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./fonts/inter-latin-wght-normal.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+/* Metrics-matched fallback so font-display: swap causes no reflow. */
+@font-face {
+  font-family: "InterVar Fallback";
+  src: local("Arial"), local("Helvetica"), local("Liberation Sans"), local("DejaVu Sans");
+  ascent-override: 90.44%;
+  descent-override: 22.52%;
+  line-gap-override: 0%;
+  size-adjust: 107.12%;
+}
+
+@font-face {
+  font-family: "JetBrainsMonoVar";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("./fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212,
+    U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "JetBrainsMonoVar Fallback";
+  src: local("Liberation Mono"), local("DejaVu Sans Mono"), local("Courier New");
+  ascent-override: 102%;
+  descent-override: 30%;
+  line-gap-override: 0%;
+  size-adjust: 100%;
+}
+
 @theme {
   --color-obby-bg: #08070d;
   --color-obby-bg-soft: #0d0b14;
@@ -20,6 +73,83 @@
   --shadow-obby: 0 18px 48px rgba(0, 0, 0, 0.34);
 }
 
+/* `static` so tokens consumed only through raw var() are still emitted. */
+@theme static {
+  /* ── elevation ladder: every former one-off hex, named ────────────────── */
+  --color-obby-surface-0: #08070d; /* page                                  */
+  --color-obby-surface-1: #0b0910; /* recessed: inputs, feed boxes, rails   */
+  --color-obby-surface-2: #100d17; /* floating: dropdowns, popovers, footer */
+  --color-obby-surface-3: #15111d; /* chips: badges, inline metrics         */
+  --color-obby-surface-4: #171220; /* raised control: secondary buttons     */
+  --color-obby-surface-5: #191324; /* interactive control: icon buttons     */
+  --color-obby-surface-6: #22172f; /* control hover                          */
+
+  /* ── semantic ink ─────────────────────────────────────────────────────── */
+  --color-obby-text-soft: #ddd6ec;
+  --color-obby-ink-on-accent: #12051d;
+  --color-obby-ink-on-bad: #1c0508;
+
+  /* ── status families ──────────────────────────────────────────────────── */
+  --color-obby-bad-fill: #ff9aa5;
+  --color-obby-bad-strong: #ffb3be;
+  --color-obby-bad-surface: #2a1117;
+  --color-obby-bad-border: #7f1d1d;
+  --color-obby-warn-strong: #fcd34d;
+  --color-obby-warn-border: #78350f;
+  --color-obby-good: #86efac;
+  --color-obby-good-border: #15803d;
+  --color-obby-signal-green: #73f0a8;
+
+  /* ── fluid type scale ─────────────────────────────────────────────────── */
+  --text-micro: clamp(0.6875rem, 0.665rem + 0.11vw, 0.75rem);
+  --text-micro--line-height: 1.25;
+  --text-micro--letter-spacing: 0.045em;
+  --text-meta: clamp(0.75rem, 0.72rem + 0.15vw, 0.8125rem);
+  --text-meta--line-height: 1.35;
+  --text-body: clamp(0.8125rem, 0.78rem + 0.18vw, 0.9375rem);
+  --text-body--line-height: 1.45;
+  --text-h2: clamp(0.9375rem, 0.89rem + 0.24vw, 1.0625rem);
+  --text-h2--line-height: 1.2;
+  --text-h1: clamp(1.5rem, 1.05rem + 2.2vw, 2.5rem);
+  --text-h1--line-height: 1.02;
+  --text-value: clamp(1rem, 0.9rem + 0.45vw, 1.3125rem);
+  --text-value--line-height: 1.1;
+  --text-value-xl: clamp(1.5rem, 1.1rem + 1.6vw, 2.375rem);
+  --text-value-xl--line-height: 1;
+
+  /* ── fonts ────────────────────────────────────────────────────────────── */
+  --font-sans: "InterVar", "InterVar Fallback", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+  --font-mono: "JetBrainsMonoVar", "JetBrainsMonoVar Fallback", ui-monospace,
+    SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* ── extra breakpoints ONLY ───────────────────────────────────────────────
+     Do not redefine sm/md/lg/xl: .statusStrip relies on `lg:` and .rateBadge on
+     `sm:col-span-2`, so redefining them silently changes behaviour.            */
+  --breakpoint-3xl: 100rem; /* 1600 */
+  --breakpoint-4xl: 120rem; /* 1920 */
+  --breakpoint-5xl: 160rem; /* 2560 */
+
+  --ease-obby: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+:root {
+  /* One gutter, one panel pad, one header height — fluid, so several of the old
+     per-breakpoint padding/font-size overrides are no longer needed at all. */
+  --gutter: clamp(0.5rem, 0.35rem + 0.7vw, 0.875rem);
+  --pad-panel: clamp(0.625rem, 0.5rem + 0.6vw, 1rem);
+  --pad-panel-y: clamp(0.5rem, 0.4rem + 0.4vw, 0.75rem);
+  --panel-header-h: clamp(2.75rem, 2.4rem + 1vw, 3.375rem);
+  --feed-max: 15rem;
+  --container-max: 1680px;
+
+  --radius-obby-sm: 0.375rem;
+  --radius-obby-md: 0.5rem;
+  --radius-obby-lg: 0.75rem;
+
+  --color-obby-focus-ring: rgba(168, 85, 247, 0.22);
+}
+
 @layer base {
   * {
     @apply box-border;
@@ -37,7 +167,12 @@
     overflow-x: hidden;
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
-    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-family: var(--font-sans);
+    font-optical-sizing: auto;
+    /* No faux-bold from the fallback face, and real tabular figures so the
+       2.5s status poll stops making every number jitter. */
+    font-synthesis: none;
+    font-variant-numeric: tabular-nums;
     background:
       linear-gradient(180deg, rgba(168, 85, 247, 0.12), transparent 320px),
       linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
@@ -59,24 +194,27 @@
   }
 
   input {
-    @apply min-h-11 w-full rounded-lg border border-obby-line-strong bg-[#0b0910] px-3.5 py-3 text-obby-text outline-none;
+    @apply min-h-11 w-full rounded-lg border border-obby-line-strong bg-obby-surface-1 px-3.5 py-3 text-obby-text outline-none;
   }
 
   input:focus {
     @apply border-obby-accent;
-    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
+    box-shadow: 0 0 0 3px var(--color-obby-focus-ring);
   }
 }
 
 @layer components {
   button,
   .buttonLink {
-    @apply inline-flex min-h-[42px] cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-obby-accent bg-obby-accent-strong px-4 py-2.5 font-extrabold text-[#12051d] no-underline transition;
+    @apply inline-flex min-h-[42px] cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-obby-accent bg-obby-accent-strong px-4 py-2.5 font-extrabold text-obby-ink-on-accent no-underline transition;
   }
 
+  /* A brightness shift instead of a translate: the old global -translate-y-px
+     nudged every button in the cockpit on hover, which reads as jitter. */
   button:hover:not(:disabled),
   .buttonLink:hover {
-    @apply -translate-y-px;
+    filter: brightness(1.08);
+    border-color: var(--color-obby-accent);
   }
 
   button:disabled {
@@ -85,11 +223,11 @@
 
   button.secondary,
   .buttonLink {
-    @apply border-obby-line-strong bg-[#181222] text-obby-text;
+    @apply border-obby-line-strong bg-obby-surface-4 text-obby-text;
   }
 
   button.danger {
-    @apply border-obby-bad bg-[#ff9aa5] text-[#1c0508];
+    @apply border-obby-bad bg-obby-bad-fill text-obby-ink-on-bad;
   }
 
   button.streamNow {
@@ -100,24 +238,31 @@
     @apply bg-obby-accent/35;
   }
 
+  /* One real focus ring for the whole app. :where() keeps specificity at 0 so
+     component rules can still restyle, but nothing removes it any more. */
+  :where(button, a, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-obby-accent-strong);
+    outline-offset: 2px;
+  }
+
   .muted {
     @apply text-obby-muted;
   }
 
   .kicker {
-    @apply text-xs font-black uppercase tracking-normal text-obby-accent;
+    @apply font-black uppercase text-obby-accent text-micro;
   }
 
   .loginShell {
-    @apply grid min-h-dvh place-items-center p-6;
-    padding-left: max(1.5rem, env(safe-area-inset-left));
-    padding-right: max(1.5rem, env(safe-area-inset-right));
-    padding-top: max(1.5rem, env(safe-area-inset-top));
-    padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+    @apply grid min-h-dvh place-items-center p-3 sm:p-6;
+    padding-left: max(0.75rem, env(safe-area-inset-left));
+    padding-right: max(0.75rem, env(safe-area-inset-right));
+    padding-top: max(0.75rem, env(safe-area-inset-top));
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
   }
 
   .loginPanel {
-    @apply w-full max-w-[520px] rounded-lg border border-obby-line bg-obby-panel/95 p-7 shadow-obby;
+    @apply w-full max-w-[520px] rounded-lg border border-obby-line bg-obby-panel/95 p-4 shadow-obby sm:p-7;
   }
 
   .brandMark {
@@ -142,7 +287,7 @@
   }
 
   .loginPanel h1 {
-    @apply mt-1.5 text-[2.4rem] leading-none;
+    @apply mt-1.5 text-h1;
   }
 
   .loginPanel .muted {
@@ -150,7 +295,8 @@
   }
 
   .loginForm {
-    @apply mt-5 grid grid-cols-[1fr_auto] gap-2.5;
+    @apply mt-5 grid grid-cols-1 sm:grid-cols-[1fr_auto];
+    gap: var(--gutter);
   }
 
   .formError {
@@ -158,15 +304,18 @@
   }
 
   .appShell {
-    @apply mx-auto w-full max-w-[1680px] px-3 py-3.5;
-    padding-left: max(0.75rem, env(safe-area-inset-left));
-    padding-right: max(0.75rem, env(safe-area-inset-right));
-    padding-bottom: max(0.875rem, env(safe-area-inset-bottom));
+    @apply mx-auto w-full;
+    max-width: var(--container-max);
+    padding: var(--gutter);
+    padding-left: max(var(--gutter), env(safe-area-inset-left));
+    padding-right: max(var(--gutter), env(safe-area-inset-right));
+    padding-bottom: max(var(--gutter), env(safe-area-inset-bottom));
   }
 
   .commandHeader {
-    @apply flex min-h-[120px] items-end justify-between gap-5 rounded-lg border border-obby-line p-4 shadow-obby;
-    background: linear-gradient(180deg, #171220, #100d17);
+    @apply flex flex-col items-stretch gap-3 rounded-lg border border-obby-line shadow-obby lg:flex-row lg:items-end lg:justify-between lg:gap-5;
+    padding: var(--pad-panel);
+    background: linear-gradient(180deg, var(--color-obby-surface-4), var(--color-obby-surface-2));
   }
 
   .commandHeader > div:first-child {
@@ -174,45 +323,93 @@
   }
 
   .commandHeader h1 {
-    @apply mt-2 text-[2.45rem] leading-none;
+    @apply mt-2 text-h1;
   }
 
   .monoLine {
-    @apply mt-2.5 max-w-full break-words font-mono text-[0.82rem] text-obby-muted;
+    @apply mt-2.5 max-w-full break-words font-mono text-obby-muted text-meta;
     overflow-wrap: anywhere;
   }
 
   .stoppedBanner {
-    @apply mt-2.5 inline-flex items-center gap-1 rounded-md border border-obby-line px-2.5 py-1 text-[0.8rem] font-semibold;
-    color: #fca5a5;
-    border-color: #7f1d1d;
+    @apply mt-2.5 inline-flex items-center gap-1 rounded-md border px-2.5 py-1 font-semibold text-meta;
+    color: var(--color-obby-bad-fill);
+    border-color: var(--color-obby-bad-border);
     background: rgba(127, 29, 29, 0.18);
   }
 
   /* Auto-schedule standby: parked, not dead — amber rather than the red Stop. */
   .standbyBanner {
-    @apply mt-2.5 inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-[0.8rem] font-semibold;
-    color: #fcd34d;
-    border-color: #78350f;
+    @apply mt-2.5 inline-flex items-center gap-1 rounded-md border px-2.5 py-1 font-semibold text-meta;
+    color: var(--color-obby-warn-strong);
+    border-color: var(--color-obby-warn-border);
     background: rgba(120, 53, 15, 0.18);
   }
 
+  /* One row, never stacked. The Auto-schedule toggle takes its own full-width
+     line above so it isn't competing with the three actions for space. */
   .commandActions {
-    @apply flex min-w-0 flex-wrap items-center justify-end gap-2;
+    @apply flex min-w-0 flex-wrap items-center justify-end gap-1.5 sm:gap-2;
   }
 
+  .commandActions button {
+    @apply min-w-0 flex-1 basis-0 px-2 lg:flex-none lg:basis-auto lg:px-4;
+  }
+
+  .commandActions .scheduleToggle {
+    @apply order-first shrink-0 basis-full lg:order-none lg:basis-auto;
+  }
+
+  .commandActions .actionLabel {
+    @apply overflow-hidden whitespace-nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .commandActions .playerIcon {
+    @apply h-4 w-4 shrink-0;
+  }
+
+  /* Only the very narrowest widths go icon-only. At 320px three labelled
+     buttons still fit (~64px each), so hiding the words there was needless —
+     the accessible name lives on aria-label either way. */
+  @media (width < 22rem) {
+    .commandActions .actionLabel {
+      @apply sr-only;
+    }
+  }
+
+  @media (width < 40rem) {
+    .commandActions button {
+      min-width: 44px;
+    }
+  }
+
+  /* From lg the icons are redundant next to full labels. */
+  @media (width >= 64rem) {
+    .commandActions .playerIcon {
+      @apply hidden;
+    }
+  }
+
+  /* The one place a hover lift still reads as an affordance. */
+  .commandActions button:hover:not(:disabled) {
+    translate: 0 -1px;
+  }
+
+  /* min-h-9: the label is the real tap target for its checkbox, so it has to
+     clear the 36px touch minimum on its own. */
   .scheduleToggle {
-    @apply inline-flex cursor-pointer select-none items-center gap-1.5 rounded-md border border-obby-line px-2.5 py-1 text-[0.8rem] font-semibold text-obby-muted;
+    @apply inline-flex min-h-9 cursor-pointer select-none items-center gap-1.5 rounded-md border border-obby-line px-2.5 py-1 font-semibold text-obby-muted text-meta;
   }
 
   .scheduleToggle:has(input:checked) {
-    color: #86efac;
-    border-color: #15803d;
+    color: var(--color-obby-good);
+    border-color: var(--color-obby-good-border);
     background: rgba(21, 128, 61, 0.14);
   }
 
   .scheduleToggle input {
-    @apply h-3.5 w-3.5 cursor-pointer accent-emerald-500;
+    @apply h-4 w-4 min-h-0 cursor-pointer accent-emerald-500;
   }
 
   .schedulePanel .scheduleBody {
@@ -220,15 +417,15 @@
   }
 
   .scheduleEventName {
-    @apply text-[0.95rem] font-semibold text-obby-text;
+    @apply font-semibold text-obby-text text-h2;
   }
 
   .scheduleCountdown {
-    @apply text-[0.85rem];
+    @apply text-meta;
   }
 
   .scheduleCountdown strong {
-    @apply text-[1.35rem] font-bold tabular-nums text-obby-text;
+    @apply block font-bold tabular-nums text-obby-text text-value;
   }
 
   .scheduleCards {
@@ -236,7 +433,7 @@
   }
 
   .scheduleCards li {
-    @apply grid grid-cols-[1fr_auto_auto] items-center gap-2 rounded-md border border-obby-line px-2 py-1 text-[0.8rem];
+    @apply grid grid-cols-[1fr_auto_auto] items-center gap-2 rounded-md border border-obby-line px-2 py-1 text-meta;
   }
 
   .scheduleCards li.cardDone {
@@ -252,27 +449,29 @@
   }
 
   .scheduleResult {
-    @apply text-[0.85rem] font-semibold;
-    color: #fcd34d;
+    @apply font-semibold text-meta;
+    color: var(--color-obby-warn-strong);
   }
 
   .scheduleReason {
-    @apply text-[0.75rem];
+    @apply text-micro;
+    letter-spacing: normal;
   }
 
   .sourceAcquisition {
-    @apply text-[0.78rem] leading-snug;
+    @apply leading-snug text-meta;
   }
 
   .sourceAcquisition.warn {
     @apply rounded-md px-2 py-1.5;
     border: 1px solid rgba(245, 166, 35, 0.35);
     background: rgba(245, 166, 35, 0.1);
-    color: #fcd34d;
+    color: var(--color-obby-warn-strong);
   }
 
   .sourceRejects {
-    @apply mt-1 space-y-0.5 text-[0.7rem];
+    @apply mt-1 space-y-0.5 text-micro;
+    letter-spacing: normal;
   }
 
   .sourceRejects .rejectTitle {
@@ -280,19 +479,66 @@
   }
 
   .resumeButton {
-    border-color: #15803d !important;
+    border-color: var(--color-obby-good-border) !important;
     background: rgba(21, 128, 61, 0.18) !important;
-    color: #86efac !important;
+    color: var(--color-obby-good) !important;
   }
 
   .panelHint {
-    @apply mb-2 text-[0.8rem] text-obby-muted;
+    @apply mb-2 text-obby-muted text-meta;
   }
 
+  .statusSentinel {
+    @apply h-px;
+  }
+
+  /* Sticky at every width now, not just lg: the condensed row is ~40px, which a
+     320px phone can afford, and losing stream state mid-scroll was the point. */
   .statusStrip {
-    @apply mt-2.5 grid gap-2.5 lg:sticky lg:top-0 lg:z-20 lg:py-2;
+    @apply sticky top-0 z-20 grid;
+    gap: var(--gutter);
+    padding-block: var(--pad-panel-y);
     grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
-    background: var(--color-obby-bg);
+    background: var(--color-obby-surface-0);
+    transition: padding 180ms var(--ease-obby);
+  }
+
+  /* Condensed: keep the encode rate, Run and Health; drop the rest. */
+  .statusStrip.isCondensed {
+    @apply border-b border-obby-line;
+    grid-template-columns: auto auto auto 1fr;
+    box-shadow: 0 8px 24px -12px rgb(0 0 0 / 0.7);
+  }
+
+  .statusStrip.isCondensed .metricTile,
+  .statusStrip.isCondensed .rateBadge {
+    @apply min-h-0 py-1;
+  }
+
+  /* The badge is col-span-full / sm:col-span-2 when expanded; condensed it has
+     to sit in a single column or it takes the whole row to itself. */
+  .statusStrip.isCondensed .rateBadge {
+    @apply col-span-1! gap-2 border;
+  }
+
+  .statusStrip.isCondensed .metricTile {
+    @apply flex items-baseline gap-2;
+  }
+
+  .statusStrip.isCondensed .metricTile strong {
+    @apply mt-0;
+  }
+
+  .statusStrip.isCondensed .metricTile:nth-child(n + 5) {
+    @apply hidden;
+  }
+
+  .statusStrip.isCondensed .rateValue {
+    @apply text-value;
+  }
+
+  .statusStrip.isCondensed .rateLag {
+    @apply hidden sm:block;
   }
 
   .panel,
@@ -308,19 +554,47 @@
   }
 
   .panelHeader {
-    @apply flex min-h-14 items-center justify-between gap-3 border-b border-obby-line px-3 py-3;
+    @apply flex flex-col items-start justify-between gap-2 border-b border-obby-line sm:flex-row sm:items-center sm:gap-3;
+    min-block-size: var(--panel-header-h);
+    padding: var(--pad-panel-y) var(--pad-panel);
   }
 
   .panelHeader h2 {
-    @apply text-base font-bold;
+    @apply font-bold text-h2;
+    letter-spacing: -0.01em;
+  }
+
+  /* Collapse control: visually a bare title, but a real 36px tap target — a
+     bare `p-0` button here was only 18px tall and failed the tap-target gate. */
+  .panelToggle {
+    @apply -my-1 flex min-h-9 min-w-0 items-center gap-2 rounded-md border-0 bg-transparent px-1 py-1 text-left text-obby-text shadow-none;
+    margin-inline-start: -0.25rem;
+  }
+
+  .panelToggle:hover:not(:disabled) {
+    @apply text-obby-accent-strong;
+    filter: none;
+  }
+
+  .panelChevron {
+    @apply h-2 w-2 shrink-0 rotate-45 border-b-2 border-r-2 border-obby-accent-strong transition-transform;
+    transform: translateY(-1px) rotate(45deg);
+  }
+
+  .panelToggle[aria-expanded="false"] .panelChevron {
+    transform: translateX(-1px) rotate(-45deg);
+  }
+
+  .isCollapsed .panelHeader {
+    @apply border-b-0;
   }
 
   .panelMeta {
-    @apply flex items-center gap-2;
+    @apply flex w-full items-center justify-start gap-2 sm:w-auto;
   }
 
   .badge {
-    @apply inline-flex min-h-7 items-center whitespace-nowrap rounded-lg border border-obby-line-strong bg-[#15111d] px-2.5 py-1 text-xs font-extrabold text-obby-muted;
+    @apply inline-flex min-h-7 items-center whitespace-nowrap rounded-lg border border-obby-line-strong bg-obby-surface-3 px-2.5 py-1 font-extrabold text-obby-muted text-micro;
   }
 
   .tone-ok {
@@ -342,26 +616,33 @@
   }
 
   .metricTile {
-    @apply min-h-[74px] min-w-0 overflow-hidden bg-obby-tile px-3 py-2.5;
+    @apply min-w-0 overflow-hidden bg-obby-tile;
+    padding: var(--pad-panel-y) var(--pad-panel);
   }
 
+  /* Hierarchy inversion: the label goes down and dim, the value goes up and
+     near-white. This is what makes a wall of tiles scannable. */
   .metricTile span {
-    @apply block text-xs text-obby-muted;
+    @apply block font-bold uppercase text-obby-dim text-micro;
   }
 
   .metricTile strong {
-    @apply mt-1.5 block break-words text-sm font-extrabold text-obby-text tabular-nums;
-    overflow-wrap: anywhere;
+    @apply mt-1 block font-bold text-obby-text tabular-nums text-value;
+    /* break-word, not anywhere: long segment names still wrap rather than being
+       shredded mid-token, and the minmax(0,1fr) columns absorb the min-content. */
+    overflow-wrap: break-word;
+    word-break: normal;
   }
 
   .rateBadge {
-    @apply relative col-span-full flex min-h-[74px] items-center gap-3 overflow-hidden rounded-lg bg-obby-tile px-4 py-2.5 sm:col-span-2;
+    @apply relative col-span-full flex items-center gap-3 overflow-hidden rounded-lg bg-obby-tile sm:col-span-2;
+    padding: var(--pad-panel-y) var(--pad-panel);
     border: 2px solid var(--color-obby-line-strong);
     color: var(--color-obby-muted);
   }
 
   .rateBadge .rateValue {
-    @apply text-[34px] font-black leading-none tabular-nums;
+    @apply font-black tabular-nums text-value-xl;
     color: var(--color-obby-text);
   }
 
@@ -370,11 +651,11 @@
   }
 
   .rateBadge .rateName {
-    @apply text-[11px] font-black uppercase tracking-wider text-obby-muted;
+    @apply font-black uppercase text-obby-muted text-micro;
   }
 
   .rateBadge .rateLag {
-    @apply whitespace-nowrap text-xs font-bold text-obby-dim;
+    @apply whitespace-nowrap font-bold text-obby-dim text-meta;
   }
 
   .rateBadge .rateDot {
@@ -425,21 +706,69 @@
     @apply text-obby-bad;
   }
 
-  .primaryGrid {
-    @apply mt-2.5 grid items-start gap-2.5;
-    grid-template-columns: minmax(0, 1.45fr) minmax(min(430px, 100%), 0.75fr);
+  /* ── Region grids ────────────────────────────────────────────────────────
+     Three 12-column regions with explicit spans, mobile-first. Explicit spans
+     rather than auto-placement or multicol: auto-placement leaves holes around
+     the player (≈4× the height of a metric panel), and multicol would fragment
+     panels, break the player's sticky positioning, and desync tab order from
+     visual order.                                                            */
+  .stageRow,
+  .telemetryRow {
+    @apply grid items-start;
+    margin-top: var(--gutter);
+    gap: var(--gutter);
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+  }
+
+  .stageRow > .panel,
+  .rightRail,
+  .telemetryRow > .panel {
+    grid-column: span 12;
   }
 
   .rightRail {
-    @apply grid min-w-0 gap-2.5;
+    @apply grid min-w-0;
+    gap: var(--gutter);
+    align-content: start;
   }
 
+  /* The four source panels are independent cards of very unequal height, so a
+     fixed grid strands whichever one wraps to a new row (measured: a 1217px gap
+     beside Private IPTV at 1920). Multicol balances column heights instead.
+     Safe here specifically: none of these panels is sticky, none needs to
+     fragment, and column-major order still matches how the cards read. */
+  .sourcesRow {
+    @apply block;
+    margin-top: var(--gutter);
+    column-gap: var(--gutter);
+  }
+
+  .sourcesRow > .panel {
+    break-inside: avoid;
+    margin-bottom: var(--gutter);
+  }
+
+  /* Skip layout/paint for these while they are offscreen — the page is still
+     several thousand pixels tall and they re-render on every 2.5s poll. NOT on
+     .stagePanel (sticky, holds the <video>) or .statusStrip (sticky). The `auto`
+     keyword makes the browser remember the last rendered size, so the scrollbar
+     does not jump. Trade-off: in-page Ctrl-F can miss offscreen feed text. */
+  .telemetryPanel,
+  .gpuPanel,
+  .sourcesRow > .panel {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 480px;
+  }
+
+  /* Mobile-first player: chrome sits BELOW the video rather than overlaying it,
+     so controls are reachable and nothing covers the picture on a phone. From
+     md up it becomes a proper overlay. */
   .stagePanel {
-    @apply sticky top-2.5;
+    @apply overflow-visible md:overflow-hidden;
   }
 
   .videoSurface {
-    @apply relative aspect-video min-w-0 w-full overflow-hidden bg-black;
+    @apply relative aspect-auto min-w-0 w-full overflow-visible rounded-b-lg bg-black md:aspect-video md:overflow-hidden md:rounded-b-none;
     background:
       linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
       linear-gradient(180deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
@@ -448,7 +777,18 @@
   }
 
   .video-js {
-    @apply h-full! w-full bg-black;
+    @apply w-full bg-black md:h-full!;
+  }
+
+  .videoSurface .video-js {
+    @apply h-auto! min-h-0 md:h-full!;
+    aspect-ratio: 16 / 9;
+  }
+
+  @media (width >= 48rem) {
+    .videoSurface .video-js {
+      aspect-ratio: auto;
+    }
   }
 
   .video-js .vjs-tech {
@@ -465,12 +805,24 @@
   }
 
   .customPlayerChrome {
-    @apply pointer-events-none absolute inset-0 flex flex-col justify-between p-3;
-    background: linear-gradient(180deg, rgba(8, 7, 13, 0.66), transparent 34%, rgba(8, 7, 13, 0.9));
+    @apply pointer-events-auto static grid gap-2 p-2 md:pointer-events-none md:absolute md:inset-0 md:flex md:flex-col md:justify-between;
+    background: var(--color-obby-surface-1);
+  }
+
+  @media (width >= 48rem) {
+    .customPlayerChrome {
+      padding: var(--pad-panel);
+      background: linear-gradient(
+        180deg,
+        color-mix(in oklab, var(--color-obby-surface-0) 66%, transparent),
+        transparent 34%,
+        color-mix(in oklab, var(--color-obby-surface-0) 90%, transparent)
+      );
+    }
   }
 
   .playerTopRail {
-    @apply flex min-w-0 items-center justify-between gap-3 text-xs font-bold text-obby-muted;
+    @apply flex min-w-0 items-center justify-between gap-3 rounded-lg border border-obby-line bg-obby-surface-3 px-2.5 py-2 font-bold text-obby-muted text-meta md:rounded-none md:border-0 md:bg-transparent md:p-0;
   }
 
   .playerTopRail > span {
@@ -482,11 +834,13 @@
   }
 
   .playerMetaLine {
-    @apply shrink-0 text-[0.72rem] text-obby-muted;
+    @apply shrink-0 text-obby-muted text-micro;
+    letter-spacing: normal;
   }
 
   .playerBottomRail {
-    @apply pointer-events-auto flex flex-wrap items-center justify-between gap-2 rounded-lg border border-obby-line-strong/70 bg-[#0b0910]/90 p-2 shadow-obby backdrop-blur;
+    @apply pointer-events-auto flex flex-wrap items-center justify-between gap-2 rounded-lg border border-obby-line-strong/70 p-2 md:shadow-obby md:backdrop-blur;
+    background: color-mix(in oklab, var(--color-obby-surface-1) 90%, transparent);
   }
 
   .playerControlRow,
@@ -499,7 +853,8 @@
   }
 
   .playerIconButton {
-    @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-obby-line-strong bg-[#191324]/90 text-obby-text;
+    @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-obby-line-strong text-obby-text;
+    background: color-mix(in oklab, var(--color-obby-surface-5) 90%, transparent);
   }
 
   .playerIconButton:hover:not(:disabled),
@@ -508,7 +863,7 @@
   }
 
   .playerIconButton.primary {
-    @apply border-obby-accent bg-obby-accent-strong text-[#12051d];
+    @apply border-obby-accent bg-obby-accent-strong text-obby-ink-on-accent;
   }
 
   .playerIcon {
@@ -521,7 +876,7 @@
 
   .volumePopover,
   .playerMoreMenu {
-    @apply absolute bottom-[calc(100%+8px)] z-30 rounded-lg border border-obby-line-strong bg-[#100d17] p-2 shadow-obby;
+    @apply absolute bottom-[calc(100%+8px)] z-30 rounded-lg border border-obby-line-strong bg-obby-surface-2 p-2 shadow-obby;
   }
 
   .volumePopover {
@@ -529,11 +884,11 @@
   }
 
   .volumeMuteButton {
-    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-obby-line-strong bg-[#171220] px-3 text-sm font-bold text-obby-text;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-obby-line-strong bg-obby-surface-4 px-3 font-bold text-obby-text text-body;
   }
 
   .volumeSliderRow {
-    @apply flex items-center gap-2 text-xs font-bold text-obby-muted;
+    @apply flex items-center gap-2 font-bold text-obby-muted text-meta;
   }
 
   .volumeSliderRow input {
@@ -545,7 +900,7 @@
   }
 
   .liveChip {
-    @apply inline-flex min-h-10 shrink-0 items-center gap-2 rounded-lg border border-obby-bad/50 bg-[#2a1117] px-3 text-xs font-black text-[#ffb3be];
+    @apply inline-flex min-h-10 shrink-0 items-center gap-2 rounded-lg border border-obby-bad/50 bg-obby-bad-surface px-3 font-black text-obby-bad-strong text-meta;
   }
 
   .liveChip span {
@@ -553,7 +908,7 @@
   }
 
   .playerReadout {
-    @apply min-w-0 truncate text-xs font-semibold text-obby-muted;
+    @apply min-w-0 truncate font-semibold text-obby-muted text-meta;
   }
 
   .sourceDots {
@@ -565,19 +920,19 @@
   }
 
   .sourceDot.active {
-    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.18);
+    box-shadow: 0 0 0 3px var(--color-obby-focus-ring);
   }
 
   .sourceDot-green {
-    background: #73f0a8;
+    background: var(--color-obby-signal-green);
   }
 
   .sourceDot-yellow {
-    background: #f0bf57;
+    background: var(--color-obby-warn);
   }
 
   .sourceDot-red {
-    background: #ff6f7f;
+    background: var(--color-obby-bad);
   }
 
   .playerMoreMenu {
@@ -589,15 +944,15 @@
   }
 
   .playerMenuButton {
-    @apply grid min-h-[58px] w-full gap-1 rounded-lg border border-obby-line-strong bg-[#171220] px-3 py-2 text-left;
+    @apply grid min-h-[58px] w-full gap-1 rounded-lg border border-obby-line-strong bg-obby-surface-4 px-3 py-2 text-left;
   }
 
   .playerMenuButton strong {
-    @apply text-sm text-obby-text;
+    @apply text-obby-text text-body;
   }
 
   .playerMenuButton span {
-    @apply text-xs font-semibold text-obby-muted;
+    @apply font-semibold text-obby-muted text-meta;
   }
 
   .customDropdown {
@@ -606,17 +961,14 @@
   }
 
   .dropdownButton {
-    @apply flex min-h-[44px] w-full min-w-0 items-center justify-between gap-3 rounded-lg border border-obby-line-strong bg-[#191324]/95 px-3 py-2 text-left text-obby-text shadow-none;
+    @apply flex min-h-[44px] w-full min-w-0 items-center justify-between gap-3 rounded-lg border border-obby-line-strong px-3 py-2 text-left text-obby-text shadow-none;
+    background: color-mix(in oklab, var(--color-obby-surface-5) 95%, transparent);
   }
 
   .dropdownButton:hover:not(:disabled),
   .dropdownButton[aria-expanded="true"] {
-    @apply border-obby-accent bg-[#22172f] translate-y-0;
-  }
-
-  .dropdownButton:focus-visible {
-    @apply outline-none;
-    box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.24);
+    @apply border-obby-accent bg-obby-surface-6;
+    filter: none;
   }
 
   .dropdownButton > span:first-child {
@@ -625,11 +977,11 @@
 
   .dropdownLabel,
   .dropdownStatus {
-    @apply text-[0.67rem] font-black uppercase tracking-normal text-obby-muted;
+    @apply font-black uppercase text-obby-muted text-micro;
   }
 
   .dropdownButton strong {
-    @apply truncate text-sm font-black leading-tight;
+    @apply truncate font-black leading-tight text-body;
   }
 
   .dropdownStatus {
@@ -646,7 +998,7 @@
   }
 
   .dropdownPanel {
-    @apply absolute right-0 top-[calc(100%+8px)] z-30 grid max-h-[320px] min-w-full gap-1 overflow-auto rounded-lg border border-obby-line-strong bg-[#100d17] p-1.5 shadow-obby;
+    @apply absolute right-0 top-[calc(100%+8px)] z-30 grid max-h-[320px] min-w-full gap-1 overflow-auto rounded-lg border border-obby-line-strong bg-obby-surface-2 p-1.5 shadow-obby;
     width: max-content;
     max-width: min(360px, calc(100vw - 24px));
   }
@@ -667,7 +1019,8 @@
 
   .dropdownOption:hover:not(:disabled),
   .dropdownOption.active {
-    @apply border-obby-line-strong bg-obby-accent/15 translate-y-0;
+    @apply border-obby-line-strong bg-obby-accent/15;
+    filter: none;
   }
 
   .dropdownOption.selected {
@@ -683,15 +1036,15 @@
   }
 
   .dropdownOption strong {
-    @apply truncate text-sm font-black;
+    @apply truncate font-black text-body;
   }
 
   .dropdownOption small {
-    @apply truncate text-xs font-semibold text-obby-muted;
+    @apply truncate font-semibold text-obby-muted text-meta;
   }
 
   .dropdownOption em {
-    @apply rounded-md border border-obby-accent/45 px-2 py-1 text-[0.67rem] not-italic text-obby-accent-strong;
+    @apply rounded-md border border-obby-accent/45 px-2 py-1 not-italic text-obby-accent-strong text-micro;
   }
 
   .playerMenu {
@@ -699,7 +1052,7 @@
   }
 
   .playerMenu .dropdownButton {
-    @apply min-h-9 px-3 py-1.5 text-xs;
+    @apply min-h-9 px-3 py-1.5 text-meta;
   }
 
   .playerMenu .dropdownPanel {
@@ -710,41 +1063,56 @@
 
   .playerToolbar,
   .footerStatus {
-    @apply flex flex-wrap items-center gap-2 px-3 py-2.5;
+    @apply flex flex-wrap items-center gap-2;
+    padding: var(--pad-panel-y) var(--pad-panel);
+  }
+
+  .playerToolbar .inlineMetric {
+    @apply flex-1 basis-[138px] lg:flex-none lg:basis-auto;
   }
 
   .inlineMetric {
-    @apply inline-flex min-h-[42px] min-w-0 max-w-full items-center gap-1.5 bg-[#15111d] px-2.5 py-2 text-obby-muted;
+    @apply inline-flex min-h-[42px] min-w-0 max-w-full items-center gap-1.5 bg-obby-surface-3 px-2.5 py-2 text-obby-muted text-meta;
   }
 
+  /* Truncate rather than wrap. These sit in flex-wrap rails (player toolbar,
+     footer) where a long unbreakable URL's min-content width propagates all the
+     way out and widens the whole document — it pushed the 320px layout viewport
+     to 337px. Phase 4 swaps the URL ones for <UrlChip> with copy + title. */
   .inlineMetric strong {
-    @apply break-words text-obby-text;
-    min-width: 0;
-    overflow-wrap: anywhere;
+    @apply min-w-0 truncate text-obby-text;
   }
 
   .panelMessage {
-    @apply px-3 pt-3 leading-normal text-obby-muted;
+    @apply leading-normal text-obby-muted text-body;
+    padding: var(--pad-panel-y) var(--pad-panel) 0;
   }
 
   .metricGrid {
-    @apply grid gap-2 p-3;
+    @apply grid;
+    gap: var(--gutter);
+    padding: var(--pad-panel-y) var(--pad-panel);
   }
 
-  .metricGrid.two {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
+  /* auto-fit on the PANEL's width, not the viewport's. These grids live in
+     containers that differ wildly at the same viewport — the vitals rail is
+     ~390px while full-bleed telemetry is ~2060px — so viewport breakpoints gave
+     the rail four 85px columns and broke labels and values mid-word
+     ("DECISION / healt hy"). min() keeps two columns as the floor on a 320px
+     phone, where eight stacked tiles used to waste ~700px. */
+  .metricGrid.two,
   .metricGrid.three {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
   }
 
   .chipRow {
-    @apply flex min-h-10 flex-wrap items-center gap-1.5 px-3 pb-3;
+    @apply flex min-h-10 flex-wrap items-center gap-1.5;
+    padding: 0 var(--pad-panel) var(--pad-panel-y);
   }
 
   .sampleRail {
-    @apply mx-3 mb-3 flex h-[54px] items-end gap-1 rounded-lg border border-obby-line bg-[#0b0910] p-2;
+    @apply flex h-[54px] items-end gap-1 rounded-lg border border-obby-line bg-obby-surface-1 p-2;
+    margin: 0 var(--pad-panel) var(--pad-panel-y);
   }
 
   .sampleBar {
@@ -753,41 +1121,118 @@
   }
 
   .encoderControl {
-    @apply flex min-w-0 items-center justify-between gap-3 p-3;
+    @apply flex min-w-0 flex-col items-stretch justify-between gap-3 sm:flex-row sm:items-center;
+    padding: var(--pad-panel-y) var(--pad-panel);
   }
 
-  .encoderControl span {
-    @apply block text-xs text-obby-muted;
+  /* Direct child only: a bare `.encoderControl span` also matches the nested
+     ModernDropdown wrapper span, and text-transform inherits — which uppercased
+     the dropdown's own value ("Auto" → "AUTO"). */
+  .encoderControl > div > span {
+    @apply block font-bold uppercase text-obby-dim text-micro;
   }
 
-  .encoderControl strong {
-    @apply mt-1 block break-words;
+  .encoderControl > div > strong {
+    @apply mt-1 block break-words text-value;
   }
 
   .encoderDropdown {
-    @apply w-[260px];
+    @apply w-full sm:w-[260px];
   }
 
   .subsection {
-    @apply min-w-0 px-3 pb-3;
+    @apply min-w-0;
+    padding: 0 var(--pad-panel) var(--pad-panel-y);
   }
 
   .subsection h3 {
-    @apply mb-2 text-sm font-bold text-obby-accent-strong;
+    @apply mb-2 font-bold text-obby-accent-strong text-meta;
   }
 
   .feedBox {
-    @apply max-h-56 min-w-0 overflow-auto bg-[#0b0910];
+    @apply min-w-0 overflow-auto bg-obby-surface-1;
+    max-height: var(--feed-max);
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-obby-line-strong) transparent;
+    overscroll-behavior: contain;
+  }
+
+  .feedScroll {
+    @apply relative;
+  }
+
+  .feedScroll.isExpanded {
+    --feed-max: 42rem;
+  }
+
+  /* Fade mask: tells you the feed continues instead of just clipping a line. */
+  .feedScroll::after {
+    content: "";
+    @apply pointer-events-none absolute inset-x-0 bottom-0 h-9 rounded-b-lg;
+    background: linear-gradient(to top, var(--color-obby-surface-1), transparent);
+  }
+
+  .feedScroll.isExpanded::after {
+    @apply opacity-35;
+  }
+
+  .feedHead h3 {
+    @apply mb-0;
+  }
+
+  .feedExpand {
+    @apply shrink-0;
+  }
+
+  /* ── UrlChip: middle truncation, no measurement needed ─────────────────── */
+  /* No gap: the head and tail spans are two halves of one URL, and a flex gap
+     between them reads as a space inside the address. */
+  .urlChip {
+    @apply flex min-w-0 items-center font-mono text-obby-text-soft text-meta;
+  }
+
+  .urlChipHead {
+    @apply overflow-hidden whitespace-nowrap;
+    flex: 0 1 auto;
+    min-width: 3ch;
+    text-overflow: ellipsis;
+  }
+
+  .urlChipTail {
+    @apply flex-none whitespace-nowrap;
+  }
+
+  .urlChipCopy {
+    @apply ml-1.5 flex-none;
+    min-height: 36px;
+  }
+
+  /* ── Loading + change feedback (both disabled under prefers-reduced-motion) */
+  .metricTile.isChanged strong {
+    animation: valueFlash 420ms var(--ease-obby);
+    border-radius: var(--radius-obby-sm);
+  }
+
+  .skeleton {
+    @apply inline-block rounded text-transparent;
+    background: linear-gradient(
+      90deg,
+      var(--color-obby-surface-2) 25%,
+      var(--color-obby-surface-4) 37%,
+      var(--color-obby-surface-2) 63%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
   }
 
   .logBox {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
   }
 
   .feedLine,
   .emptyLine {
-    @apply break-words border-b border-white/5 px-2.5 py-2 text-xs leading-normal text-[#ddd6ec];
-    overflow-wrap: anywhere;
+    @apply border-b border-white/5 px-2.5 py-2 leading-normal text-obby-text-soft text-meta;
+    overflow-wrap: break-word;
   }
 
   .feedLine:last-child,
@@ -796,7 +1241,7 @@
   }
 
   .feedHead {
-    @apply mb-1 flex items-center justify-between gap-2 text-xs text-obby-muted;
+    @apply mb-1 flex items-center justify-between gap-2 text-obby-muted text-meta;
   }
 
   .emptyLine {
@@ -804,24 +1249,30 @@
   }
 
   .gpuPanel .metricTile strong {
-    @apply font-mono text-xs;
-  }
-
-  .lowerGrid {
-    @apply mt-2.5 grid items-start gap-2.5;
-    grid-template-columns: minmax(min(390px, 100%), 0.72fr) minmax(0, 1.28fr);
+    @apply font-mono text-meta;
   }
 
   .addLink {
-    @apply grid grid-cols-[1fr_auto] gap-2 p-3;
+    @apply grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto];
+    padding: var(--pad-panel-y) var(--pad-panel);
   }
 
+  /* These two override .addLink's column template, so they must be gated at sm
+     as well — otherwise their fixed minimums (120px + 180px + auto) blow past a
+     320px viewport, which is exactly what the old max-width block hid. */
   .publicSourceForm {
-    grid-template-columns: minmax(120px, 0.35fr) minmax(180px, 1fr) auto;
+    @apply grid-cols-1;
+  }
+
+  @media (width >= 40rem) {
+    .publicSourceForm {
+      grid-template-columns: minmax(120px, 0.35fr) minmax(180px, 1fr) auto;
+    }
   }
 
   .automationSummary {
-    @apply grid grid-cols-2 gap-2 px-3 pt-3 text-xs text-obby-muted;
+    @apply grid grid-cols-2 gap-2 text-obby-muted text-meta;
+    padding: var(--pad-panel-y) var(--pad-panel) 0;
   }
 
   .automationSummary span {
@@ -829,11 +1280,14 @@
   }
 
   .privateIptvPanel .panelMessage {
-    @apply px-3 pt-2;
+    padding: var(--pad-panel-y) var(--pad-panel) 0;
   }
 
-  .privateIptvPanel > .sourceMeta {
-    @apply px-3 font-sans text-xs text-obby-muted;
+  /* Descendant, not direct child: Panel now wraps its children in .panelBody,
+     which added a DOM level between the panel and this element. */
+  .privateIptvPanel .sourceMeta {
+    @apply font-sans text-obby-muted text-meta;
+    padding-inline: var(--pad-panel);
     overflow-wrap: anywhere;
   }
 
@@ -846,7 +1300,8 @@
   }
 
   .scrapeResult {
-    @apply px-3 pb-1 text-xs text-obby-muted;
+    @apply text-obby-muted text-meta;
+    padding: 0 var(--pad-panel) 0.25rem;
   }
 
   .sourceChanger {
@@ -854,19 +1309,30 @@
   }
 
   .sourceChanger .addLink {
-    @apply grid-cols-[1fr_auto_auto];
+    @apply grid-cols-1 sm:grid-cols-[1fr_auto_auto];
   }
 
   .linksList {
-    @apply grid gap-2 px-3 pb-3;
+    @apply grid gap-2;
+    padding: 0 var(--pad-panel) var(--pad-panel-y);
   }
 
   .linkItem {
     @apply min-w-0 bg-obby-tile p-2.5;
   }
 
+  /* Two columns, not flex: the badges used to wrap into a ragged right-aligned
+     vertical column on mobile (Fallback / green / soursignal / 0 watching each
+     on its own line). Below sm they get their own full-width row instead. */
   .linkTop {
-    @apply flex items-center justify-between gap-2;
+    @apply grid items-start gap-2;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  @media (width >= 40rem) {
+    .linkTop {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
   }
 
   .sourceItem {
@@ -874,20 +1340,20 @@
   }
 
   .sourceBadges {
-    @apply flex flex-wrap justify-end gap-1.5;
+    @apply flex min-w-0 flex-wrap justify-start gap-1.5 sm:justify-end;
   }
 
   .linkTop strong {
-    @apply text-sm text-obby-accent;
+    @apply text-obby-accent text-body;
   }
 
   .linkItem p {
-    @apply mt-2 break-words font-mono text-xs text-[#ddd6ec];
-    overflow-wrap: anywhere;
+    @apply mt-2 font-mono text-obby-text-soft text-meta;
+    overflow-wrap: break-word;
   }
 
   .linkItem .sourceMeta {
-    @apply mt-1 font-sans text-xs text-obby-muted;
+    @apply mt-1 font-sans text-obby-muted text-meta;
   }
 
   .linkActions {
@@ -895,7 +1361,26 @@
   }
 
   .compactButton {
-    @apply min-h-[34px] px-2.5 py-1.5 text-xs;
+    @apply min-h-[36px] px-2.5 py-1.5 text-meta;
+  }
+
+  .sourceMenu {
+    @apply min-w-0;
+  }
+
+  .sourceMenu .dropdownButton {
+    @apply min-h-[36px] w-auto px-2.5 py-1.5 text-meta;
+  }
+
+  .sourceMenu .dropdownLabel {
+    @apply sr-only;
+  }
+
+  /* Anchor left, not right. The More button sits at the left of a narrow card,
+     so the default right-0 panel hangs 300px off the left edge of the viewport. */
+  .sourceMenu .dropdownPanel {
+    @apply left-0 right-auto;
+    max-width: min(320px, calc(100vw - 24px));
   }
 
   .telemetryFeeds {
@@ -903,160 +1388,29 @@
     grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   }
 
-  .telemetryFeeds .feedBox {
-    @apply max-h-60;
-  }
-
   .footerStatus {
-    @apply mt-2.5 grid rounded-lg border border-obby-line bg-[#100d17];
+    @apply grid rounded-lg border border-obby-line bg-obby-surface-2;
+    margin-top: var(--gutter);
     grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   }
 }
 
-@media (max-width: 1360px) {
-  .primaryGrid {
-    @apply grid-cols-1;
-  }
+/* ────────────────────────────────────────────────────────────────────────────
+   Responsive ladder — mobile-first min-width, on one numeric scale.
 
-  .stagePanel {
-    @apply static;
-  }
+   Replaces the old desktop-first max-width blocks (1360/1040/880/720/560/420)
+   which were interleaved with Tailwind's own min-width `lg:` variants and left
+   a dead band at 1040–1360. Everything above is now the phone layout; each
+   block below only ever adds width.
 
-  .rightRail {
-    @apply grid-cols-2;
-  }
+   sm 40rem/640 · md 48rem/768 · lg 64rem/1024 · xl 80rem/1280
+   3xl 100rem/1600 · 4xl 120rem/1920 · 5xl 160rem/2560
+   ──────────────────────────────────────────────────────────────────────────── */
 
-  .gpuPanel {
-    grid-column: 1 / -1;
-  }
-
-  .lowerGrid {
-    @apply grid-cols-1;
-  }
-}
-
-@media (max-width: 1040px) {
-  .rightRail {
-    @apply grid-cols-1;
-  }
-}
-
-@media (max-width: 880px) {
-  .appShell {
-    @apply px-2 py-2.5;
-    padding-left: max(0.5rem, env(safe-area-inset-left));
-    padding-right: max(0.5rem, env(safe-area-inset-right));
-  }
-
-  .commandHeader {
-    @apply min-h-0 flex-col items-stretch;
-  }
-
-  .commandHeader h1 {
-    @apply text-[2rem];
-  }
-
-  .commandActions button {
-    @apply flex-1 basis-28;
-  }
-
-  .rightRail,
-  .metricGrid.three,
-  .telemetryFeeds {
-    @apply grid-cols-1;
-  }
-
-  .metricGrid.two {
-    @apply grid-cols-2;
-  }
-
-  .encoderControl {
-    @apply flex-col items-stretch;
-  }
-
-  .encoderDropdown {
-    @apply w-full;
-  }
-
-  .playerBottomRail {
-    @apply grid-cols-2;
-  }
-
-  .volumeControl {
-    @apply col-span-2;
-  }
-
-  .playerMenu {
-    @apply col-span-2 min-w-0;
-  }
-
-  .playerToolbar .inlineMetric {
-    @apply flex-1 basis-[138px];
-  }
-
-  .addLink {
-    @apply grid-cols-1;
-  }
-}
-
-@media (max-width: 720px) {
-  .stagePanel {
-    @apply overflow-visible;
-  }
-
-  .videoSurface {
-    @apply aspect-auto overflow-visible rounded-b-lg;
-  }
-
-  .videoSurface .video-js {
-    @apply h-auto! min-h-0;
-    aspect-ratio: 16 / 9;
-  }
-
-  .customPlayerChrome {
-    @apply pointer-events-auto static grid gap-2 p-2;
-    background: #0b0910;
-  }
-
-  .playerTopRail {
-    @apply rounded-lg border border-obby-line bg-[#15111d] px-2.5 py-2;
-  }
-
-  .playerBottomRail {
-    @apply shadow-none;
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-  }
-
-  .playerMenu .dropdownPanel {
-    top: auto;
-    bottom: calc(100% + 8px);
-  }
-}
-
-@media (max-width: 560px) {
-  .loginShell {
-    @apply p-3;
-    padding-left: max(0.75rem, env(safe-area-inset-left));
-    padding-right: max(0.75rem, env(safe-area-inset-right));
-    padding-top: max(0.75rem, env(safe-area-inset-top));
-    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
-  }
-
-  .loginPanel {
-    @apply p-4;
-  }
-
-  .loginForm,
-  .metricGrid.two {
-    @apply grid-cols-1;
-  }
-
-  .commandHeader h1,
-  .loginPanel h1 {
-    @apply text-[1.72rem];
-  }
-
+/* Small screens only: dropdown panels become bottom sheets. Expressed as the
+   complement of `sm` rather than inverted, because undoing `position: fixed
+   !important` at a larger width would need a second !important block. */
+@media (width < 40rem) {
   .customDropdown .dropdownPanel,
   .playerMenu .dropdownPanel {
     position: fixed !important;
@@ -1069,44 +1423,107 @@
     max-width: none !important;
     max-height: min(320px, calc(100dvh - 1rem)) !important;
   }
-}
-
-@media (max-width: 420px) {
-  .commandHeader {
-    @apply p-3;
-  }
-
-  .commandActions {
-    @apply grid grid-cols-1;
-  }
-
-  .commandActions button {
-    @apply w-full basis-auto;
-  }
-
-  .panelHeader {
-    @apply min-h-0 flex-col items-start;
-  }
-
-  .panelMeta {
-    @apply w-full justify-start;
-  }
-
-  .playerBottomRail {
-    @apply grid-cols-1;
-  }
-
-  .volumeControl,
-  .playerMenu {
-    @apply col-span-1;
-  }
 
   .footerStatus {
     @apply gap-2;
   }
 }
 
+/* metricGrid needs no breakpoint rules: it auto-fits to its panel's width. */
+
+/* lg: the stage is still stacked, so the full-width rail pairs its panels. */
+@media (width >= 64rem) {
+  .rightRail {
+    @apply grid-cols-2;
+  }
+
+  .sourcesRow {
+    columns: 2;
+  }
+}
+
+/* xl: the stage splits — player beside the rail, GPU on the row below. */
+@media (width >= 80rem) {
+  .stagePanel {
+    @apply sticky;
+    grid-column: span 8;
+    top: var(--gutter);
+  }
+
+  .rightRail {
+    @apply grid-cols-1;
+    grid-column: span 4;
+  }
+
+  /* GPU keeps the base span of 12 here: it sits on its own row below the player
+     and rail, so spanning only the player's 8 columns would leave 4 columns of
+     the row empty. */
+}
+
+/* 3xl: GPU becomes a third stage column, the source cards go 3-up, and the
+   shell is allowed past 1680px. */
+@media (width >= 100rem) {
+  :root {
+    --container-max: min(2100px, 96vw);
+  }
+
+  .stagePanel {
+    grid-column: span 6;
+  }
+
+  .rightRail {
+    grid-column: span 3;
+  }
+
+  .gpuPanel {
+    grid-column: span 3;
+  }
+
+  .sourcesRow {
+    columns: 3;
+  }
+}
+
+@media (width >= 160rem) {
+  .sourcesRow {
+    columns: 4;
+  }
+}
+
+@keyframes valueFlash {
+  from {
+    background-color: color-mix(in oklab, var(--color-obby-accent) 22%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
 @keyframes ratePulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.3; transform: scale(1.35); }
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(1.35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

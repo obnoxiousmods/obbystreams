@@ -200,7 +200,9 @@ Four things changed:
    the tracked `event_id`; with none, the cockpit stays armed with the encode *down* and retries on
    `acquisition_poll_seconds` (180s). Discord gets a warning if the card starts with nothing found.
    Public backup sources are pulled in after `public_fallback_after_attempts` failed sweeps, but only
-   after the card is live; an unidentified fallback is never aired during pre-roll.
+   after the card is live; an unidentified fallback is never aired during pre-roll. If ffmpeg was
+   already carrying a stale/unidentified source when pre-roll opens, it is replaced with a verified
+   source or quarantined offline — decoder health alone is never treated as card identity.
 4. **Segments switch dynamically.** ESPN can publish one segment (main card only), two (prelims +
    main), or three (early prelims + prelims + main). The earliest one opens pre-roll, and every later
    boundary forces discovery and selects only current-segment feeds.
@@ -219,7 +221,18 @@ with reasons, switch count), and the cockpit renders it — including
 ESPN sometimes never flips a card's final flag. `card_stalled()` stands the stream down when the
 last segment started more than `stall_hours` (6) ago *and* no bout has been decided for
 `stall_idle_minutes` (45) — both conditions, so a genuinely slow card is never cut off mid-broadcast.
-The 8h `max_runtime_hours` failsafe remains as the outer bound.
+The absolute failsafe allows at least `max_runtime_hours` (8h) from the earliest segment **and** a
+full five-hour runway from the Main card start, whichever is later. That keeps a three-block card's
+early prelims from consuming the Main card's safety margin.
+
+### Restart safety
+
+With auto-schedule enabled, the service always boots into process standby. The scheduler's first
+event-aware tick — not the watchdog — decides whether ffmpeg may start. The exact links handed to
+the running process are tracked separately from mutable config, so a config refresh cannot make an
+old process appear to be carrying a newly selected source. Mid-card crash recovery is gated through
+the same current-event link selection, and the persisted absolute deadline remains enforceable even
+when both ESPN and the cached detail are unavailable.
 
 ## Cockpit UI
 

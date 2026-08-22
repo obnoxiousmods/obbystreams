@@ -52,6 +52,7 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -73,6 +74,29 @@ from starlette.staticfiles import StaticFiles
 from obbyschedule import EventContext, ScheduleSettings, StartResult, StartStatus, StopReason, UfcScheduler
 
 logger = logging.getLogger("obbystreams")
+
+# uvicorn only configures its own loggers, and the root logger it leaves at
+# WARNING with no handler this module inherits — so every logger.info() here was
+# being dropped on the floor. Attach our own handler once, and stop propagating
+# so uvicorn's root config cannot double-print it. Self-contained on purpose: no
+# systemd unit change, survives a deploy. stdout goes to journald under systemd.
+if not logger.handlers:
+    _log_handler = logging.StreamHandler(sys.stdout)
+    _log_handler.setFormatter(logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
+    logger.addHandler(_log_handler)
+    logger.setLevel(os.environ.get("OBBYSTREAMS_LOG_LEVEL", "INFO").upper())
+    logger.propagate = False
+
+# Operator messages routinely embed provider URLs whose path/query are bearer
+# credentials. _redact_url() takes a bare URL, so text has to be matched first.
+_URL_IN_TEXT_RE = re.compile(r"https?://\S+")
+
+
+def _redact_message(text: str) -> str:
+    """Redact any provider URLs embedded in an operator message before logging."""
+    # _redact_url is defined further down; module-level names resolve at call
+    # time and nothing calls this during import, so the ordering is fine.
+    return _URL_IN_TEXT_RE.sub(lambda m: _redact_url(m.group(0)), text)
 
 
 class _RedactProxyTargets(logging.Filter):
@@ -188,6 +212,16 @@ VIEWER_SESSION_TTL = 45
 VIEWER_SESSIONS: dict[str, dict[str, Any]] = {}
 VIEWER_LOCK = asyncio.Lock()
 
+
+# Monotonic timestamps of every managed-encode start, for the instability alert.
+# One restart is routine (each card-segment transition causes one by design); a
+# burst of them is the thing nobody was told about — 2026-08-08 saw 25 in a day
+# with no notification anywhere.
+STREAM_START_TIMES: deque[float] = deque(maxlen=64)
+STREAM_INSTABILITY_WINDOW_SECONDS = 900.0
+STREAM_INSTABILITY_THRESHOLD = 4
+STREAM_INSTABILITY_COOLDOWN_SECONDS = 1800.0
+_LAST_INSTABILITY_ALERT_AT: float | None = None
 
 RUNTIME: dict[str, Any] = {
     "stream_starts": 0,
@@ -1560,12 +1594,38 @@ async def _apply_geo(ip_hash, geo):
             VIEWER_STATS_DIRTY = True
 
 
-def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, label=None):
-    """Accumulate per-source quality-of-experience: watch/buffering ms, stall count, and the set of unique viewer hashes."""
-    stats = SOURCE_QOE.setdefault(source_id, {"watch_ms": 0.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set()})
+def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, label=None,
+                      reattaches=0, live_latency_seconds=None, dropped_frames=0):
+    """Accumulate per-source quality-of-experience from client heartbeats.
+
+    reattaches and live_latency_seconds are the two that actually diagnose
+    "it's skipping": a re-attach tears the pipeline down and restarts the
+    playhead at live, so each one IS a visible skip, and latency says whether a
+    viewer is riding the live edge or stuck far behind it. Both are computed in
+    the browser; before they were reported these had to be reconstructed by
+    counting init-segment refetches in the nginx access log.
+    """
+    stats = SOURCE_QOE.setdefault(source_id, {
+        "watch_ms": 0.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set(),
+        "reattaches": 0, "dropped_frames": 0, "latency_sum": 0.0, "latency_samples": 0,
+    })
+    # Older persisted snapshots predate these keys.
+    for key, default in (("reattaches", 0), ("dropped_frames", 0), ("latency_sum", 0.0), ("latency_samples", 0)):
+        stats.setdefault(key, default)
     stats["watch_ms"] += max(0.0, credit_seconds) * 1000.0
     stats["buffering_ms"] += max(0.0, min(float(buffering_ms or 0), 60_000.0))
     stats["stalls"] += max(0, int(stalls or 0))
+    # Clamped: these arrive from the public internet and are deltas per heartbeat.
+    stats["reattaches"] += max(0, min(int(reattaches or 0), 1000))
+    stats["dropped_frames"] += max(0, min(int(dropped_frames or 0), 1_000_000))
+    if live_latency_seconds is not None:
+        try:
+            latency = float(live_latency_seconds)
+        except (TypeError, ValueError):
+            latency = None
+        if latency is not None and 0.0 <= latency <= 3600.0:
+            stats["latency_sum"] += latency
+            stats["latency_samples"] += 1
     if label:
         stats["label"] = str(label)[:80]
     if ip_hash:
@@ -1574,7 +1634,8 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
             viewers.add(ip_hash)
 
 
-async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, stalls=0, source_label=None):
+async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, stalls=0, source_label=None,
+                       reattaches=0, live_latency_seconds=None, dropped_frames=0):
     """Credit watch time to a viewer (capped per heartbeat gap), update QoE, and kick off geo resolution for new/ungeo'd IPs."""
     global VIEWER_STATS_DIRTY
     credit = 0.0
@@ -1582,7 +1643,9 @@ async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, s
         gap = now_t - float(last_at)
         if 0 < gap <= VIEWER_SESSION_TTL * 2:
             credit = min(gap, VIEWER_WATCH_MAX_STEP)
-    record_source_qoe(source_id, ip_hash, credit, buffering_ms, stalls, label=source_label)
+    record_source_qoe(source_id, ip_hash, credit, buffering_ms, stalls, label=source_label,
+                      reattaches=reattaches, live_latency_seconds=live_latency_seconds,
+                      dropped_frames=dropped_frames)
     new_ip = False
     async with VIEWER_STATS_LOCK:
         stats: dict[str, Any]
@@ -1654,6 +1717,12 @@ async def viewer_highscores_snapshot(limit=25):
             "smoothness": round(max(0.0, min(1.0, 1.0 - buffer_ratio)) * 100.0, 1),
             "buffering_minutes": round(buffering_ms / 60_000.0, 1),
             "stalls": int(qoe.get("stalls", 0)),
+            "reattaches": int(qoe.get("reattaches", 0)),
+            "dropped_frames": int(qoe.get("dropped_frames", 0)),
+            "avg_live_latency_seconds": (
+                round(qoe["latency_sum"] / qoe["latency_samples"], 1)
+                if qoe.get("latency_samples") else None
+            ),
             "viewers": viewers,
         })
     source_performance.sort(key=lambda s: s["watch_hours"], reverse=True)
@@ -1756,6 +1825,13 @@ class StreamHealthScorer:
     previous_hls: dict = field(default_factory=dict)
     samples: deque[dict] = field(default_factory=lambda: deque(maxlen=90))
     last_assessment: dict | None = None
+    # Wall time we last saw an ffmpeg child under the supervisor. The supervisor
+    # relaunches ffmpeg itself on an upstream blip, and for those couple of
+    # seconds there is legitimately no encoder and no fresh playlist — which
+    # scores far below the failure threshold. Without remembering that an encoder
+    # existed a moment ago, the watchdog confirms "failed" in ~4s and kills the
+    # supervisor mid-recovery, turning a 2.5s blip into a ~10s outage.
+    last_encoder_seen_at: float = 0.0
 
     def reset(self, pid=None, started_at=None):
         """Clear all accumulated sample state, optionally re-seeding the tracked pid/started_at for a new process."""
@@ -1767,6 +1843,9 @@ class StreamHealthScorer:
         self.previous_hls = {}
         self.samples.clear()
         self.last_assessment = None
+        # A different managed process: the startup grace covers its first seconds,
+        # and carrying the old one's encoder sighting over would be a lie.
+        self.last_encoder_seen_at = 0.0
 
     def assess(self, config, proc, hls, force=False):
         """Score the current proc+HLS snapshot, update streak counters, and return the health assessment dict.
@@ -1804,7 +1883,12 @@ class StreamHealthScorer:
         if self.last_assessment and not force and self.last_sample_at and now - self.last_sample_at < sample_interval:
             return self.last_assessment
 
-        elapsed = float(proc.get("age") or 0.0)
+        # Age of the ffmpeg actually producing output, not of the supervisor that
+        # outlives it across relaunches. Falls back to the supervisor's age while
+        # no encoder child exists (which is itself what the score is judging).
+        supervisor_age = float(proc.get("age") or 0.0)
+        encoder_age = proc.get("encoder_age")
+        elapsed = float(encoder_age) if encoder_age is not None else supervisor_age
         min_assessment = float(stream.get("min_assessment_seconds", 15))
         stale_seconds = float(stream.get("playlist_stale_seconds", 25))
         ramp_seconds = float(stream.get("failure_ramp_seconds", 60))
@@ -1812,8 +1896,27 @@ class StreamHealthScorer:
         failure_threshold = float(stream.get("failure_score_threshold", -120))
         confirmed_failure_samples = int(stream.get("confirmed_failure_samples", 2))
 
+        # startup_grace_seconds was accepted by config and normalization but read
+        # by nothing, so a supervisor that had launched but not yet produced a
+        # playlist could be declared failed and killed while it was still coming
+        # up. It gates on the SUPERVISOR's age deliberately: during the window
+        # where ffmpeg does not exist yet there is no encoder age to gate on.
+        startup_grace = float(stream.get("startup_grace_seconds", 25))
+        within_startup_grace = supervisor_age < startup_grace
+        if encoder_age is not None:
+            self.last_encoder_seen_at = now
+        elif (
+            proc.get("managed")
+            and self.last_encoder_seen_at
+            and now - self.last_encoder_seen_at < startup_grace
+        ):
+            # Supervisor is up and had an encoder moments ago: it is relaunching
+            # ffmpeg, not wedged. Judging this window is what made the watchdog
+            # kill the very recovery it was waiting on.
+            within_startup_grace = True
+
         score, evidence, reasons = score_stream_snapshot(proc, hls, self.previous_hls, elapsed, min_assessment, stale_seconds, ramp_seconds, recent_errors)
-        bad_sample = elapsed >= min_assessment and score <= failure_threshold
+        bad_sample = elapsed >= min_assessment and score <= failure_threshold and not within_startup_grace
         good_sample = score >= success_threshold
         if bad_sample:
             self.consecutive_bad_samples += 1
@@ -1824,7 +1927,12 @@ class StreamHealthScorer:
         elif score > failure_threshold / 2:
             self.consecutive_bad_samples = 0
 
-        if elapsed < min_assessment:
+        if within_startup_grace and score <= failure_threshold:
+            state = "assessing"
+            level = "warn"
+            decision = "assessing"
+            message = f"Within the {startup_grace:.0f}s startup grace window; not judging the stream yet."
+        elif elapsed < min_assessment:
             state = "assessing"
             level = "warn"
             decision = "assessing"
@@ -2016,11 +2124,26 @@ def confidence_for_assessment(score, elapsed, min_assessment, sample_count, bad_
 # ---------------------------------------------------------------------------
 # Event log & auth guards — operator event feed plus session/origin checks.
 # ---------------------------------------------------------------------------
+_EVENT_LOG_LEVELS = {
+    "ok": logging.INFO,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+
+
 def event(message, level="info", extra=None):
     """Append an operator event to the EVENTS ring and queue it for ArangoDB; returns the created item."""
     item = {"ts": now_ms(), "level": level, "message": message, "extra": extra or {}}
     EVENTS.append(item)
     queue_arango_insert("events", item)
+    # Also emit to journald. The EVENTS ring holds 300 entries and dies with the
+    # process, and ArangoDB is not what you reach for at 3am — so without this a
+    # restart leaves no record of WHY it restarted. Every operator decision in
+    # this file (restart, watchdog action, source switch, stand-down) goes
+    # through here, so this one line is the whole audit trail.
+    logger.log(_EVENT_LOG_LEVELS.get(str(level).lower(), logging.INFO), "event: %s", _redact_message(str(message)))
     return item
 
 
@@ -2533,10 +2656,26 @@ def process_metrics():
         data["cpu"] = proc.cpu_percent(interval=0.0)
         data["rss"] = proc.memory_info().rss
         data["cmd"] = " ".join(proc.cmdline())
-        data["children"] = [
-            {"pid": c.pid, "name": c.name(), "cpu": c.cpu_percent(interval=0.0), "rss": c.memory_info().rss}
-            for c in proc.children(recursive=True)
-        ]
+        children = []
+        encoder_age = None
+        for c in proc.children(recursive=True):
+            child_age = None
+            with contextlib.suppress(psutil.Error):
+                child_age = max(0.0, time.time() - c.create_time())
+            children.append({
+                "pid": c.pid, "name": c.name(), "cpu": c.cpu_percent(interval=0.0),
+                "rss": c.memory_info().rss, "age": child_age,
+            })
+            if child_age is not None and "ffmpeg" in (c.name() or "") and (encoder_age is None or child_age < encoder_age):
+                encoder_age = child_age
+        data["children"] = children
+        # The supervisor outlives the ffmpeg processes it launches, so its age is
+        # the wrong clock for "has this encode had time to produce output yet".
+        # Scoring on it meant that ~150s after boot the failure ramp was pinned at
+        # maximum, and the ~2.5s gap while the supervisor relaunched ffmpeg scored
+        # far below the failure threshold — so the watchdog killed the supervisor
+        # mid-recovery and turned a 2.5s blip into a ~10s outage.
+        data["encoder_age"] = encoder_age
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     _PROC_METRICS_CACHE["data"] = data
@@ -3049,6 +3188,9 @@ async def viewer_counts(request):
                 ip_hash, client_ip, source_id, now_t, last_at,
                 buffering_ms=body.get("buffering_ms", 0), stalls=body.get("stalls", 0),
                 source_label=body.get("source_label"),
+                reattaches=body.get("reattaches", 0),
+                live_latency_seconds=body.get("live_latency_seconds"),
+                dropped_frames=body.get("dropped_frames", 0),
             )
         return JSONResponse({"ok": True, "session_id": session_id, "viewers": counts}, headers=cors)
     async with VIEWER_LOCK:
@@ -3087,6 +3229,138 @@ async def health(request):
         },
         status_code=status_code,
     )
+
+
+_MPD_AST_RE = re.compile(r'availabilityStartTime="([^"]+)"')
+_MPD_REP_RE = re.compile(r'<Representation id="(\d+)".*?</Representation>', re.S)
+_MPD_TIMESCALE_RE = re.compile(r'timescale="(\d+)"')
+# Continuation entries carry no t=, so t must be optional or the timeline is
+# undercounted (this is what made audio look 28s out of sync during the audit).
+_MPD_S_RE = re.compile(r'<S(?:\s+t="(\d+)")?\s+d="(\d+)"(?:\s+r="(-?\d+)")?\s*/>')
+
+
+def dash_timeline_drift_seconds(output_dir):
+    """Seconds by which the MPD's advertised live edge leads wall clock.
+
+    ffmpeg stamps availabilityStartTime when the muxer starts, then drains the
+    source's backlog as fast as it arrives (observed 1.8x for the first seconds).
+    That pushes media time permanently ahead of AST, so the manifest advertises
+    segments that are not yet "available" by a player's own arithmetic — pure
+    added latency that grows with the size of the startup burst and is invisible
+    unless something measures it. Positive = advertising future content.
+    """
+    manifest = Path(output_dir) / "ufc.mpd"
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    ast_match = _MPD_AST_RE.search(text)
+    rep_match = _MPD_REP_RE.search(text)
+    if not ast_match or not rep_match:
+        return None
+    try:
+        ast = datetime.fromisoformat(ast_match.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    rep = rep_match.group(0)
+    timescale_match = _MPD_TIMESCALE_RE.search(rep)
+    entries = _MPD_S_RE.findall(rep)
+    if not timescale_match or not entries:
+        return None
+    timescale = int(timescale_match.group(1)) or 1
+    first_t = int(entries[0][0] or 0)
+    total = 0
+    for _, duration, repeat in entries:
+        total += int(duration) * (int(repeat or 0) + 1)
+    edge = ast.timestamp() + (first_t + total) / timescale
+    return round(edge - time.time(), 2)
+
+
+def _openmetrics_lines(name, help_text, metric_type, samples):
+    """Render one OpenMetrics family; samples is a list of (labels|None, value)."""
+    lines = [f"# HELP {name} {help_text}", f"# TYPE {name} {metric_type}"]
+    for labels, value in samples:
+        if value is None:
+            continue
+        try:
+            rendered = float(value)
+        except (TypeError, ValueError):
+            continue
+        lines.append(f"{name}{{{labels}}} {rendered}" if labels else f"{name} {rendered}")
+    return lines
+
+
+async def metrics(request):
+    """GET /metrics (guarded): OpenMetrics exposition of stream, encode and viewer state.
+
+    Guarded deliberately. nginx proxies this vhost to the public internet, and the
+    counters below describe upstream sources and viewer activity.
+    """
+    config = load_config()
+    proc = process_metrics()
+    hls = hls_metrics(config)
+    health_doc = stream_health(config, proc, hls, force=True)
+    viewers = viewer_counts_snapshot()
+    output_dir = Path(config.get("stream", {}).get("output_dir", "/var/www/live.obnoxious.lol/stream"))
+
+    out: list[str] = []
+    out += _openmetrics_lines("obbystreams_up", "1 when a managed ffmpeg process is running.", "gauge",
+                              [(None, 1 if proc.get("managed") else 0)])
+    out += _openmetrics_lines("obbystreams_health_score", "Stream health score; failure threshold is negative.", "gauge",
+                              [(None, health_doc.get("score"))])
+    out += _openmetrics_lines("obbystreams_encode_rate_ratio", "Encoded content seconds per wall second; 1.0 keeps up.", "gauge",
+                              [(None, hls.get("encode_rate"))])
+    out += _openmetrics_lines("obbystreams_live_lag_seconds", "Age of the newest published segment.", "gauge",
+                              [(None, hls.get("live_lag_seconds"))])
+    out += _openmetrics_lines("obbystreams_playlist_age_seconds", "Age of the HLS media playlist.", "gauge",
+                              [(None, hls.get("playlist_age"))])
+    out += _openmetrics_lines("obbystreams_dash_timeline_drift_seconds",
+                              "Seconds the MPD's advertised live edge leads wall clock; grows with the startup burst.", "gauge",
+                              [(None, dash_timeline_drift_seconds(output_dir))])
+    out += _openmetrics_lines("obbystreams_segments_published", "Segments currently listed in the playlist.", "gauge",
+                              [(None, hls.get("segments"))])
+    out += _openmetrics_lines("obbystreams_viewers", "Currently tracked viewers.", "gauge",
+                              [(None, (viewers or {}).get("total"))])
+
+    for key, help_text in (
+        ("stream_starts", "Managed stream starts since boot."),
+        ("stream_restarts", "Managed stream restarts since boot."),
+        ("watchdog_restarts", "Restarts initiated by the watchdog since boot."),
+        ("start_failures", "Failed start attempts since boot."),
+        ("arango_dropped_writes", "Analytics writes dropped because the queue was full."),
+        ("arango_write_failures", "Analytics writes that failed to persist."),
+    ):
+        out += _openmetrics_lines(f"obbystreams_{key}_total", help_text, "counter", [(None, RUNTIME.get(key))])
+
+    proxy_cache = RUNTIME.get("proxy_cache") or {}
+    for key in ("hits", "misses", "evictions", "upstream_errors"):
+        out += _openmetrics_lines(f"obbystreams_proxy_cache_{key}_total", f"HLS proxy cache {key}.", "counter",
+                                  [(None, proxy_cache.get(key))])
+
+    # Client-reported playback quality, the only signal that reflects what a
+    # viewer actually experienced rather than what the origin emitted.
+    smoothness, stalls, reattaches, latency = [], [], [], []
+    for source_id, qoe in SOURCE_QOE.items():
+        label = str(qoe.get("label") or source_id).replace("\\", "\\\\").replace('"', '\\"')
+        selector = f'source_id="{str(source_id)[:120]}",label="{label[:120]}"'
+        watch_ms = float(qoe.get("watch_ms", 0.0))
+        buffering_ms = float(qoe.get("buffering_ms", 0.0))
+        if watch_ms > 0:
+            smoothness.append((selector, round(max(0.0, 1.0 - buffering_ms / watch_ms) * 100.0, 2)))
+        stalls.append((selector, qoe.get("stalls", 0)))
+        reattaches.append((selector, qoe.get("reattaches", 0)))
+        if qoe.get("latency_samples"):
+            latency.append((selector, round(qoe["latency_sum"] / qoe["latency_samples"], 2)))
+    out += _openmetrics_lines("obbystreams_source_smoothness_percent",
+                              "Share of client watch time not spent buffering.", "gauge", smoothness)
+    out += _openmetrics_lines("obbystreams_source_stalls_total", "Client-reported stalls.", "counter", stalls)
+    out += _openmetrics_lines("obbystreams_source_reattaches_total",
+                              "Client player teardown/re-attach cycles; each one is a visible skip.", "counter", reattaches)
+    out += _openmetrics_lines("obbystreams_source_client_latency_seconds",
+                              "Mean client-reported distance behind the live edge.", "gauge", latency)
+
+    out.append("# EOF")
+    return Response("\n".join(out) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 async def get_config(request):
@@ -3526,14 +3800,22 @@ def source_switch_allowed(config, *, force=False, stream_running=True):
     Every switch costs viewers a few seconds of black, so mid-fight flapping is
     worse than a slightly worse feed. Returns (allowed, reason).
     """
-    if force or not stream_running:
+    if not stream_running:
         return True, ""
     private_cfg = config.get("private_iptv", {})
     cooldown = float(private_cfg.get("switch_cooldown_seconds", 300) or 0)
     max_switches = int(private_cfg.get("max_switches_per_card", 6))
     last = float(SOURCE_SWITCH_STATE.get("last_switch_at") or 0.0)
+    # force skips the COOLDOWN — a segment transition or a confirmed wrong-event
+    # feed must not wait out a 5 minute timer. It must not skip the BUDGET: that
+    # is the backstop against a flapping upstream restarting the encode without
+    # limit, and every restart is visible to every viewer. Previously force
+    # short-circuited both, so max_switches_per_card constrained nothing in
+    # exactly the cases that restart the stream most.
     if SOURCE_SWITCH_STATE.get("switches", 0) >= max_switches:
         return False, f"source switch budget for this card is spent ({max_switches})"
+    if force:
+        return True, ""
     elapsed = time.monotonic() - last
     if last and elapsed < cooldown:
         return False, f"source switch cooldown: {int(cooldown - elapsed)}s remaining"
@@ -4722,7 +5004,12 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
             old_links = effective_stream_links(config)
             active_ids = merge_private_iptv_sources(config, accepted, context=context)
             new_links = effective_stream_links(config)
-            changed = old_links != new_links
+            # Compare as a SET. merge_private_iptv_sources re-sorts by selection
+            # score, and equally-scored sources (the normal case — they all score
+            # 198) can come back in a different order from one provider fetch to
+            # the next. Comparing the ordered list made that a "change" and tore
+            # down the encode to restart it on the very same URLs.
+            changed = set(old_links) != set(new_links)
             _reconcile_operator_stopped(config)
             save_config(config)
             PRIVATE_IPTV_RUNTIME.update(
@@ -5813,6 +6100,14 @@ def build_command(config, links=None):
     option_flags = {
         "restart_delay": "--restart-delay",
         "max_restart_delay": "--max-restart-delay",
+        # Slow-upstream auto-rotation. Health scoring cannot see a feed that is
+        # still emitting frames but delivering below realtime, so the supervisor
+        # watches the encode rate itself and rotates links.
+        "min_encode_rate": "--min-encode-rate",
+        "max_drift_seconds": "--max-drift-seconds",
+        "slow_source_cooldown": "--slow-source-cooldown",
+        "slow_source_backoff": "--slow-source-backoff",
+        "max_auto_rotations": "--max-auto-rotations",
         "backoff_multiplier": "--backoff-multiplier",
         "backoff_jitter": "--backoff-jitter",
         "rate_limit_delay": "--rate-limit-delay",
@@ -5923,8 +6218,97 @@ def start_managed_process(config, links, kill_existing=True):
     STREAM_HEALTH_SCORER.reset(pid=PROCESS.pid, started_at=STARTED_AT)
     READER_TASK = asyncio.create_task(read_process_output(PROCESS))
     RUNTIME["stream_starts"] += 1
+    STREAM_START_TIMES.append(time.monotonic())
     event("stream started", "ok", {"cmd": cmd, "pid": PROCESS.pid})
     return PROCESS.pid, cmd
+
+
+async def maybe_alert_stream_instability():
+    """Alert Discord when the encode is restarting far more than a card requires.
+
+    Rate-based with a cooldown, deliberately: one restart per card-segment
+    transition is normal and correct, so alerting per restart would train the
+    operator to ignore it. What was previously invisible is the pathological
+    case — repeated watchdog restarts while viewers watch it break.
+    """
+    global _LAST_INSTABILITY_ALERT_AT
+    if SCHEDULER is None or not SCHEDULER.notifier.active:
+        return
+    now_mono = time.monotonic()
+    recent = [t for t in STREAM_START_TIMES if now_mono - t <= STREAM_INSTABILITY_WINDOW_SECONDS]
+    if len(recent) < STREAM_INSTABILITY_THRESHOLD:
+        return
+    if _LAST_INSTABILITY_ALERT_AT is not None and now_mono - _LAST_INSTABILITY_ALERT_AT < STREAM_INSTABILITY_COOLDOWN_SECONDS:
+        return
+    _LAST_INSTABILITY_ALERT_AT = now_mono
+    minutes = int(STREAM_INSTABILITY_WINDOW_SECONDS // 60)
+    event(f"stream instability: {len(recent)} restarts in {minutes}m", "warn")
+    await SCHEDULER.notifier.send_embed({
+        "title": "⚠️ Stream is restarting repeatedly",
+        "description": (
+            f"The managed encode has started **{len(recent)} times in the last {minutes} minutes**. "
+            "Every restart clears the segment window and interrupts all viewers, so this is visible "
+            "on air. Check the upstream source and the cockpit event log."
+        ),
+        "color": 0xE67E22,
+        "fields": [
+            {"name": "Restarts (total)", "value": str(RUNTIME.get("stream_restarts", 0)), "inline": True},
+            {"name": "Watchdog restarts", "value": str(RUNTIME.get("watchdog_restarts", 0)), "inline": True},
+        ],
+    })
+
+
+MIN_REALTIME_ENCODE_RATE = 0.92
+ENCODE_RATE_SUSTAIN_SECONDS = 120.0
+ENCODE_RATE_ALERT_COOLDOWN_SECONDS = 1800.0
+_LOW_ENCODE_RATE_SINCE: float | None = None
+_LAST_LOW_RATE_ALERT_AT: float | None = None
+
+
+async def maybe_alert_slow_upstream(hls):
+    """Alert when the encode cannot keep up with realtime for a sustained period.
+
+    Nothing in the health scoring looks at encode rate — it only asks whether
+    ffmpeg is emitting frames and whether the playlist is fresh, both of which
+    stay true while a degrading upstream delivers at 0.7x. The stream then slides
+    steadily further behind live (observed: 0.73x, 92s behind and growing) while
+    the cockpit reports a healthy score of 380.
+
+    Deliberately an alert and not an automatic restart: a restart does not make a
+    slow source faster, and the watchdog would relaunch onto the same primary
+    link. Rotating links is the supervisor's job; a human switching sources is
+    the correct response, so this exists to tell them.
+    """
+    global _LOW_ENCODE_RATE_SINCE, _LAST_LOW_RATE_ALERT_AT
+    rate = hls.get("encode_rate")
+    now_mono = time.monotonic()
+    if rate is None or rate >= MIN_REALTIME_ENCODE_RATE:
+        _LOW_ENCODE_RATE_SINCE = None
+        return
+    if _LOW_ENCODE_RATE_SINCE is None:
+        _LOW_ENCODE_RATE_SINCE = now_mono
+        return
+    sustained = now_mono - _LOW_ENCODE_RATE_SINCE
+    if sustained < ENCODE_RATE_SUSTAIN_SECONDS:
+        return
+    if _LAST_LOW_RATE_ALERT_AT is not None and now_mono - _LAST_LOW_RATE_ALERT_AT < ENCODE_RATE_ALERT_COOLDOWN_SECONDS:
+        return
+    _LAST_LOW_RATE_ALERT_AT = now_mono
+    behind = (1.0 - rate) * sustained
+    event(f"upstream below realtime: {rate:.2f}x for {int(sustained)}s (~{int(behind)}s behind)", "warn")
+    if SCHEDULER is None or not SCHEDULER.notifier.active:
+        return
+    await SCHEDULER.notifier.send_embed({
+        "title": "⚠️ Upstream feed is slower than realtime",
+        "description": (
+            f"The encode has been running at **{rate:.2f}x** for {int(sustained)}s, so the stream is "
+            f"sliding roughly **{int(behind)}s** behind live and will keep drifting. Frames are still "
+            "flowing, so the health score looks fine — switching to another source is the fix."
+        ),
+        "color": 0xE67E22,
+        "fields": [{"name": "Encode rate", "value": f"{rate:.2f}x", "inline": True},
+                   {"name": "Sustained", "value": f"{int(sustained)}s", "inline": True}],
+    })
 
 
 async def restart_managed_with_config(reason):
@@ -6367,6 +6751,9 @@ async def watchdog_loop():
             await asyncio.sleep(2)
             config = load_config()
             stream = config.get("stream", {})
+            # Evaluated before the Stop guard: a stopped stream still deserves the
+            # alert for the restart storm that preceded the operator stopping it.
+            await maybe_alert_stream_instability()
             # Operator Stop is a hard idle: no auto-recovery of either the exited
             # or the stalled branch until a human Starts the stream again.
             if operator_stopped(config):
@@ -6400,6 +6787,10 @@ async def watchdog_loop():
                     continue
                 proc = process_metrics()
                 hls = hls_metrics(config)
+                # Checked before the decision gate: a slow upstream keeps the
+                # score healthy by design, so this would never be reached if it
+                # sat behind a "failed" verdict.
+                await maybe_alert_slow_upstream(hls)
                 assessment = stream_health(config, proc, hls, force=True)
                 if assessment.get("decision") != "failed":
                     continue
@@ -6742,6 +7133,7 @@ routes = [
     Route("/favicon.ico", static_asset("favicon.svg", "image/svg+xml")),
     Route("/og-image.png", static_asset("og-image.png", "image/png")),
     Route("/api/health", health),
+    Route("/metrics", guarded(metrics)),
     Route("/api/auth/login", login, methods=["POST"]),
     Route("/api/status", guarded(status)),
     Route("/api/sources", guarded(list_sources), methods=["GET"]),

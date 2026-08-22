@@ -523,10 +523,57 @@ def kill_instances(procs):
 
 
 def cleanup(stream_dir):
+    """Remove every published artefact. Only for a cold start or a shutdown."""
     for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.mpd", "ufc*.m4s", "ufc*.mp4", "media_*.m3u8", "*.tmp"):
         for f in glob.glob(os.path.join(stream_dir, pattern)):
             with contextlib.suppress(OSError):
                 os.remove(f)
+
+
+def run_token():
+    """Short, sortable token namespacing one ffmpeg run's segments on disk."""
+    return f"{int(time.time()):x}"
+
+
+# Deliberately not tied to run_token()'s current hex format: a token format change
+# must not silently turn pruning into a no-op and leak every run's segments to disk.
+_RUN_FILE_RE = re.compile(r"^ufc_r([0-9a-z]+)_")
+
+
+LEGACY_SEGMENT_GRACE_SECONDS = 180.0
+
+
+def prune_foreign_runs(stream_dir, keep_tokens, legacy_grace=LEGACY_SEGMENT_GRACE_SECONDS):
+    """Delete segments belonging to runs other than keep_tokens; return the count.
+
+    Relaunching ffmpeg used to wipe the whole output directory first, which meant
+    every restart pulled the init segments and the entire DVR window out from
+    under connected players — a 2s process blip became a wall of 404s and a
+    forced re-attach for everyone. Namespacing each run's files instead lets the
+    previous run's segments stay readable while the new run spins up, so anything
+    mid-fetch still resolves. The manifests are deliberately left alone: they are
+    overwritten by the incoming run, and until they are, players keep serving
+    themselves from segments that still exist.
+    """
+    removed = 0
+    cutoff = time.time() - legacy_grace
+    for pattern in ("ufc_r*", "ufc_chunk_*", "ufc_init_*"):
+        for path in glob.glob(os.path.join(stream_dir, pattern)):
+            match = _RUN_FILE_RE.match(os.path.basename(path))
+            if match and match.group(1) in keep_tokens:
+                continue
+            with contextlib.suppress(OSError):
+                # Age gate applies to every foreign file, not just the
+                # un-namespaced ones. A supervisor restart (the common path —
+                # source refresh, watchdog) starts a fresh process that knows
+                # nothing of the previous run's token, so without this it would
+                # delete the outgoing run's segments the instant it came up and
+                # 404 every viewer mid-handover, which is the whole failure this
+                # was meant to remove.
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+    return removed
 
 
 def ensure_output_dir(path):
@@ -735,7 +782,7 @@ def choose_encoder(args):
     return max(profiles, key=lambda p: p.score), profiles
 
 
-def build_ffmpeg_cmd(args, url, encoder):
+def build_ffmpeg_cmd(args, url, encoder, run_id="0"):
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     network_input = url.startswith(("http://", "https://", "rtmp://", "rtmps://"))
     source_headers = getattr(args, "source_headers", {}).get(url, {})
@@ -773,8 +820,27 @@ def build_ffmpeg_cmd(args, url, encoder):
             "-reconnect_delay_max", str(args.reconnect_delay),
         ]
 
-    if network_input:
-        cmd += ["-re"]
+    # Input pacing. Two failure modes bracket this setting, and both were observed:
+    #
+    #   bare -re (== -readrate 1 with the default 1.05x catchup): every network
+    #   hiccup becomes standing latency the catchup rate is too slow to drain, so
+    #   delay COMPOUNDS across a run (measured 15.4s accumulated in 5.5 minutes).
+    #
+    #   no pacing at all: ffmpeg drains the source's connect-time backlog as fast
+    #   as it arrives (measured 1.82x for the first seconds), which pushes the
+    #   media clock permanently AHEAD of availabilityStartTime — the manifest then
+    #   advertises segments ~6s in the future and every DASH player waits out that
+    #   gap as pure added latency.
+    #
+    # -readrate 1 keeps the media clock on wall clock; a bounded initial burst
+    # still fills the pipeline at startup; and a catchup well above 1.05 lets real
+    # lag actually drain instead of accumulating.
+    if network_input and args.readrate > 0:
+        cmd += [
+            "-readrate", str(args.readrate),
+            "-readrate_initial_burst", str(args.readrate_initial_burst),
+            "-readrate_catchup", str(args.readrate_catchup),
+        ]
 
     cmd += ["-i", url]
 
@@ -808,8 +874,10 @@ def build_ffmpeg_cmd(args, url, encoder):
         "-bufsize:v:1", args.bufsize_1080,
         "-g:v:0", str(args.gop),
         "-g:v:1", str(args.gop),
-        "-keyint_min:v:0", str(args.gop),
-        "-keyint_min:v:1", str(args.gop),
+        # No -keyint_min: pinning it equal to -g forbids the encoder from closing a
+        # GOP early, which is exactly what force_key_frames asks it to do. At
+        # 59.94fps a 120-frame GOP is 2.002s while force_key_frames wants 2.000s,
+        # so the two never agree and segment durations come out uneven.
         "-force_key_frames:v:0", f"expr:gte(t,n_forced*{args.hls_time})",
         "-force_key_frames:v:1", f"expr:gte(t,n_forced*{args.hls_time})",
         "-profile:v:0", "high",
@@ -826,7 +894,11 @@ def build_ffmpeg_cmd(args, url, encoder):
         "-c:a", "aac",
         "-b:a", args.audio_bitrate,
         "-ac", "2",
-        "-af", "aresample=async=1:first_pts=0",
+        # async=1 corrects the audio start ONCE and then lets it free-run, so a
+        # feed that drifts (reconnects, discarded packets) desyncs progressively
+        # over a multi-hour card with nothing pulling it back. async=1000 allows
+        # continuous correction of up to 1000 samples/sec.
+        "-af", "aresample=async=1000:first_pts=0",
         "-max_muxing_queue_size", "9999",
         "-f", "dash",
         "-seg_duration", str(args.hls_time),
@@ -835,12 +907,24 @@ def build_ffmpeg_cmd(args, url, encoder):
         "-extra_window_size", str(args.hls_delete_threshold),
         "-use_template", "1",
         "-use_timeline", "1",
+        # A dynamic MPD locates the live edge as availabilityStartTime + media time,
+        # compared against a clock. With no UTCTiming element the player has to use
+        # the device's own clock, so every viewer's latency inherits their clock
+        # skew and a fast clock requests segments before they exist. DASH-IF IOP
+        # requires this for live. ffmpeg emits urn:mpeg:dash:utc:http-xsdate:2014,
+        # so the URL must return an xs:dateTime body (nginx `location = /time`).
+        *(["-utc_timing_url", args.utc_timing_url] if args.utc_timing_url else []),
         "-dash_segment_type", "mp4",
         "-hls_playlist", "1",
         "-hls_master_name", "ufc.m3u8",
         "-master_m3u8_publish_rate", "1",
-        "-init_seg_name", "ufc_init_$RepresentationID$.$ext$",
-        "-media_seg_name", "ufc_chunk_$RepresentationID$_$Number%06d$.$ext$",
+        # Per-run prefix. Segment numbering restarts at 1 on every relaunch and the
+        # init segments have fixed names, so without this a new run's files collide
+        # with the previous run's and a player holding the old init decodes garbage.
+        # Unique names also make each segment immutable for its whole lifetime,
+        # which is the precondition for ever putting a CDN in front of them.
+        "-init_seg_name", f"ufc_r{run_id}_init_$RepresentationID$.$ext$",
+        "-media_seg_name", f"ufc_r{run_id}_chunk_$RepresentationID$_$Number%06d$.$ext$",
         "-adaptation_sets", "id=0,streams=0,1 id=1,streams=2",
         os.path.join(args.output_dir, "ufc.mpd"),
     ]
@@ -903,7 +987,10 @@ def _write_encode_status(args, ff):
         pass
 
 
-def update_progress(state, line, args=None):
+PROGRESS_LOG_INTERVAL = 30.0
+
+
+def update_progress(state, line, args=None, process_log=None, process_log_lock=None):
     line = line.strip()
     if "=" not in line:
         return
@@ -911,14 +998,27 @@ def update_progress(state, line, args=None):
     if not key:
         return
     snapshot = None
+    should_log = False
     with with_lock(state):
         state["ffmpeg"][key] = value
         # ffmpeg -progress emits `progress=continue` to close each stats block;
         # snapshot the live values (incl. real speed) and publish for the app.
         if key == "progress":
             snapshot = dict(state["ffmpeg"])
+            now_mono = time.monotonic()
+            if now_mono - state.get("last_progress_log_at", 0.0) >= PROGRESS_LOG_INTERVAL:
+                state["last_progress_log_at"] = now_mono
+                should_log = True
     if snapshot is not None and args is not None:
         _write_encode_status(args, snapshot)
+    if should_log and process_log is not None:
+        # One line per interval, retaining exactly the fields needed to answer
+        # "was the encoder keeping up, and was it dropping frames" after the fact.
+        summary = " ".join(
+            f"{field}={snapshot.get(field, '?')}"
+            for field in ("out_time", "fps", "speed", "drop_frames", "dup_frames", "frame")
+        )
+        write_process_log(process_log, process_log_lock, "progress", summary)
 
 
 def remember_ffmpeg_log(state, line, args):
@@ -963,10 +1063,16 @@ def is_ffmpeg_error_line(line):
 def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=None):
     try:
         for line in iter(stream.readline, ""):
-            write_process_log(process_log, process_log_lock, kind, line.rstrip())
             if kind == "progress":
-                update_progress(state, line, args)
+                # ffmpeg -progress emits ~12 key=value lines every second. Writing
+                # them verbatim made the log ~99% noise (one run reached 11 MB) and
+                # buried the stderr that actually matters — decode errors, timestamp
+                # discontinuities, reconnects. Emit one condensed sample per
+                # PROGRESS_LOG_INTERVAL instead, which doubles as the encode
+                # time-series that .encode-progress.json (point-in-time) cannot give.
+                update_progress(state, line, args, process_log, process_log_lock)
             else:
+                write_process_log(process_log, process_log_lock, kind, line.rstrip())
                 remember_ffmpeg_log(state, line, args)
     except Exception as exc:
         add_event(state, f"ffmpeg {kind} reader stopped: {exc}", "warn")
@@ -1131,6 +1237,127 @@ def manual_next_index(health, current_index):
     return (current_index + 1) % len(health)
 
 
+def parse_out_time(value):
+    """ffmpeg's HH:MM:SS.mmm progress field as seconds, or None."""
+    try:
+        hours, minutes, seconds = str(value).split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (ValueError, AttributeError):
+        return None
+
+
+def next_available_index(health, current_index):
+    """Next link that is not in backoff, wrapping; falls back to plain rotation."""
+    if len(health) <= 1:
+        return current_index
+    now = time.monotonic()
+    for step in range(1, len(health) + 1):
+        candidate = (current_index + step) % len(health)
+        if health[candidate].backoff_until <= now:
+            return candidate
+    return manual_next_index(health, current_index)
+
+
+def realtime_watchdog_thread(state, args, health):
+    """Rotate off an upstream that is delivering slower than realtime.
+
+    Nothing else catches this. The health scoring asks whether ffmpeg is emitting
+    frames and whether the playlist is fresh — both stay true while a feed decays
+    to 0.7x, so it scores healthy while the stream slides further behind live
+    every second (observed: 92s behind and growing, score still 380).
+
+    Two things make this measurable and safe. `speed=` is a CUMULATIVE average
+    and lags reality badly, so the rate is derived from out_time deltas over wall
+    clock instead. And a rotation no longer wipes the output directory, so the
+    cost of being wrong is a brief gap rather than 404ing every viewer.
+    """
+    if args.min_encode_rate <= 0 or len(health) <= 1:
+        return None
+
+    def run():
+        base_at = None       # wall clock of the first settled sample
+        base_out = None      # content produced at that moment
+        last_at = None
+        last_out = None
+        last_rotation_at = 0.0
+        rotations = 0
+        while not state["interrupted"]:
+            interruptible_sleep(5.0, lambda: state["interrupted"])
+            if state["interrupted"]:
+                break
+            progress, _, _ = ffmpeg_snapshot(state)
+            out_seconds = parse_out_time(progress.get("out_time"))
+            now = time.monotonic()
+            started = state.get("stream_start")
+
+            # A relaunch restarts out_time at zero; never diff across that.
+            if out_seconds is None or (last_out is not None and out_seconds < last_out):
+                base_at = base_out = last_at = last_out = None
+                continue
+            # Judge only a settled run: the initial burst reads far above 1x.
+            if not started or (now - started) < max(args.min_assessment_seconds, 30.0):
+                continue
+            if base_at is None:
+                base_at, base_out = now, out_seconds
+                last_at, last_out = now, out_seconds
+                continue
+
+            wall = now - last_at
+            if wall < 4.0:
+                continue
+            rate = (out_seconds - last_out) / wall
+            last_at, last_out = now, out_seconds
+
+            # Accumulated shortfall, NOT a run of low samples. An upstream dip of
+            # a minute or two is normal and --readrate_catchup drains it back to
+            # zero on its own (observed: 37s of deficit fully recovered). Rotating
+            # on "rate was low for N seconds" fires on exactly those recoverable
+            # dips. What actually distinguishes a dying feed is a deficit that
+            # keeps growing because nothing is draining it.
+            deficit = (now - base_at) - (out_seconds - base_out)
+            if deficit < args.max_drift_seconds:
+                continue
+            # Still behind, but catching up: leave it alone, that is the fix working.
+            if rate >= 1.0:
+                continue
+            if now - last_rotation_at < args.slow_source_cooldown:
+                continue
+            if rotations >= args.max_auto_rotations:
+                continue
+
+            current = health[state["url_index"]]
+            target = next_available_index(health, state["url_index"])
+            if target == state["url_index"]:
+                # Every alternative is in backoff; rotating in place would just
+                # restart onto the same slow feed.
+                continue
+
+            # Hold the slow link down so rotation cannot land straight back on it.
+            current.backoff_until = now + args.slow_source_backoff
+            rotations += 1
+            last_rotation_at = now
+            state["url_index"] = target
+            # Reuses the manual-switch path deliberately: the link is slow, not
+            # failed, so it must not be scored as a failure and pushed toward the
+            # stop-after-failed-rounds kill switch.
+            state["manual_rotate"] = True
+            emit(
+                state,
+                args,
+                f"upstream not keeping up ({rate:.2f}x, {int(deficit)}s behind and not recovering) "
+                f"-> auto-switch to link [{target + 1}/{len(health)}] {short_url(health[target].url)}",
+                "warn",
+            )
+            proc = state.get("proc_obj")
+            if proc and proc.poll() is None:
+                proc.terminate()
+            last_at, last_out = None, None
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
 def keyboard_thread(state, health, args):
     if not sys.stdin.isatty():
         return None
@@ -1227,9 +1454,15 @@ def parser_for_args():
     parser.add_argument("--maxrate-1080", default=None, dest="maxrate_1080", help="1080p rendition max video bitrate")
     parser.add_argument("--bufsize-1080", default=None, dest="bufsize_1080", help="1080p rendition video buffer size")
     parser.add_argument("--audio-bitrate", "-ab", default="192k", dest="audio_bitrate", help="Audio bitrate")
-    parser.add_argument("--hls-time", default=4, type=int, help="HLS segment duration in seconds")
-    parser.add_argument("--hls-size", default=10, type=int, help="HLS playlist size in segments")
-    parser.add_argument("--hls-delete-threshold", default=4, type=int, help="Extra old HLS segments to keep")
+    # 2s segments keep the player's 3-segment live buffer down to ~6s. The GOP below is
+    # 120 frames (~2s at 59.94fps), so segments still start on a keyframe.
+    parser.add_argument("--hls-time", default=2, type=int, help="HLS segment duration in seconds")
+    parser.add_argument("--hls-size", default=15, type=int, help="HLS playlist size in segments")
+    # Retention beyond the published window. A viewer on a weak connection drifts
+    # behind the live edge; if the segment it is still fetching has already been
+    # deleted it 404s, the player errors, and the recovery is a visible skip.
+    # 15 + 20 = 70s of files on disk (~105 MB) against a 30s published window.
+    parser.add_argument("--hls-delete-threshold", default=20, type=int, help="Extra old HLS segments to keep")
     parser.add_argument("--gop", default=120, type=int, help="GOP / keyframe interval")
     parser.add_argument("--output-dir", default=DEFAULT_STREAM_DIR, dest="output_dir", help="HLS output directory")
     parser.add_argument("--ffmpeg-log-dir", default=DEFAULT_FFMPEG_LOG_DIR, dest="ffmpeg_log_dir",
@@ -1244,6 +1477,35 @@ def parser_for_args():
     parser.add_argument("--no-reconnect", action="store_true", help="Disable ffmpeg-level reconnect flags")
     parser.add_argument("--reconnect-delay", default=5, type=int, dest="reconnect_delay", help="Max ffmpeg reconnect delay")
     parser.add_argument("--timeout", default=10, type=int, help="HTTP read/connect timeout in seconds")
+    parser.add_argument("--utc-timing-url", dest="utc_timing_url",
+                        default="https://fight.nswfiles.com/time",
+                        help="URL returning an xs:dateTime body, published as the MPD's "
+                             "UTCTiming element so players do not rely on the device clock")
+    parser.add_argument("--min-encode-rate", default=0.92, type=float, dest="min_encode_rate",
+                        help="Set to 0 to disable slow-upstream auto-rotation entirely. Health "
+                             "scoring cannot see this failure: a decaying feed keeps emitting "
+                             "frames and a fresh playlist, and scores healthy the whole way down")
+    parser.add_argument("--max-drift-seconds", default=60.0, type=float, dest="max_drift_seconds",
+                        help="Rotate once the stream has fallen this far behind realtime AND is "
+                             "not catching up. Deliberately measured as accumulated drift rather "
+                             "than a run of slow samples, so a recoverable dip that --readrate-catchup "
+                             "drains does not cost viewers a switch")
+    parser.add_argument("--slow-source-cooldown", default=300.0, type=float, dest="slow_source_cooldown",
+                        help="Minimum gap between automatic slow-source rotations")
+    parser.add_argument("--slow-source-backoff", default=900.0, type=float, dest="slow_source_backoff",
+                        help="How long a link rotated away from for being slow is skipped")
+    parser.add_argument("--max-auto-rotations", default=3, type=int, dest="max_auto_rotations",
+                        help="Cap on automatic slow-source rotations per supervisor run, so a "
+                             "provider that is slow on every link cannot cause endless restarts")
+    parser.add_argument("--readrate", default=1.0, type=float,
+                        help="Pace input reads at this multiple of realtime (0 disables pacing). "
+                             "1.0 keeps the media clock aligned with wall clock")
+    parser.add_argument("--readrate-initial-burst", default=4.0, type=float, dest="readrate_initial_burst",
+                        help="Seconds of input to burst-read before pacing applies, to fill the "
+                             "pipeline at startup without skewing the media clock for the whole run")
+    parser.add_argument("--readrate-catchup", default=2.0, type=float, dest="readrate_catchup",
+                        help="Temporary read rate used to drain lag after an input stall. ffmpeg's "
+                             "default of 1.05 is too slow to recover, so lag compounds")
     parser.add_argument("--thread-queue-size", default=8192, type=int, dest="thread_queue_size", help="ffmpeg input queue size")
     parser.add_argument("--analyzeduration", default=2_000_000, type=int, help="ffmpeg analyze duration in microseconds")
     parser.add_argument("--probesize", default=2_000_000, type=int, help="ffmpeg probe size in bytes")
@@ -1346,7 +1608,12 @@ def main():
             print("Existing instance left running. Exiting.")
             sys.exit(0)
 
-    cleanup(args.output_dir)
+    # NOT a full wipe. A supervisor restart is the normal way this process starts
+    # (source refresh, watchdog), and the previous supervisor's segments are still
+    # being fetched by live viewers at that moment. Age-gated pruning lets the
+    # handover happen without 404ing everyone, and the outgoing files disappear
+    # on their own once nobody can still be asking for them.
+    prune_foreign_runs(args.output_dir, set())
 
     health = [StreamHealth(i, u) for i, u in enumerate(urls)]
     state = {
@@ -1365,6 +1632,7 @@ def main():
         "ffmpeg_logs": deque(maxlen=8),
         "ffmpeg_errors": deque(maxlen=24),
         "last_ffmpeg_log_at": None,
+        "last_progress_log_at": 0.0,
         "live_ui": sys.stdout.isatty() and not args.verbose,
     }
     proc = None
@@ -1397,21 +1665,35 @@ def main():
         print()
 
     status_thread(state, args, health, encoder, interval=10)
+    realtime_watchdog_thread(state, args, health)
     keyboard_thread(state, health, args)
 
+    previous_run = None
     try:
         while not state["interrupted"]:
             current = health[state["url_index"]]
             current.record_start()
-            cmd = build_ffmpeg_cmd(args, current.url, encoder)
+            this_run = run_token()
+            # run_token() is second-resolution; a fast relaunch inside the same
+            # second would otherwise reuse the previous run's namespace.
+            while this_run == previous_run:
+                time.sleep(0.4)
+                this_run = run_token()
+            cmd = build_ffmpeg_cmd(args, current.url, encoder, run_id=this_run)
 
-            cleanup(args.output_dir)
+            # Keep the outgoing run's segments so players mid-fetch still resolve
+            # while the new run comes up; drop everything older than that.
+            prune_foreign_runs(args.output_dir, {this_run, previous_run} - {None})
+            previous_run = this_run
             action = "restart" if state["restarts"] else "starting"
             with with_lock(state):
                 state["ffmpeg"] = {}
                 state["ffmpeg_logs"].clear()
                 state["ffmpeg_errors"].clear()
                 state["last_ffmpeg_log_at"] = None
+                # Log the first progress sample of a new run immediately rather
+                # than waiting out the interval from the previous one.
+                state["last_progress_log_at"] = 0.0
             emit(state, args, f"{action} -> link [{current.index + 1}/{len(health)}] {short_url(current.url)}")
 
             stream_start = time.monotonic()
@@ -1543,8 +1825,12 @@ def main():
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        cleanup(args.output_dir)
-        print(f"\n{icon(APP_NAME, args)} stopped. cleaned up.")
+        # Leave the published segments and manifests in place. A stop is almost
+        # always immediately followed by a replacement supervisor, and wiping here
+        # is what actually pulled the DVR window out from under viewers on every
+        # restart. Anything genuinely stale is pruned by age on the next start.
+        prune_foreign_runs(args.output_dir, set())
+        print(f"\n{icon(APP_NAME, args)} stopped.")
 
 
 if __name__ == "__main__":

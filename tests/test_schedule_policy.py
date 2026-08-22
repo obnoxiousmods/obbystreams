@@ -4,6 +4,7 @@
 here with a fake clock — no network, no event loop, no ffmpeg.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -59,6 +60,22 @@ def test_automation_defaults_match_the_broadcast_contract(settings):
     assert settings.end_grace_minutes == 30
     assert settings.acquisition_poll_seconds == 180
     assert settings.cache_max_age_hours == 72
+
+
+def test_three_segment_card_keeps_a_full_main_card_failsafe_window(scheduler, settings):
+    early = FIRST_CARD
+    prelims = FIRST_CARD + timedelta(hours=2)
+    main = FIRST_CARD + timedelta(hours=4)
+    event = replace(
+        build_event(),
+        cards=(
+            CardSegment(early, "Early prelims", 4, 0),
+            CardSegment(prelims, "Prelims", 6, 0),
+            CardSegment(main, "Main card", 5, 0),
+        ),
+    )
+
+    assert scheduler.hard_stop_for(event, settings) == (main + timedelta(hours=5)).timestamp()
 
 
 # ------------------------------------------------------------------- arming
@@ -117,6 +134,34 @@ def test_does_not_start_when_disabled(scheduler):
 
 def test_does_not_start_when_a_manual_stream_is_already_running(scheduler, settings):
     decision = scheduler.decide(FIRST_CARD, build_event(), ScheduleState(), settings, stream_running=True)
+
+    assert decision.action is SchedulerAction.IDLE
+    assert "not scheduler-owned" in decision.reason
+
+
+def test_replaces_a_running_feed_that_is_not_verified_for_this_card(scheduler, settings):
+    decision = scheduler.decide(
+        FIRST_CARD,
+        build_event(),
+        ScheduleState(),
+        settings,
+        stream_running=True,
+        stream_verified=False,
+    )
+
+    assert decision.action is SchedulerAction.START
+    assert "unverified" in decision.reason
+
+
+def test_does_not_touch_an_unverified_manual_stream_before_the_event_window(scheduler, settings):
+    decision = scheduler.decide(
+        FIRST_CARD - timedelta(hours=2),
+        build_event(),
+        ScheduleState(),
+        settings,
+        stream_running=True,
+        stream_verified=False,
+    )
 
     assert decision.action is SchedulerAction.IDLE
     assert "not scheduler-owned" in decision.reason
@@ -323,6 +368,20 @@ def test_rearms_when_the_encode_dies_mid_card(scheduler, settings):
     assert "re-arming" in decision.reason
 
 
+def test_replaces_a_wrong_segment_feed_even_after_taking_ownership(scheduler, settings):
+    decision = scheduler.decide(
+        MAIN_CARD,
+        build_event(),
+        armed_state(),
+        settings,
+        stream_running=True,
+        stream_verified=False,
+    )
+
+    assert decision.action is SchedulerAction.START
+    assert "wrong-segment" in decision.reason
+
+
 def test_does_not_rearm_once_the_card_is_final(scheduler, settings):
     state = armed_state(final_seen_at=MAIN_CARD)
     decision = scheduler.decide(MAIN_CARD + timedelta(minutes=1), build_event(final=True), state, settings, stream_running=False)
@@ -334,6 +393,17 @@ def test_does_not_rearm_once_the_card_is_final(scheduler, settings):
 def test_adopts_a_stream_that_was_already_running_when_the_card_began(scheduler, settings):
     """Without this the feature is a no-op unless the operator pressed Stop first."""
     assert scheduler.should_adopt(MAIN_CARD, build_event(), ScheduleState(), settings, stream_running=True) is True
+
+
+def test_does_not_adopt_an_unverified_running_feed(scheduler, settings):
+    assert scheduler.should_adopt(
+        MAIN_CARD,
+        build_event(),
+        ScheduleState(),
+        settings,
+        stream_running=True,
+        stream_verified=False,
+    ) is False
 
 
 def test_adoption_makes_the_stand_down_fire(scheduler, settings):

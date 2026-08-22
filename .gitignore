@@ -13,6 +13,10 @@ build/
 *.egg-info/
 *.log
 artifacts/
+# Staging dir and rollback copy for the zero-downtime frontend swap
+# (build to .static-next, then mv static -> static.prev). See docs/frontend.md.
+.static-next/
+static.prev/
 ffmpegLogs/
 .env
 .env.*

@@ -11,7 +11,10 @@ import type { BlacklistEntry, PublicStreamSource, SourceStatus, StatusPayload } 
 const noop = async () => {};
 
 describe("SourcesPanel", () => {
-  it("renders a Block button that calls onBlock with the source", () => {
+  // Block moved behind the per-source "More" menu, so the destructive actions are
+  // not one mis-tap away from Switch. Asserting through the menu also covers that
+  // the menu actually opens.
+  it("exposes Block in the More menu and calls onBlock with the source", () => {
     const source: SourceStatus = { id: "private-iptv-x", label: "UFC Main", url: "https://s/x.m3u8" };
     const onBlock = vi.fn(async () => {});
     render(
@@ -25,7 +28,9 @@ describe("SourcesPanel", () => {
         onBlock={onBlock}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Block" }));
+    expect(screen.queryByRole("menuitem", { name: /Block/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /More/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Block/ }));
     expect(onBlock).toHaveBeenCalledWith(source);
   });
 });

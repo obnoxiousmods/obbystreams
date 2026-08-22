@@ -8,9 +8,12 @@ scraper ever asked. These tests pin the answer to "is this *tonight's* card?".
 """
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
 
 import app
-from obbyschedule import CardSegment, ScheduleSettings, UfcEvent
+from obbyschedule import CardSegment, ScheduleSettings, StartStatus, UfcEvent
 
 SETTINGS = ScheduleSettings.from_config({})
 
@@ -357,8 +360,77 @@ def test_high_grade_requires_current_segment_identity_and_deep_probe():
     context = context_at(CARD_DAY.replace(hour=15))
 
     assert app.live_stream_is_high_grade(config, context, now=CARD_DAY.replace(hour=15))
+    assert not app.live_stream_is_high_grade(
+        config,
+        context,
+        now=CARD_DAY.replace(hour=15),
+        actual_links=("https://soursignal.com/x/y/stale",),
+    )
     config["stream"]["sources"][0]["probe_score"] = 40
     assert not app.live_stream_is_high_grade(config, context, now=CARD_DAY.replace(hour=15))
+
+
+def test_running_source_acceptance_uses_actual_ffmpeg_links_not_new_config(monkeypatch):
+    main = "https://soursignal.com/x/y/main"
+    stale = "https://soursignal.com/x/y/last-week"
+    config = {
+        "stream": {
+            "sources": [
+                {
+                    "id": "main",
+                    "url": main,
+                    "enabled": True,
+                    "event_id": "600059339",
+                    "segment_label": "Main card",
+                    "match_confidence": "exact",
+                    "probe_score": 95,
+                }
+            ]
+        }
+    }
+    context = context_at(CARD_DAY.replace(hour=17))
+    resolver = app.CockpitSourceResolver()
+    monkeypatch.setattr(app, "load_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(app, "process_metrics", lambda: {"managed": True})
+
+    monkeypatch.setattr(app, "MANAGED_LINKS", (stale,))
+    assert not resolver.is_stream_acceptable(context)
+
+    monkeypatch.setattr(app, "MANAGED_LINKS", (main,))
+    assert resolver.is_stream_acceptable(context)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_start_quarantines_a_running_feed_when_no_verified_link_exists(monkeypatch):
+    context = context_at(CARD_DAY.replace(hour=15))
+    config = {"stream": {"sources": [], "links": []}, "private_iptv": private_config()}
+    process = SimpleNamespace(poll=lambda: None)
+    stopped = []
+
+    async def fake_stop(reason):
+        stopped.append(reason)
+        app.PROCESS = None
+        return True
+
+    monkeypatch.setattr(app, "SCHEDULER", SimpleNamespace(state=SimpleNamespace(
+        current_event_id=context.event_id,
+        suppressed_event_id=None,
+    )))
+    monkeypatch.setattr(app, "ACTIVE_EVENT_CONTEXT", context)
+    monkeypatch.setattr(app, "PROCESS", process)
+    monkeypatch.setattr(app, "STREAM_DESIRED_STATE", "running")
+    monkeypatch.setattr(app, "load_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(app, "set_operator_stopped", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "purge_foreign_event_sources", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(app, "schedule_start_links", lambda *args, **kwargs: ([], "no verified source"))
+    monkeypatch.setattr(app, "stop_managed_process", fake_stop)
+    monkeypatch.setattr(app, "event", lambda *args, **kwargs: None)
+
+    result = await app.schedule_start_stream("pre-roll")
+
+    assert result.status is StartStatus.AWAITING_SOURCE
+    assert stopped == ["unverified running feed quarantined by auto-schedule"]
+    assert app.STREAM_DESIRED_STATE == "stopped"
 
 
 def test_switch_guardrails_stop_the_stream_from_flapping():

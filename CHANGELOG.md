@@ -47,6 +47,60 @@ All notable Obbystreams changes are tracked here.
 
 ### Changed
 
+- **Cockpit frontend overhaul.** The dashboard had never had a responsive or
+  typographic pass. Full-page measurement at 320–3440px found no horizontal
+  overflow but heavy waste: at 1920 the right half of the lower grid sat empty
+  for ~2000px of scroll while `TelemetryPanel` — the densest panel in the app —
+  was squeezed into a 615px column, and the page ran 5405px at 1920 / 10534px at
+  393 (twelve screenfuls). Changes:
+  - **Self-hosted variable fonts.** `styles.css` had always declared
+    `font-family: Inter` without shipping Inter, so every client rendered a
+    different fallback (on a machine with no Inter installed, a *monospace* one)
+    and the existing `tabular-nums` silently did nothing. Inter + JetBrains Mono
+    latin `wght` woff2 are now vendored under `frontend/src/fonts/` and imported
+    with relative `url()` so Vite hashes them into `static/assets/`. No font CDN
+    is contacted, and metrics-matched fallback faces keep `font-display: swap`
+    from reflowing.
+  - **Layout restructured** from two fixed 2-column grids into `stageRow` /
+    `sourcesRow` / `telemetryRow`. `GpuPanel` moved out of the vitals rail and
+    becomes a third stage column at ≥1600px; `TelemetryPanel` is full-bleed, so
+    its playlist tail, ffmpeg errors, events and logs sit side by side instead of
+    stacking; the four short source panels use balanced multicol rather than a
+    grid that stranded whichever card wrapped to a new row.
+  - **Mobile-first breakpoints.** The six desktop-first `max-width` blocks
+    (1360/1040/880/720/560/420), which were interleaved with Tailwind `lg:`
+    min-width variants and left a dead band at 1040–1360, are now one min-width
+    ladder on Tailwind's scale plus `3xl`/`4xl`/`5xl`. Metric grids auto-fit to
+    their *panel* width rather than the viewport, since the vitals rail (~390px)
+    and full-bleed telemetry (~2060px) coexist at the same viewport.
+  - **Design tokens.** Added a surface/ink/status token ladder and a fluid
+    `clamp()` type scale, retiring 22 hardcoded one-off hexes (including
+    `#181222` on `button.secondary`, one digit off the `#181322` token it should
+    have used) and three per-breakpoint `h1` font-size rules.
+  - **Density and hierarchy.** Metric labels stepped down (dim, uppercase,
+    micro) and values up, which is what makes a wall of tiles scannable.
+    Consistent `--gutter` / `--pad-panel` rhythm throughout.
+  - **Collapsible panels** (Process, GPU, Private IPTV, Public Streams,
+    Blacklist, Telemetry) persisted to `localStorage["obbystreams_ui_v1"]`,
+    defaulting closed for the diagnostic panels below 1024px.
+  - **Compact mobile action bar** — Auto-schedule + Start/Restart/Stop no longer
+    stack into four full-width buttons (~200px before any data).
+  - **Condensing sticky status bar** via an `IntersectionObserver` sentinel, so
+    encode rate / Run / Health stay visible mid-page at every width.
+  - **`UrlChip`** replaces `overflow-wrap: anywhere` on URLs with CSS
+    middle-truncation plus a copy button. `anywhere` also shrank min-content
+    width, which is how a long public HLS URL was widening the whole document.
+  - Feed boxes gained a fade mask and expand control instead of clipping
+    mid-sentence; per-source destructive actions moved behind a `More` menu;
+    metric tiles flash on meaningful change (never on the 2.5s clock); and
+    hover/focus/`prefers-reduced-motion` handling replaced a global
+    `-translate-y-px` that nudged every button in the cockpit.
+  - Result: 5405px → ~3380px at 1920 (-38%) and 10534px → ~5620px at 393 (-47%),
+    with no horizontal overflow at any width from 320 to 3440.
+- **Frontend bundle split** (`vite.config.ts` `manualChunks`): video.js and React
+  are separate long-lived chunks, so the app chunk is 54KB instead of 943KB and a
+  CSS/JSX-only redeploy no longer invalidates ~600KB of video.js in every cache.
+  Offscreen telemetry/GPU/source panels get `content-visibility: auto`.
 - **Type checking migrated from mypy to [ty](https://github.com/astral-sh/ty)**
   (Astral) at strict settings (`error-on-warning`); the ruff ruleset was
   broadened (C4, PIE, RET, RUF, ASYNC, PERF, ISC, TID, FLY, G, LOG, PLE). All
