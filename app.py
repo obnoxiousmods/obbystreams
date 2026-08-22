@@ -1595,7 +1595,8 @@ async def _apply_geo(ip_hash, geo):
 
 
 def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, label=None,
-                      reattaches=0, live_latency_seconds=None, dropped_frames=0):
+                      reattaches=0, live_latency_seconds=None, dropped_frames=0,
+                      last_error=None, mirror_id=None):
     """Accumulate per-source quality-of-experience from client heartbeats.
 
     reattaches and live_latency_seconds are the two that actually diagnose
@@ -1604,14 +1605,22 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
     viewer is riding the live edge or stuck far behind it. Both are computed in
     the browser; before they were reported these had to be reconstructed by
     counting init-segment refetches in the nginx access log.
+
+    last_error and mirror_id say WHY and WHERE. Without them a re-attach count
+    is a number with no cause attached, and since the two Cloudflare mirrors are
+    the same vhost, a fault specific to one hostname is otherwise invisible.
     """
     stats = SOURCE_QOE.setdefault(source_id, {
         "watch_ms": 0.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set(),
         "reattaches": 0, "dropped_frames": 0, "latency_sum": 0.0, "latency_samples": 0,
+        "errors": {}, "mirrors": {},
     })
     # Older persisted snapshots predate these keys.
     for key, default in (("reattaches", 0), ("dropped_frames", 0), ("latency_sum", 0.0), ("latency_samples", 0)):
         stats.setdefault(key, default)
+    for key in ("errors", "mirrors"):
+        if not isinstance(stats.get(key), dict):
+            stats[key] = {}
     stats["watch_ms"] += max(0.0, credit_seconds) * 1000.0
     stats["buffering_ms"] += max(0.0, min(float(buffering_ms or 0), 60_000.0))
     stats["stalls"] += max(0, int(stalls or 0))
@@ -1626,6 +1635,18 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
         if latency is not None and 0.0 <= latency <= 3600.0:
             stats["latency_sum"] += latency
             stats["latency_samples"] += 1
+    # Free-text from the public internet: clamp the value length and the number
+    # of distinct keys, or a hostile client can grow this dict without bound.
+    if last_error:
+        errors = stats["errors"]
+        key = str(last_error)[:120]
+        if key in errors or len(errors) < 40:
+            errors[key] = errors.get(key, 0) + 1
+    if mirror_id:
+        mirrors = stats["mirrors"]
+        key = str(mirror_id)[:40]
+        if key in mirrors or len(mirrors) < 20:
+            mirrors[key] = mirrors.get(key, 0) + 1
     if label:
         stats["label"] = str(label)[:80]
     if ip_hash:
@@ -1635,7 +1656,8 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
 
 
 async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, stalls=0, source_label=None,
-                       reattaches=0, live_latency_seconds=None, dropped_frames=0):
+                       reattaches=0, live_latency_seconds=None, dropped_frames=0,
+                       last_error=None, mirror_id=None):
     """Credit watch time to a viewer (capped per heartbeat gap), update QoE, and kick off geo resolution for new/ungeo'd IPs."""
     global VIEWER_STATS_DIRTY
     credit = 0.0
@@ -1645,7 +1667,7 @@ async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, s
             credit = min(gap, VIEWER_WATCH_MAX_STEP)
     record_source_qoe(source_id, ip_hash, credit, buffering_ms, stalls, label=source_label,
                       reattaches=reattaches, live_latency_seconds=live_latency_seconds,
-                      dropped_frames=dropped_frames)
+                      dropped_frames=dropped_frames, last_error=last_error, mirror_id=mirror_id)
     new_ip = False
     async with VIEWER_STATS_LOCK:
         stats: dict[str, Any]
@@ -1722,6 +1744,17 @@ async def viewer_highscores_snapshot(limit=25):
             "avg_live_latency_seconds": (
                 round(qoe["latency_sum"] / qoe["latency_samples"], 1)
                 if qoe.get("latency_samples") else None
+            ),
+            # What viewers actually hit, most common first. A re-attach count on
+            # its own says something is wrong; these say what.
+            "top_errors": [
+                {"error": err, "count": count}
+                for err, count in sorted(
+                    (qoe.get("errors") or {}).items(), key=lambda kv: kv[1], reverse=True
+                )[:5]
+            ],
+            "by_mirror": dict(
+                sorted((qoe.get("mirrors") or {}).items(), key=lambda kv: kv[1], reverse=True)
             ),
             "viewers": viewers,
         })
@@ -3191,6 +3224,8 @@ async def viewer_counts(request):
                 reattaches=body.get("reattaches", 0),
                 live_latency_seconds=body.get("live_latency_seconds"),
                 dropped_frames=body.get("dropped_frames", 0),
+                last_error=body.get("last_error"),
+                mirror_id=body.get("mirror_id"),
             )
         return JSONResponse({"ok": True, "session_id": session_id, "viewers": counts}, headers=cors)
     async with VIEWER_LOCK:
@@ -3792,6 +3827,63 @@ def reset_switch_state(event_id):
             "selected_confidence": None,
         }
     )
+
+
+# How stale the wrapper's published link may be before we stop trusting it. It
+# rewrites .encode-progress.json on every ffmpeg stats block (~1s), so anything
+# older than this means the encode is not currently running.
+ACTIVE_LINK_MAX_AGE_SECONDS = 15.0
+
+
+def active_encode_link(config):
+    """The link URL ffmpeg is actually ingesting, or "" if unknown.
+
+    The wrapper rotates links internally on failure, so the app cannot infer this
+    from config order -- it only ever knew "we launched with this list". Assuming
+    link 1 is what made a restart abandon a healthy feed: on 2026-08-22 a 19
+    minute old encode at 1.00x was restarted and re-entered at a link that had
+    already failed 20 minutes earlier, while the link it had been happily using
+    was still in the pool at position 3.
+    """
+    output_dir = config.get("stream", {}).get("output_dir")
+    if not output_dir:
+        return ""
+    try:
+        path = Path(output_dir) / ".encode-progress.json"
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return ""
+    if time.time() - float(payload.get("at", 0) or 0) > ACTIVE_LINK_MAX_AGE_SECONDS:
+        return ""
+    return str(payload.get("link_url") or "")
+
+
+def links_with_active_first(links, active_url):
+    """Reorder links so the currently-working one is tried first after a restart.
+
+    The wrapper always starts at links[0]. Without this, every restart -- watchdog,
+    source refresh, segment transition -- discards which link was known to work and
+    rediscovers it by burning through the dead ones ahead of it, each failure
+    costing viewers another few seconds of black.
+    """
+    if not active_url or active_url not in links:
+        return links
+    return [active_url] + [link for link in links if link != active_url]
+
+
+def links_with_active_last(links, active_url):
+    """Reorder links so the one that just failed is tried last.
+
+    The mirror image of links_with_active_first, for the watchdog: there the
+    active link is by definition the one whose failure triggered the restart, so
+    leading with it wastes a whole attempt. Observed on 2026-08-22 at 14:45 --
+    the watchdog fired on a stale playlist, restarted onto the same dead link 1,
+    failed again 37s later, then walked 2 and 3 before settling on link 4.
+    """
+    if not active_url or active_url not in links or len(links) < 2:
+        return links
+    return [link for link in links if link != active_url] + [active_url]
 
 
 def source_switch_allowed(config, *, force=False, stream_running=True):
@@ -5009,7 +5101,26 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
             # 198) can come back in a different order from one provider fetch to
             # the next. Comparing the ordered list made that a "change" and tore
             # down the encode to restart it on the very same URLs.
-            changed = set(old_links) != set(new_links)
+            # A pool change is not by itself a reason to interrupt viewers. What
+            # matters is whether the link ffmpeg is ACTUALLY ingesting survived the
+            # refresh: if it did, the encode is unaffected and the new pool can be
+            # saved silently, to be picked up by the next restart that has its own
+            # reason. On 2026-08-22 the old whole-pool test killed a 19 minute old
+            # encode at 1.00x with 0 dropped frames because an unrelated link had
+            # entered the pool -- and the restart then abandoned the working feed.
+            active_url = active_encode_link(config)
+            pool_changed = set(old_links) != set(new_links)
+            if active_url:
+                changed = active_url not in set(new_links)
+                if pool_changed and not changed:
+                    event(
+                        "private IPTV pool changed; live link survived, saving without a restart",
+                        "ok",
+                    )
+            else:
+                # No encode running (or the wrapper is not publishing): fall back
+                # to the pool test, which is the right call when nothing is live.
+                changed = pool_changed
             _reconcile_operator_stopped(config)
             save_config(config)
             PRIVATE_IPTV_RUNTIME.update(
@@ -6317,10 +6428,15 @@ async def restart_managed_with_config(reason):
     async with PROCESS_LOCK:
         if not PROCESS or PROCESS.poll() is not None:
             return False
+        # Read the live link BEFORE stopping: once ffmpeg is gone the wrapper
+        # stops republishing it and active_encode_link() goes stale by design.
+        active_url = active_encode_link(load_config())
         await stop_managed_process(f"stream stopped for restart: {reason}")
         event(f"restarting stream: {reason}", "warn")
         config = load_config()
-        links = effective_stream_links(config)
+        links = links_with_active_first(effective_stream_links(config), active_url)
+        if active_url and links and links[0] == active_url:
+            event("restart will resume on the link that was already working", "ok")
         try:
             start_managed_process(config, links, kill_existing=True)
             RUNTIME["stream_restarts"] += 1
@@ -6779,6 +6895,7 @@ async def watchdog_loop():
                         if not links:
                             event(f"watchdog skipped restart: {detail}", "warn")
                             continue
+                        links = links_with_active_last(links, active_encode_link(config))
                         try:
                             start_managed_process(config, links, kill_existing=True)
                         except (OSError, ValueError) as exc:
@@ -6802,6 +6919,7 @@ async def watchdog_loop():
                 WATCHDOG_LAST_ACTION = now
                 RUNTIME["watchdog_restarts"] += 1
                 event(f"watchdog restart: {reason}", "warn")
+                failed_url = active_encode_link(config)
                 await stop_managed_process(f"stream stopped for watchdog: {reason}")
                 # While a card is tracked the watchdog is held to the same bar as
                 # a scheduled start: recover onto this event's feeds or not at all.
@@ -6809,6 +6927,7 @@ async def watchdog_loop():
                 if not links:
                     event(f"watchdog skipped restart: {detail}", "warn")
                     continue
+                links = links_with_active_last(links, failed_url)
                 try:
                     start_managed_process(config, links, kill_existing=True)
                 except (OSError, ValueError) as exc:

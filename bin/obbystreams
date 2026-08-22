@@ -203,6 +203,10 @@ class StreamHealth:
     score_history: deque = field(default_factory=lambda: deque(maxlen=16))
     tried_this_round: bool = False
     failed_this_round: bool = False
+    # Consecutive rc==0 exits on THIS link with no successful long run between
+    # them. A clean exit is not evidence the link is bad, so it must not rotate
+    # on the first one -- see the escalation ladder.
+    clean_exits: int = 0
 
     @property
     def average_runtime(self):
@@ -320,14 +324,25 @@ def safe_file_size(path):
         return 0
 
 
-def hls_probe(output_dir):
+def hls_probe(output_dir, run_id=None):
+    """Sample the encoder's output for the health scorer.
+
+    run_id scopes the segment glob to one run. Without it the glob also matched
+    the *previous* run's files, which prune_foreign_runs deliberately keeps for
+    LEGACY_SEGMENT_GRACE_SECONDS so in-flight players are not 404'd. A brand-new
+    run therefore inherited ~125 points of positive evidence (segment_count,
+    bytes, last_segment_size) from output it had not produced, and the playlists
+    it reads are overwritten by the incoming run so playlist_age looked fresh
+    regardless. Net effect: a dead relaunch could not be detected for 180s.
+    """
     playlist = os.path.join(output_dir, "ufc.m3u8")
     dash_manifest = os.path.join(output_dir, "ufc.mpd")
     media_playlists = sorted(glob.glob(os.path.join(output_dir, "media_*.m3u8")))
+    prefix = f"ufc_r{run_id}_" if run_id else "ufc"
     segments = sorted(
-        glob.glob(os.path.join(output_dir, "ufc*.ts"))
-        + glob.glob(os.path.join(output_dir, "ufc*.m4s"))
-        + glob.glob(os.path.join(output_dir, "ufc*.mp4"))
+        glob.glob(os.path.join(output_dir, f"{prefix}*.ts"))
+        + glob.glob(os.path.join(output_dir, f"{prefix}*.m4s"))
+        + glob.glob(os.path.join(output_dir, f"{prefix}*.mp4"))
     )
     segment_names = []
     media_sequence = None
@@ -522,14 +537,6 @@ def kill_instances(procs):
             os.kill(pid, signal.SIGKILL)
 
 
-def cleanup(stream_dir):
-    """Remove every published artefact. Only for a cold start or a shutdown."""
-    for pattern in ("ufc*.ts", "ufc*.m3u8", "ufc*.mpd", "ufc*.m4s", "ufc*.mp4", "media_*.m3u8", "*.tmp"):
-        for f in glob.glob(os.path.join(stream_dir, pattern)):
-            with contextlib.suppress(OSError):
-                os.remove(f)
-
-
 def run_token():
     """Short, sortable token namespacing one ffmpeg run's segments on disk."""
     return f"{int(time.time()):x}"
@@ -541,6 +548,12 @@ _RUN_FILE_RE = re.compile(r"^ufc_r([0-9a-z]+)_")
 
 
 LEGACY_SEGMENT_GRACE_SECONDS = 180.0
+
+# A run at least this long proves the link works, so a clean upstream close after
+# it resets the clean-exit retry budget. It must stay well above
+# --min-assessment-seconds, or a link that EOFs every ~20s would refill its budget
+# on every attempt and never rotate.
+CLEAN_EXIT_RESET_SECONDS = 120.0
 
 
 def prune_foreign_runs(stream_dir, keep_tokens, legacy_grace=LEGACY_SEGMENT_GRACE_SECONDS):
@@ -965,7 +978,7 @@ def proc_stats(pid):
     return None, None
 
 
-def _write_encode_status(args, ff):
+def _write_encode_status(args, ff, link=None):
     out_dir = getattr(args, "output_dir", None)
     if not out_dir:
         return
@@ -978,6 +991,13 @@ def _write_encode_status(args, ff):
             "frame": ff.get("frame", ""),
             "at": time.time(),
         }
+        # Which link is actually feeding this encode. The wrapper rotates links
+        # internally, so without publishing it the app can only assume link 1 --
+        # which is why a restart kept re-entering at link 1 and rediscovering the
+        # working feed by burning through the failures ahead of it.
+        if link:
+            payload["link_url"] = link.get("url", "")
+            payload["link_index"] = link.get("index", 0)
         path = os.path.join(out_dir, ".encode-progress.json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -998,6 +1018,7 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
     if not key:
         return
     snapshot = None
+    active_link = None
     should_log = False
     with with_lock(state):
         state["ffmpeg"][key] = value
@@ -1005,12 +1026,13 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
         # snapshot the live values (incl. real speed) and publish for the app.
         if key == "progress":
             snapshot = dict(state["ffmpeg"])
+            active_link = dict(state.get("active_link") or {})
             now_mono = time.monotonic()
             if now_mono - state.get("last_progress_log_at", 0.0) >= PROGRESS_LOG_INTERVAL:
                 state["last_progress_log_at"] = now_mono
                 should_log = True
     if snapshot is not None and args is not None:
-        _write_encode_status(args, snapshot)
+        _write_encode_status(args, snapshot, link=active_link)
     if should_log and process_log is not None:
         # One line per interval, retaining exactly the fields needed to answer
         # "was the encoder keeping up, and was it dropping frames" after the fact.
@@ -1523,6 +1545,9 @@ def parser_for_args():
                         help="Seconds over which negative scoring ramps to full weight")
     parser.add_argument("--stop-after-failed-rounds", default=2, type=int,
                         help="Stop after every link confirms failure this many full rounds in a row")
+    parser.add_argument("--clean-exit-retries", default=2, type=int,
+                        help="Retry the same link this many times after ffmpeg exits 0 (a live "
+                             "upstream closing the connection) before rotating to the next link")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg output")
     parser.add_argument("--print-cmd", action="store_true", help="Print the ffmpeg command and exit")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
@@ -1680,6 +1705,8 @@ def main():
                 time.sleep(0.4)
                 this_run = run_token()
             cmd = build_ffmpeg_cmd(args, current.url, encoder, run_id=this_run)
+            with with_lock(state):
+                state["active_link"] = {"url": current.url, "index": state["url_index"]}
 
             # Keep the outgoing run's segments so players mid-fetch still resolve
             # while the new run comes up; drop everything older than that.
@@ -1725,7 +1752,7 @@ def main():
                 current.last_error = error_summary
                 msg += f" | ffmpeg: {error_summary}"
             progress, _, _ = ffmpeg_snapshot(state)
-            hls = hls_probe(args.output_dir)
+            hls = hls_probe(args.output_dir, run_id=this_run)
             if state["manual_rotate"]:
                 assessment = {"decision": "manual", "score": current.last_score, "reasons": []}
             else:
@@ -1763,6 +1790,11 @@ def main():
 
             state["restarts"] += 1
             all_failed = False
+            # A link that streamed for minutes has proven itself; a later upstream
+            # close earns a fresh retry budget rather than inheriting the count
+            # from some earlier bad patch.
+            if elapsed >= CLEAN_EXIT_RESET_SECONDS:
+                current.clean_exits = 0
             confirmed_failure = assessment["decision"] == "failed"
             still_assessing = assessment["decision"] == "assessing"
             capacity_limited = is_capacity_limited_error(error_summary)
@@ -1789,8 +1821,21 @@ def main():
                 current.reset_assessment_window()
             elif rc != 0:
                 msg += " - evidence is not bad enough to rotate; retrying same link"
+            elif current.clean_exits < args.clean_exit_retries:
+                # rc == 0 means ffmpeg considered the input finished, which for a
+                # live feed usually means the upstream dropped the connection --
+                # not that this link is bad. Rotating on the first clean exit cost
+                # three viewer-visible restarts in 78s on 2026-08-22, on runs the
+                # scorer itself rated healthy (~708) that each ran ~20s before the
+                # provider EOF'd. Give the link its retries back before moving.
+                current.clean_exits += 1
+                msg += (
+                    f" - upstream closed cleanly; retrying same link"
+                    f" ({current.clean_exits}/{args.clean_exit_retries})"
+                )
             elif len(health) > 1:
                 # Long-lived streams earn priority, but still rotate after death so alternatives get sampled.
+                current.clean_exits = 0
                 state["url_index"], all_failed = next_stream_index(health, state["url_index"])
                 if all_failed:
                     state["url_index"] = 0

@@ -17,7 +17,7 @@ RUNNER = runpy.run_path(str(Path(__file__).resolve().parents[1] / "bin" / "obbys
 prune_foreign_runs = RUNNER["prune_foreign_runs"]
 run_token = RUNNER["run_token"]
 build_ffmpeg_cmd = RUNNER["build_ffmpeg_cmd"]
-cleanup = RUNNER["cleanup"]
+hls_probe = RUNNER["hls_probe"]
 
 
 def _touch(directory, *names, age_seconds=0):
@@ -93,15 +93,6 @@ def test_prune_ignores_unrelated_files(tmp_path):
 
 def test_prune_on_an_empty_directory_is_a_no_op(tmp_path):
     assert prune_foreign_runs(tmp_path, {"any"}) == 0
-
-
-def test_cleanup_still_removes_namespaced_segments(tmp_path):
-    """cleanup() remains the cold-start/shutdown wipe and must not leak runs."""
-    _touch(tmp_path, "ufc_raaa_chunk_1_000001.m4s", "ufc_raaa_init_1.m4s", "ufc.mpd", "media_0.m3u8")
-
-    cleanup(str(tmp_path))
-
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_run_token_is_filename_safe_and_sortable():
@@ -347,3 +338,31 @@ def test_a_stream_far_behind_but_catching_up_is_left_alone():
 
     assert deficit >= 60.0, "still far behind"
     assert not (deficit >= 60.0 and rate < 1.0), "must not rotate while catching up"
+
+
+def test_hls_probe_ignores_the_previous_run_s_segments(tmp_path):
+    """A new run must be scored on its own output, not the run it replaced.
+
+    prune_foreign_runs deliberately keeps the outgoing run's files for 180s so
+    in-flight players are not 404'd. An unscoped glob therefore handed a brand
+    new run ~125 points of positive evidence (segment_count, bytes,
+    last_segment_size) it had not earned, and since the incoming run overwrites
+    the playlists, playlist_age looked fresh too. A dead relaunch was invisible.
+    """
+    _touch(
+        tmp_path,
+        "ufc_rold_chunk_0_000001.m4s",
+        "ufc_rold_chunk_0_000002.m4s",
+        "ufc_rold_init_0.m4s",
+    )
+
+    inherited = hls_probe(str(tmp_path), run_id="new")
+    assert inherited["segment_count"] == 0
+    assert inherited["bytes"] == 0
+
+    _touch(tmp_path, "ufc_rnew_chunk_0_000001.m4s")
+    own = hls_probe(str(tmp_path), run_id="new")
+    assert own["segment_count"] == 1
+
+    # Unscoped stays backward-compatible for any caller without a run id.
+    assert hls_probe(str(tmp_path))["segment_count"] == 4
