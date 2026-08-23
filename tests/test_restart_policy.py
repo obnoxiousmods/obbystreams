@@ -22,6 +22,8 @@ import json
 import time
 from typing import ClassVar
 
+import pytest
+
 import app
 
 
@@ -143,3 +145,120 @@ class TestQoeDiagnostics:
         }
         self._record(last_error="boom", mirror_id="fight")
         assert app.SOURCE_QOE["server-1"]["errors"] == {"boom": 1}
+
+
+class TestPlaybackDiagnostics:
+    """The ~24 player metrics and the event timeline behind them.
+
+    These exist because the 2026-08-22 freeze -- nginx serving a playlist up to
+    30s stale -- was invisible to every server-side check. The origin was correct
+    the whole time; only a client could see the manifest had stopped advancing.
+    Everything here arrives from a public, unauthenticated endpoint.
+    """
+
+    def setup_method(self):
+        app.SOURCE_QOE.clear()
+
+    def teardown_method(self):
+        app.SOURCE_QOE.clear()
+
+    def _record(self, playback=None, events=None):
+        app.record_source_qoe("server-1", "hash", 15.0, 0, 0, playback=playback, events=events)
+
+    def test_counters_accumulate_across_heartbeats(self):
+        for _ in range(3):
+            self._record({"stall_events": 2, "gap_jumps": 1, "manifest_sequence_regressions": 4})
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["stall_events"] == 6
+        assert stats["gap_jumps"] == 3
+        assert stats["manifest_sequence_regressions"] == 12
+
+    def test_gauges_average_only_over_beats_that_reported_them(self):
+        self._record({"buffer_min_seconds": 10.0})
+        self._record({"buffer_min_seconds": 4.0})
+        self._record({})  # reported nothing -- must not count as a zero
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["buffer_min_seconds_samples"] == 2
+        assert stats["buffer_min_seconds_sum"] == 14.0
+
+    def test_a_null_gauge_is_not_a_zero(self):
+        # "nobody measured it" and "it measured zero" are different answers, and
+        # conflating them silently drags every average toward 0.
+        self._record({"manifest_advance_rate": None})
+        assert app.SOURCE_QOE["server-1"]["manifest_advance_rate_samples"] == 0
+
+    def test_clamps_hostile_counter_values(self):
+        self._record({"stall_events": 10**9, "gap_jumps": -50})
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["stall_events"] == 1_000      # capped
+        assert stats["gap_jumps"] == 0             # negatives floor at 0
+
+    def test_rejects_non_finite_and_out_of_range_gauges(self):
+        self._record({"buffer_min_seconds": float("inf")})
+        self._record({"buffer_min_seconds": float("nan")})
+        self._record({"live_latency_max_seconds": 10**9})
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["buffer_min_seconds_samples"] == 0
+        assert stats["live_latency_max_seconds_samples"] == 0
+
+    def test_ignores_garbage_types(self):
+        self._record({"stall_events": "banana", "buffer_min_seconds": {"a": 1}})
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["stall_events"] == 0
+        assert stats["buffer_min_seconds_samples"] == 0
+
+    def test_tallies_the_event_timeline_by_kind(self):
+        self._record(events=[{"t": 1, "kind": "waiting"}, {"t": 2, "kind": "waiting"},
+                             {"t": 3, "kind": "shaka-gapjump"}])
+        assert app.SOURCE_QOE["server-1"]["event_kinds"] == {"waiting": 2, "shaka-gapjump": 1}
+
+    def test_bounds_the_event_timeline(self):
+        self._record(events=[{"kind": f"k{i}"} for i in range(500)])
+        kinds = app.SOURCE_QOE["server-1"]["event_kinds"]
+        # Both the per-beat count and the distinct-key count are bounded, or a
+        # hostile client grows this dict without limit.
+        assert len(kinds) <= app.QOE_EVENT_CARDINALITY
+        assert sum(kinds.values()) <= app.QOE_MAX_EVENTS
+
+    def test_survives_malformed_event_entries(self):
+        self._record(events=["nope", None, 42, {"no_kind": 1}, {"kind": ""}, {"kind": "ok"}])
+        assert app.SOURCE_QOE["server-1"]["event_kinds"] == {"ok": 1}
+
+    def test_truncates_long_event_kinds(self):
+        self._record(events=[{"kind": "z" * 500}])
+        assert max(len(k) for k in app.SOURCE_QOE["server-1"]["event_kinds"]) == app.QOE_EVENT_KIND_MAX
+
+    def test_a_snapshot_predating_these_fields_still_loads(self):
+        # Persisted QoE from before this change has none of the new keys.
+        app.SOURCE_QOE["server-1"] = {
+            "watch_ms": 1.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set(),
+        }
+        self._record({"stall_events": 1, "buffer_min_seconds": 5.0})
+        stats = app.SOURCE_QOE["server-1"]
+        assert stats["stall_events"] == 1
+        assert stats["buffer_min_seconds_samples"] == 1
+
+    @pytest.mark.asyncio
+    async def test_every_declared_metric_round_trips_to_the_snapshot(self):
+        # Guards the three places a new metric has to be registered: the spec, the
+        # defaults, and the highscores projection. Adding one and forgetting the
+        # projection is a silent no-op.
+        self._record(
+            {name: 1 for name, _ in app.QOE_COUNTERS}
+            | {name: 1.0 for name, _ in app.QOE_GAUGES}
+        )
+        perf = (await app.viewer_highscores_snapshot())["source_performance"]
+        row = next(r for r in perf if r["source_id"] == "server-1")
+        for name, _ in app.QOE_COUNTERS:
+            assert row[name] == 1, name
+        for name, _ in app.QOE_GAUGES:
+            assert row[name] == 1.0, name
+
+    def test_persisted_qoe_stays_json_serializable(self):
+        import json
+        self._record({"stall_events": 1}, events=[{"kind": "waiting"}])
+        payload = {
+            sid: {**{k: v for k, v in q.items() if k != "viewers"}, "viewers": sorted(q.get("viewers") or ())}
+            for sid, q in app.SOURCE_QOE.items()
+        }
+        json.dumps(payload)  # must not raise

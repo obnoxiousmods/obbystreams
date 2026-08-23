@@ -46,6 +46,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -1489,6 +1490,12 @@ def viewer_counts_snapshot():
 VIEWER_STATS: dict[str, dict[str, Any]] = {}
 SOURCE_QOE: dict[str, dict] = {}   # source_id -> {watch_ms, buffering_ms, stalls, viewers:set}
 VIEWER_STATS_LOCK = asyncio.Lock()
+#: Guards on a public, unauthenticated endpoint. The heartbeat is ~4KB with the
+#: diagnostics block and a 60-event timeline; 64KB is generous headroom.
+VIEWER_BODY_MAX_BYTES = 64 * 1024
+#: The client beats every 15s. Below this, credit nothing.
+VIEWER_MIN_BEAT_SECONDS = 5.0
+VIEWER_ID_MAX_CHARS = 200
 VIEWER_STATS_PATH = CONFIG_PATH.parent / "viewer_highscores.json"
 VIEWER_STATS_DIRTY = False
 VIEWER_WATCH_MAX_STEP = 90.0            # cap seconds credited per heartbeat gap
@@ -1594,9 +1601,65 @@ async def _apply_geo(ip_hash, geo):
             VIEWER_STATS_DIRTY = True
 
 
+# Playback diagnostics reported per heartbeat by the player. Declarative rather
+# than 25 more kwargs: each entry is (wire_name, kind, clamp_max), where kind is
+#   "counter" -> a per-beat delta, summed; the client already resets its window
+#   "gauge"   -> describes the beat itself; averaged via a sum/samples pair, so
+#                a viewer who reports nothing does not drag the mean to zero
+#
+# The set is chosen around one question: "why did playback stop?". manifest_*
+# exists because the 2026-08-22 freeze (nginx serving a 30s-stale playlist) was
+# invisible to every server-side check -- the origin was correct the whole time,
+# and only the client could see the manifest had stopped advancing.
+QOE_COUNTERS = (
+    ("stall_events", 1_000),
+    ("stall_total_ms", 900_000),
+    ("gap_jumps", 1_000),
+    ("buffer_gap_events", 1_000),
+    ("manifest_sequence_regressions", 1_000),
+    ("segment_error_count", 10_000),
+    ("level_switches", 10_000),
+    ("fps_drop_events", 10_000),
+    ("rate_warp_ms", 900_000),
+)
+QOE_GAUGES = (
+    ("stall_longest_ms", 900_000.0),
+    ("buffer_min_seconds", 3_600.0),
+    ("live_latency_max_seconds", 3_600.0),
+    ("latency_drift_seconds", 3_600.0),
+    ("manifest_age_ms", 900_000.0),
+    ("manifest_advance_rate", 100.0),
+    ("manifest_jump_max_segments", 100_000.0),
+    ("manifest_fetch_ms_max", 300_000.0),
+    ("playback_rate_avg", 16.0),
+    ("seek_range_span_seconds", 86_400.0),
+    ("segment_ttfb_ms_p50", 300_000.0),
+    ("segment_ttfb_ms_max", 300_000.0),
+    ("bandwidth_estimate_bps", 10_000_000_000.0),
+    ("dropped_frame_ratio", 1.0),
+    ("corrupted_frames", 10_000_000.0),
+)
+#: Bound the event timeline a single heartbeat may contribute.
+QOE_MAX_EVENTS = 60
+QOE_EVENT_KIND_MAX = 40
+QOE_EVENT_CARDINALITY = 60
+
+
+def _qoe_counter_defaults():
+    return {name: 0 for name, _ in QOE_COUNTERS}
+
+
+def _qoe_gauge_defaults():
+    out = {}
+    for name, _ in QOE_GAUGES:
+        out[f"{name}_sum"] = 0.0
+        out[f"{name}_samples"] = 0
+    return out
+
+
 def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, label=None,
                       reattaches=0, live_latency_seconds=None, dropped_frames=0,
-                      last_error=None, mirror_id=None):
+                      last_error=None, mirror_id=None, playback=None, events=None):
     """Accumulate per-source quality-of-experience from client heartbeats.
 
     reattaches and live_latency_seconds are the two that actually diagnose
@@ -1609,16 +1672,25 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
     last_error and mirror_id say WHY and WHERE. Without them a re-attach count
     is a number with no cause attached, and since the two Cloudflare mirrors are
     the same vhost, a fault specific to one hostname is otherwise invisible.
+
+    playback carries the QOE_COUNTERS/QOE_GAUGES block and events the ordered
+    timeline behind it. Aggregates say a stall happened; only the ordering says
+    what preceded it.
     """
     stats = SOURCE_QOE.setdefault(source_id, {
         "watch_ms": 0.0, "buffering_ms": 0.0, "stalls": 0, "viewers": set(),
         "reattaches": 0, "dropped_frames": 0, "latency_sum": 0.0, "latency_samples": 0,
-        "errors": {}, "mirrors": {},
+        "errors": {}, "mirrors": {}, "event_kinds": {},
+        **_qoe_counter_defaults(), **_qoe_gauge_defaults(),
     })
     # Older persisted snapshots predate these keys.
     for key, default in (("reattaches", 0), ("dropped_frames", 0), ("latency_sum", 0.0), ("latency_samples", 0)):
         stats.setdefault(key, default)
-    for key in ("errors", "mirrors"):
+    for key, default in _qoe_counter_defaults().items():
+        stats.setdefault(key, default)
+    for key, default in _qoe_gauge_defaults().items():
+        stats.setdefault(key, default)
+    for key in ("errors", "mirrors", "event_kinds"):
         if not isinstance(stats.get(key), dict):
             stats[key] = {}
     stats["watch_ms"] += max(0.0, credit_seconds) * 1000.0
@@ -1635,6 +1707,39 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
         if latency is not None and 0.0 <= latency <= 3600.0:
             stats["latency_sum"] += latency
             stats["latency_samples"] += 1
+    # Every value below arrives from a public, unauthenticated endpoint, so each
+    # one is coerced and clamped rather than trusted.
+    block = playback if isinstance(playback, dict) else {}
+    for name, cap in QOE_COUNTERS:
+        try:
+            value = int(float(block.get(name) or 0))
+        except (TypeError, ValueError):
+            continue
+        stats[name] += max(0, min(value, cap))
+    for name, cap in QOE_GAUGES:
+        raw = block.get(name)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or not (-cap <= value <= cap):
+            continue
+        # sum/samples, not a running mean: a viewer that reports nothing must not
+        # be counted as a zero.
+        stats[f"{name}_sum"] += value
+        stats[f"{name}_samples"] += 1
+    if isinstance(events, list):
+        kinds = stats["event_kinds"]
+        for item in events[:QOE_MAX_EVENTS]:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "")[:QOE_EVENT_KIND_MAX]
+            if not kind:
+                continue
+            if kind in kinds or len(kinds) < QOE_EVENT_CARDINALITY:
+                kinds[kind] = kinds.get(kind, 0) + 1
     # Free-text from the public internet: clamp the value length and the number
     # of distinct keys, or a hostile client can grow this dict without bound.
     if last_error:
@@ -1657,7 +1762,7 @@ def record_source_qoe(source_id, ip_hash, credit_seconds, buffering_ms, stalls, 
 
 async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, stalls=0, source_label=None,
                        reattaches=0, live_latency_seconds=None, dropped_frames=0,
-                       last_error=None, mirror_id=None):
+                       last_error=None, mirror_id=None, playback=None, events=None):
     """Credit watch time to a viewer (capped per heartbeat gap), update QoE, and kick off geo resolution for new/ungeo'd IPs."""
     global VIEWER_STATS_DIRTY
     credit = 0.0
@@ -1667,7 +1772,8 @@ async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, s
             credit = min(gap, VIEWER_WATCH_MAX_STEP)
     record_source_qoe(source_id, ip_hash, credit, buffering_ms, stalls, label=source_label,
                       reattaches=reattaches, live_latency_seconds=live_latency_seconds,
-                      dropped_frames=dropped_frames, last_error=last_error, mirror_id=mirror_id)
+                      dropped_frames=dropped_frames, last_error=last_error, mirror_id=mirror_id,
+                      playback=playback, events=events)
     new_ip = False
     async with VIEWER_STATS_LOCK:
         stats: dict[str, Any]
@@ -1755,6 +1861,20 @@ async def viewer_highscores_snapshot(limit=25):
             ],
             "by_mirror": dict(
                 sorted((qoe.get("mirrors") or {}).items(), key=lambda kv: kv[1], reverse=True)
+            ),
+            # Counters as totals, gauges as means over the beats that actually
+            # reported them. A gauge with no samples is null, not 0 -- "nobody
+            # measured it" and "it measured zero" are different answers.
+            **{name: int(qoe.get(name, 0) or 0) for name, _ in QOE_COUNTERS},
+            **{
+                name: (
+                    round(qoe[f"{name}_sum"] / qoe[f"{name}_samples"], 3)
+                    if qoe.get(f"{name}_samples") else None
+                )
+                for name, _ in QOE_GAUGES
+            },
+            "event_kinds": dict(
+                sorted((qoe.get("event_kinds") or {}).items(), key=lambda kv: kv[1], reverse=True)[:15]
             ),
             "viewers": viewers,
         })
@@ -3201,12 +3321,18 @@ async def viewer_counts(request):
     if request.method == "OPTIONS":
         return Response("", headers=cors)
     if request.method == "POST":
+        # This route is public and unauthenticated, and the diagnostics payload
+        # made it meaningfully larger. Bound the body before parsing it, and the
+        # beat rate before crediting it.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > VIEWER_BODY_MAX_BYTES:
+            return JSONResponse({"ok": False, "error": "payload too large"}, status_code=413, headers=cors)
         try:
             body = await parse_json_body(request)
         except ValueError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400, headers=cors)
-        session_id = str(body.get("session_id") or body.get("viewer_id") or secrets.token_urlsafe(16))
-        source_id = str(body.get("source_id") or "server-1")
+        session_id = str(body.get("session_id") or body.get("viewer_id") or secrets.token_urlsafe(16))[:VIEWER_ID_MAX_CHARS]
+        source_id = str(body.get("source_id") or "server-1")[:VIEWER_ID_MAX_CHARS]
         client_ip = _client_ip(request)
         ip_hash = _ip_hash(client_ip) if client_ip else None
         now_t = time.time()
@@ -3214,9 +3340,13 @@ async def viewer_counts(request):
             prune_viewer_sessions()
             previous = VIEWER_SESSIONS.get(session_id)
             last_at = float(previous.get("at", 0.0)) if previous else None
+            # The client beats every 15s. Anything much faster is either a bug or
+            # someone inflating their own numbers; count the session but do not
+            # let it accumulate QoE. Rejecting outright would hide real viewers.
+            too_fast = last_at is not None and (now_t - last_at) < VIEWER_MIN_BEAT_SECONDS
             VIEWER_SESSIONS[session_id] = {"source_id": source_id, "at": now_t, "ip_hash": ip_hash}
             counts = viewer_counts_snapshot()
-        if ip_hash:
+        if ip_hash and not too_fast:
             await record_watch(
                 ip_hash, client_ip, source_id, now_t, last_at,
                 buffering_ms=body.get("buffering_ms", 0), stalls=body.get("stalls", 0),
@@ -3226,6 +3356,8 @@ async def viewer_counts(request):
                 dropped_frames=body.get("dropped_frames", 0),
                 last_error=body.get("last_error"),
                 mirror_id=body.get("mirror_id"),
+                playback={name: body.get(name) for name, _ in (*QOE_COUNTERS, *QOE_GAUGES)},
+                events=body.get("events"),
             )
         return JSONResponse({"ok": True, "session_id": session_id, "viewers": counts}, headers=cors)
     async with VIEWER_LOCK:
@@ -3375,6 +3507,7 @@ async def metrics(request):
     # Client-reported playback quality, the only signal that reflects what a
     # viewer actually experienced rather than what the origin emitted.
     smoothness, stalls, reattaches, latency = [], [], [], []
+    stall_seconds, gap_jumps, regressions, advance = [], [], [], []
     for source_id, qoe in SOURCE_QOE.items():
         label = str(qoe.get("label") or source_id).replace("\\", "\\\\").replace('"', '\\"')
         selector = f'source_id="{str(source_id)[:120]}",label="{label[:120]}"'
@@ -3386,6 +3519,12 @@ async def metrics(request):
         reattaches.append((selector, qoe.get("reattaches", 0)))
         if qoe.get("latency_samples"):
             latency.append((selector, round(qoe["latency_sum"] / qoe["latency_samples"], 2)))
+        stall_seconds.append((selector, round(float(qoe.get("stall_total_ms", 0) or 0) / 1000.0, 2)))
+        gap_jumps.append((selector, qoe.get("gap_jumps", 0) or 0))
+        regressions.append((selector, qoe.get("manifest_sequence_regressions", 0) or 0))
+        if qoe.get("manifest_advance_rate_samples"):
+            advance.append((selector, round(
+                qoe["manifest_advance_rate_sum"] / qoe["manifest_advance_rate_samples"], 3)))
     out += _openmetrics_lines("obbystreams_source_smoothness_percent",
                               "Share of client watch time not spent buffering.", "gauge", smoothness)
     out += _openmetrics_lines("obbystreams_source_stalls_total", "Client-reported stalls.", "counter", stalls)
@@ -3393,6 +3532,18 @@ async def metrics(request):
                               "Client player teardown/re-attach cycles; each one is a visible skip.", "counter", reattaches)
     out += _openmetrics_lines("obbystreams_source_client_latency_seconds",
                               "Mean client-reported distance behind the live edge.", "gauge", latency)
+    # The four that answer "is playback actually working for viewers". Deliberately
+    # not all 24 -- /metrics is for alerting, /api/highscores carries the full set.
+    out += _openmetrics_lines("obbystreams_source_stall_seconds_total",
+                              "Client-reported time with playback frozen.", "counter", stall_seconds)
+    out += _openmetrics_lines("obbystreams_source_gap_jumps_total",
+                              "Playhead nudges over a buffer hole; each is a micro-skip.", "counter", gap_jumps)
+    out += _openmetrics_lines("obbystreams_source_manifest_regressions_total",
+                              "Clients saw the media sequence go BACKWARDS -- a cache is serving stale playlists.",
+                              "counter", regressions)
+    out += _openmetrics_lines("obbystreams_source_manifest_advance_rate",
+                              "Media-seconds the manifest advertised per wall-second, as clients saw it. 1.0 is healthy.",
+                              "gauge", advance)
 
     out.append("# EOF")
     return Response("\n".join(out) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
