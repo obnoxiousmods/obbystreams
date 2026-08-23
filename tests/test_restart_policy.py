@@ -354,3 +354,91 @@ class TestFeedQuality:
     def test_a_stale_progress_file_records_nothing(self):
         app.record_link_quality("", 5.0)
         assert app.LINK_QUALITY == {}
+
+
+class TestActiveViewers:
+    """Who is watching right now, as opposed to who has watched the most ever."""
+
+    def setup_method(self):
+        app.VIEWER_SESSIONS.clear()
+        app.VIEWER_STATS.clear()
+
+    def teardown_method(self):
+        app.VIEWER_SESSIONS.clear()
+        app.VIEWER_STATS.clear()
+
+    def _session(self, sid, ip_hash, source="server-1", age=0.0):
+        app.VIEWER_SESSIONS[sid] = {"source_id": source, "at": time.time() - age, "ip_hash": ip_hash}
+
+    def test_every_viewer_gets_a_codename_even_before_any_stats_exist(self):
+        # A viewer on their first heartbeat has no VIEWER_STATS row yet. They must
+        # still be nameable, or the list shows blanks for exactly the people who
+        # just arrived.
+        self._session("s1", "abcdef1234567890")
+        rows = app.active_viewers_snapshot()
+        assert len(rows) == 1
+        assert rows[0]["codename"] == app.codename_for("abcdef1234567890")
+        assert rows[0]["codename"].strip()
+
+    def test_codename_is_the_same_whether_derived_or_stored(self):
+        ip_hash = "beefcafe00000000"
+        app.VIEWER_STATS[ip_hash] = {"codename": app.codename_for(ip_hash), "ip_masked": "1.•.•.4", "total": 90.0}
+        self._session("s1", ip_hash)
+        assert app.active_viewers_snapshot()[0]["codename"] == app.codename_for(ip_hash)
+
+    def test_two_tabs_are_one_viewer(self):
+        # Counting sessions instead of people would make this list disagree with
+        # the viewer count rendered beside it.
+        self._session("s1", "aaaaaaaaaaaaaaaa")
+        self._session("s2", "aaaaaaaaaaaaaaaa")
+        rows = app.active_viewers_snapshot()
+        assert len(rows) == 1
+        assert rows[0]["sessions"] == 2
+
+    def test_departed_viewers_are_pruned(self):
+        self._session("here", "1111111111111111")
+        self._session("gone", "2222222222222222", age=app.VIEWER_SESSION_TTL + 30)
+        codenames = {row["codename"] for row in app.active_viewers_snapshot()}
+        assert app.codename_for("1111111111111111") in codenames
+        assert app.codename_for("2222222222222222") not in codenames
+
+    def test_never_exposes_a_raw_ip(self):
+        ip_hash = "3333333333333333"
+        app.VIEWER_STATS[ip_hash] = {
+            "codename": "Test Viewer", "ip_masked": "207.•.•.91", "total": 10.0,
+        }
+        self._session("s1", ip_hash)
+        row = app.active_viewers_snapshot()[0]
+        assert row["ip_masked"] == "207.•.•.91"
+        assert "ip" not in row
+        assert "ip_hash" not in row
+
+    def test_a_session_without_an_ip_is_omitted_rather_than_shown_blank(self):
+        app.VIEWER_SESSIONS["anon"] = {"source_id": "server-1", "at": time.time(), "ip_hash": None}
+        assert app.active_viewers_snapshot() == []
+
+    def test_ranks_by_watch_time_and_reports_idleness(self):
+        app.VIEWER_STATS["a" * 16] = {"codename": "Aa", "ip_masked": "x", "total": 10.0}
+        app.VIEWER_STATS["b" * 16] = {"codename": "Bb", "ip_masked": "y", "total": 500.0}
+        self._session("s1", "a" * 16)
+        self._session("s2", "b" * 16, age=12.0)
+        rows = app.active_viewers_snapshot()
+        assert [r["codename"] for r in rows] == ["Bb", "Aa"]
+        assert rows[0]["idle_seconds"] >= 11.0
+        assert rows[1]["idle_seconds"] < 2.0
+
+    def test_reports_the_source_from_the_most_recent_session(self):
+        self._session("old", "cccccccccccccccc", source="server-1", age=20.0)
+        self._session("new", "cccccccccccccccc", source="overlay-hls", age=1.0)
+        assert app.active_viewers_snapshot()[0]["source_id"] == "overlay-hls"
+
+    def test_honours_the_limit(self):
+        for i in range(80):
+            self._session(f"s{i}", f"{i:016x}")
+        assert len(app.active_viewers_snapshot(limit=10)) == 10
+
+    @pytest.mark.asyncio
+    async def test_appears_in_the_public_highscores_payload(self):
+        self._session("s1", "dddddddddddddddd")
+        payload = await app.viewer_highscores_snapshot()
+        assert payload["active_viewers"][0]["codename"] == app.codename_for("dddddddddddddddd")

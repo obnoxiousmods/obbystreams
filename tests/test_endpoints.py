@@ -104,7 +104,8 @@ def test_status_payload_shape(client):
 
 
 def test_public_read_endpoints(client):
-    for path in ["/api/public-streams", "/api/public-configured-sources", "/api/news", "/api/highscores", "/api/viewers"]:
+    for path in ["/api/public-streams", "/api/public-configured-sources", "/api/news", "/api/highscores",
+                 "/api/viewers", "/api/ufc-schedule"]:
         assert client.get(path).status_code == 200
 
 
@@ -308,3 +309,28 @@ def test_viewers_post_records_session(client):
 def test_coming_up_without_a_scheduler_is_refused(client):
     resp = client.post("/api/schedule", json={"coming_up": True})
     assert resp.status_code in (400, 404, 503)
+
+
+def test_ufc_schedule_is_public_and_needs_no_token(anon_client):
+    # The watcher is a static site on a different origin with no credentials, so
+    # this has to work unauthenticated or the schedule silently never loads.
+    response = anon_client.get("/api/ufc-schedule")
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_ufc_schedule_degrades_instead_of_failing_without_a_scheduler(anon_client):
+    # Tests run with no scheduler; so does a cold boot. The site must render
+    # something rather than error.
+    body = anon_client.get("/api/ufc-schedule").json()
+    assert body["ok"] is False
+    assert body["event"] is None
+    assert body["upcoming"] == []
+
+
+def test_ufc_schedule_never_leaks_scheduler_internals(anon_client):
+    # Veto state, source matching and the notification ledger say nothing to a
+    # viewer and should not be on a public endpoint.
+    body = anon_client.get("/api/ufc-schedule").json()
+    for leaked in ("source_state", "suppressed_event_id", "notifications_sent", "context", "lifecycle"):
+        assert leaked not in body

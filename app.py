@@ -1803,6 +1803,67 @@ async def record_watch(ip_hash, ip, source_id, now_t, last_at, buffering_ms=0, s
         _spawn_background(_resolve_geo(ip_hash, ip))
 
 
+def active_viewers_snapshot(limit=60):
+    """Who is watching RIGHT NOW, anonymised the same way the leaderboard is.
+
+    The leaderboard is cumulative and answers "who has watched the most"; it says
+    nothing about who is here at this moment, which is the thing an operator
+    actually wants during a card. This joins the live session table to the
+    per-viewer stats for a codename, masked IP and coarse geo.
+
+    Deduplicated by ip_hash, not by session: one person with the stream open in
+    two tabs is one viewer, and counting them twice makes the list disagree with
+    the viewer count shown next to it.
+
+    A viewer who has only just connected has no stats row yet, so the codename is
+    derived directly -- codename_for() is pure, so it is stable whether it comes
+    from the table or is computed here, and every IP therefore has a name.
+    """
+    # Prune first: without it a viewer who closed the tab lingers for the full
+    # TTL and the list disagrees with the count rendered beside it.
+    viewer_counts_snapshot()
+    now = time.time()
+    sessions: dict[str, int] = {}
+    last_seen: dict[str, float] = {}
+    source_of: dict[str, str] = {}
+    for session in list(VIEWER_SESSIONS.values()):
+        ip_hash = str(session.get("ip_hash") or "")
+        if not ip_hash:
+            # No client IP (loopback probes, some proxies). Countable, but there
+            # is nothing to identify, so it stays out of the list.
+            continue
+        at = float(session.get("at") or 0.0)
+        sessions[ip_hash] = sessions.get(ip_hash, 0) + 1
+        if at >= last_seen.get(ip_hash, -1.0):
+            last_seen[ip_hash] = at
+            source_of[ip_hash] = str(session.get("source_id") or "server-1")
+
+    rows: list[dict] = []
+    ranking: dict[int, tuple[int, str]] = {}
+    for ip_hash, session_count in sessions.items():
+        stats = VIEWER_STATS.get(ip_hash) or {}
+        geo = stats.get("geo") or {}
+        codename = str(stats.get("codename") or codename_for(ip_hash))
+        watch_seconds = int(float(stats.get("total") or 0.0))
+        row = {
+            "codename": codename,
+            "ip_masked": stats.get("ip_masked") or "hidden",
+            "flag": geo.get("flag") or "\U0001f310",
+            "location": ", ".join(p for p in (geo.get("region"), geo.get("country")) if p),
+            "source_id": source_of.get(ip_hash, "server-1"),
+            "sessions": session_count,
+            "watch_seconds": watch_seconds,
+            "first_seen_at": stats.get("first"),
+            "idle_seconds": round(max(0.0, now - last_seen.get(ip_hash, now)), 1),
+        }
+        # Sort key kept alongside the row rather than re-read from the dict, whose
+        # values are deliberately heterogeneous.
+        ranking[id(row)] = (-watch_seconds, codename)
+        rows.append(row)
+    rows.sort(key=lambda row: ranking[id(row)])
+    return rows[:limit]
+
+
 async def viewer_highscores_snapshot(limit=25):
     """Build the anonymised analytics payload: viewer leaderboard, top/best sources, per-source QoE, and top countries."""
     async with VIEWER_STATS_LOCK:
@@ -1898,6 +1959,8 @@ async def viewer_highscores_snapshot(limit=25):
         "viewers_tracked": len(rows),
         "total_watch_hours": round(sum(s.get("total", 0.0) for s in rows) / 3600.0, 1),
         "leaderboard": leaderboard,
+        # Who is here now, as opposed to who has watched the most ever.
+        "active_viewers": active_viewers_snapshot(),
         "top_sources": [{"source_id": sid, "watch_hours": round(sec / 3600.0, 2)} for sid, sec in top_sources[:8]],
         "source_performance": source_performance[:10],
         "best_sources": best_sources,
@@ -6966,6 +7029,74 @@ async def get_schedule(request):
     return JSONResponse({"ok": True, "schedule": schedule_snapshot()})
 
 
+def public_ufc_schedule():
+    """The tracked card plus the upcoming calendar, safe to serve to viewers.
+
+    Everything here is public ESPN data (card times, venue, bout matchups), and
+    it is live rather than scraped at build time. The watcher previously shipped a
+    hand-updated static file that had drifted six weeks stale; this is the same
+    data the scheduler already fetches and acts on, so the site cannot silently
+    disagree with the thing actually running the stream.
+
+    Deliberately excludes scheduler internals -- action/veto state, source
+    matching, notification ledger -- which say nothing to a viewer.
+    """
+    if SCHEDULER is None:
+        return {"ok": False, "reason": "scheduler not running", "event": None, "upcoming": []}
+
+    def card(segment):
+        return {
+            "label": segment.label,
+            "start": segment.start.isoformat(),
+            "bouts": list(segment.bouts),
+            "bout_count": segment.bout_count,
+            "completed_bouts": segment.completed_bouts,
+            "all_final": segment.all_final,
+        }
+
+    tracked = SCHEDULER.event
+    event = None
+    if tracked is not None:
+        event = {
+            "id": tracked.event_id,
+            "name": tracked.name,
+            "short_name": tracked.short_name,
+            "venue": tracked.venue,
+            "city": tracked.city,
+            "main_event": tracked.main_event_bout,
+            "winner": tracked.main_event_winner,
+            "is_final": tracked.is_final,
+            "first_card_start": tracked.first_card_start.isoformat() if tracked.first_card_start else None,
+            "cards": [card(segment) for segment in tracked.cards],
+        }
+
+    now = datetime.now(UTC)
+    upcoming = [
+        {"label": entry.label, "start": entry.start.isoformat()}
+        for entry in sorted(SCHEDULER.state.calendar, key=lambda e: e.start)
+        if entry.start >= now
+    ][:12]
+    snapshot = schedule_snapshot()
+    return {
+        "ok": True,
+        "event": event,
+        "upcoming": upcoming,
+        "phase": snapshot.get("phase"),
+        "countdown_seconds": snapshot.get("countdown_seconds"),
+        "updated_at": now_ms(),
+    }
+
+
+async def public_ufc_schedule_endpoint(request):
+    """GET /api/ufc-schedule (public): live card + upcoming calendar for the watcher."""
+    cors = public_cors_headers()
+    if request.method == "OPTIONS":
+        return Response("", headers=cors)
+    payload = public_ufc_schedule()
+    # ESPN data moves in minutes, not seconds; let the edge absorb the polling.
+    return JSONResponse(payload, headers={**cors, "Cache-Control": "public, max-age=30"})
+
+
 async def update_schedule(request):
     """POST /api/schedule (guarded): toggle auto-schedule, or fire a test Discord embed."""
     try:
@@ -7521,6 +7652,7 @@ routes = [
     Route("/api/stream/start", guarded(start_stream), methods=["POST"]),
     Route("/api/stream/stop", guarded(stop_stream), methods=["POST"]),
     Route("/api/stream/restart", guarded(restart_stream), methods=["POST"]),
+    Route("/api/ufc-schedule", public_ufc_schedule_endpoint, methods=["GET", "OPTIONS"]),
     Route("/api/schedule", guarded(get_schedule), methods=["GET"]),
     Route("/api/schedule", guarded(update_schedule), methods=["POST"]),
     Route("/api/arango", guarded(arango_status)),
