@@ -3985,6 +3985,16 @@ def reset_switch_state(event_id):
 # older than this means the encode is not currently running.
 ACTIVE_LINK_MAX_AGE_SECONDS = 15.0
 
+#: Pause between killing the encode and starting the next one.
+#:
+#: The provider enforces connection_limit=2 and does not free a slot the instant
+#: ffmpeg dies. Restarting immediately therefore raced the teardown and lost:
+#: both restarts on 2026-08-22 hit "Server returned 429 Too Many streams" on the
+#: first attempt and only recovered when the watchdog fired ~27s later, turning a
+#: ~20s planned outage into ~60s. Waiting a moment first is strictly faster than
+#: being rate-limited and retried.
+PROVIDER_DRAIN_SECONDS = 3.0
+
 
 def active_encode_link(config):
     """The link URL ffmpeg is actually ingesting, or "" if unknown.
@@ -4007,7 +4017,11 @@ def active_encode_link(config):
         return ""
     if time.time() - float(payload.get("at", 0) or 0) > ACTIVE_LINK_MAX_AGE_SECONDS:
         return ""
-    return str(payload.get("link_url") or "")
+    url = str(payload.get("link_url") or "")
+    # Free ride: the wrapper publishes how smoothly this link is delivering in the
+    # same file, and this is the one function that reads it on a regular cadence.
+    record_link_quality(url, payload.get("read_lag_per_min"))
+    return url
 
 
 def links_with_active_first(links, active_url):
@@ -4021,6 +4035,68 @@ def links_with_active_first(links, active_url):
     if not active_url or active_url not in links:
         return links
     return [active_url] + [link for link in links if link != active_url]
+
+
+#: Per-link upstream delivery quality, keyed by link URL:
+#:   {url: {"lag_per_min": float, "samples": int, "updated_at": ms}}
+#: Kept in memory: link URLs carry rotating tokens and go stale between cards, so
+#: persisting them would mostly preserve dead keys.
+LINK_QUALITY: dict[str, dict] = {}
+#: A feed lagging more than this is publishing in clumps rather than smoothly.
+#: Measured 2026-08-22: a good feed sits at 0.4s/min, a bad one at 19.5s/min, and
+#: the bad one produced viewer-visible freezes while every server-side health
+#: check read perfectly healthy (speed=1x, 0 dropped frames).
+LINK_LAG_BAD_PER_MIN = 6.0
+#: Below this many samples the reading is noise, not a verdict.
+LINK_QUALITY_MIN_SAMPLES = 3
+LINK_QUALITY_EMA_WEIGHT = 0.15
+
+
+def record_link_quality(url, lag_per_min):
+    """Remember how smoothly a link delivered, so restarts can prefer the good ones."""
+    if not url or lag_per_min is None:
+        return
+    try:
+        value = float(lag_per_min)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(value) or value < 0:
+        return
+    entry = LINK_QUALITY.setdefault(url, {"lag_per_min": value, "samples": 0, "updated_at": 0})
+    # Exponential moving average. The weight is the whole trade-off: too fast and
+    # one bad minute condemns a good feed and triggers a restart nobody needed
+    # (each restart costs every viewer a re-attach); too slow and a feed that
+    # degrades mid-card is still preferred while it freezes people. At 0.15 a
+    # single blip from 0.4 -> 30 lands at 4.8 (under the bad threshold), while two
+    # consecutive bad readings clear it.
+    entry["lag_per_min"] = (
+        entry["lag_per_min"] * (1 - LINK_QUALITY_EMA_WEIGHT) + value * LINK_QUALITY_EMA_WEIGHT
+        if entry["samples"] else value
+    )
+    entry["samples"] += 1
+    entry["updated_at"] = now_ms()
+
+
+def link_quality_rank(url):
+    """Sort key: lower is smoother. Unmeasured links sort between good and bad."""
+    entry = LINK_QUALITY.get(url or "")
+    if not entry or entry.get("samples", 0) < LINK_QUALITY_MIN_SAMPLES:
+        # Never seen: optimistic enough to get tried, pessimistic enough that a
+        # link known to be smooth wins.
+        return LINK_LAG_BAD_PER_MIN / 2.0
+    return float(entry.get("lag_per_min", 0.0))
+
+
+def links_by_quality(links):
+    """Order links smoothest-first, preserving the original order within a tie.
+
+    Delivery smoothness is invisible to the health scorer -- a bursty feed keeps
+    ffmpeg at speed=1x with zero dropped frames while publishing segments in
+    clumps, which starves player buffers and reads to a viewer as the stream
+    freezing for a second or two. This is the only place that preference is
+    expressed.
+    """
+    return sorted(links, key=lambda url: (link_quality_rank(url), links.index(url)))
 
 
 def links_with_active_last(links, active_url):
@@ -6583,9 +6659,15 @@ async def restart_managed_with_config(reason):
         # stops republishing it and active_encode_link() goes stale by design.
         active_url = active_encode_link(load_config())
         await stop_managed_process(f"stream stopped for restart: {reason}")
+        # Let the provider release the connection slot before asking for another.
+        await asyncio.sleep(PROVIDER_DRAIN_SECONDS)
         event(f"restarting stream: {reason}", "warn")
         config = load_config()
-        links = links_with_active_first(effective_stream_links(config), active_url)
+        # Smoothest-first, then pull the still-working link to the front. Order
+        # matters: a link we KNOW is currently delivering beats a historical
+        # score, but everything behind it should still be sorted by quality so a
+        # failure walks toward good feeds instead of down the config order.
+        links = links_with_active_first(links_by_quality(effective_stream_links(config)), active_url)
         if active_url and links and links[0] == active_url:
             event("restart will resume on the link that was already working", "ok")
         try:
@@ -7046,7 +7128,7 @@ async def watchdog_loop():
                         if not links:
                             event(f"watchdog skipped restart: {detail}", "warn")
                             continue
-                        links = links_with_active_last(links, active_encode_link(config))
+                        links = links_with_active_last(links_by_quality(links), active_encode_link(config))
                         try:
                             start_managed_process(config, links, kill_existing=True)
                         except (OSError, ValueError) as exc:
@@ -7072,13 +7154,14 @@ async def watchdog_loop():
                 event(f"watchdog restart: {reason}", "warn")
                 failed_url = active_encode_link(config)
                 await stop_managed_process(f"stream stopped for watchdog: {reason}")
+                await asyncio.sleep(PROVIDER_DRAIN_SECONDS)
                 # While a card is tracked the watchdog is held to the same bar as
                 # a scheduled start: recover onto this event's feeds or not at all.
                 links, detail = schedule_start_links(config, active_event_context())
                 if not links:
                     event(f"watchdog skipped restart: {detail}", "warn")
                     continue
-                links = links_with_active_last(links, failed_url)
+                links = links_with_active_last(links_by_quality(links), failed_url)
                 try:
                     start_managed_process(config, links, kill_existing=True)
                 except (OSError, ValueError) as exc:

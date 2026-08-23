@@ -978,7 +978,7 @@ def proc_stats(pid):
     return None, None
 
 
-def _write_encode_status(args, ff, link=None):
+def _write_encode_status(args, ff, link=None, lag_per_min=None):
     out_dir = getattr(args, "output_dir", None)
     if not out_dir:
         return
@@ -998,6 +998,8 @@ def _write_encode_status(args, ff, link=None):
         if link:
             payload["link_url"] = link.get("url", "")
             payload["link_index"] = link.get("index", 0)
+        if lag_per_min is not None:
+            payload["read_lag_per_min"] = lag_per_min
         path = os.path.join(out_dir, ".encode-progress.json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -1019,6 +1021,7 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
         return
     snapshot = None
     active_link = None
+    run_started_at = None
     should_log = False
     with with_lock(state):
         state["ffmpeg"][key] = value
@@ -1027,12 +1030,15 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
         if key == "progress":
             snapshot = dict(state["ffmpeg"])
             active_link = dict(state.get("active_link") or {})
+            run_started_at = state.get("run_started_at")
             now_mono = time.monotonic()
             if now_mono - state.get("last_progress_log_at", 0.0) >= PROGRESS_LOG_INTERVAL:
                 state["last_progress_log_at"] = now_mono
                 should_log = True
     if snapshot is not None and args is not None:
-        _write_encode_status(args, snapshot, link=active_link)
+        elapsed = (time.monotonic() - run_started_at) if run_started_at else 0.0
+        _write_encode_status(args, snapshot, link=active_link,
+                             lag_per_min=read_lag_per_minute(state, elapsed))
     if should_log and process_log is not None:
         # One line per interval, retaining exactly the fields needed to answer
         # "was the encoder keeping up, and was it dropping frames" after the fact.
@@ -1096,11 +1102,45 @@ def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=
             else:
                 write_process_log(process_log, process_log_lock, kind, line.rstrip())
                 remember_ffmpeg_log(state, line, args)
+                record_read_lag(state, line)
     except Exception as exc:
         add_event(state, f"ffmpeg {kind} reader stopped: {exc}", "warn")
     finally:
         with contextlib.suppress(Exception):
             stream.close()
+
+
+#: ffmpeg's readrate pacer emits this whenever the upstream failed to deliver on
+#: schedule. It is the single best discriminator of feed quality we have: measured
+#: 2026-08-22, one soursignal feed ran at 0.4s of lag per minute while another ran
+#: at 19.5s -- a ~50x difference in delivery smoothness that NOTHING in the health
+#: scoring could see, because both kept ffmpeg at speed=1x with 0 dropped frames.
+#: A bursty feed publishes segments in clumps, which starves player buffers and is
+#: what viewers experience as the stream freezing for a second or two.
+_READ_LAG_RE = re.compile(r"after a lag of ([\d.]+)s")
+
+
+def record_read_lag(state, line):
+    """Accumulate upstream read-lag seconds so feed quality can be scored."""
+    match = _READ_LAG_RE.search(line)
+    if not match:
+        return
+    try:
+        seconds = float(match.group(1))
+    except ValueError:
+        return
+    with with_lock(state):
+        state["read_lag_seconds"] = state.get("read_lag_seconds", 0.0) + seconds
+        state["read_lag_events"] = state.get("read_lag_events", 0) + 1
+
+
+def read_lag_per_minute(state, elapsed_seconds):
+    """Upstream lag seconds accumulated per minute of encoding. Lower is smoother."""
+    if elapsed_seconds < 30:
+        return None
+    with with_lock(state):
+        total = float(state.get("read_lag_seconds", 0.0))
+    return round(total / (elapsed_seconds / 60.0), 2)
 
 
 def ffmpeg_snapshot(state):
@@ -1707,6 +1747,11 @@ def main():
             cmd = build_ffmpeg_cmd(args, current.url, encoder, run_id=this_run)
             with with_lock(state):
                 state["active_link"] = {"url": current.url, "index": state["url_index"]}
+                # Per-run, so a feed is scored on the run being measured rather
+                # than inheriting a previous link's behaviour.
+                state["read_lag_seconds"] = 0.0
+                state["read_lag_events"] = 0
+                state["run_started_at"] = time.monotonic()
 
             # Keep the outgoing run's segments so players mid-fetch still resolve
             # while the new run comes up; drop everything older than that.

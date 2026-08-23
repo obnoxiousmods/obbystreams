@@ -262,3 +262,95 @@ class TestPlaybackDiagnostics:
             for sid, q in app.SOURCE_QOE.items()
         }
         json.dumps(payload)  # must not raise
+
+
+class TestFeedQuality:
+    """Choosing between upstream feeds by how smoothly they actually deliver.
+
+    Measured 2026-08-22: one soursignal feed ran at 0.4s of upstream read-lag per
+    minute, another at 19.5s -- a ~50x difference. The bad one produced
+    viewer-visible 1-3s freezes while every server-side check read perfectly
+    healthy, because a bursty feed still keeps ffmpeg at speed=1x with zero
+    dropped frames. It publishes segments in clumps, and the clumps starve player
+    buffers. Nothing in the health scoring could see it.
+    """
+
+    def setup_method(self):
+        app.LINK_QUALITY.clear()
+
+    def teardown_method(self):
+        app.LINK_QUALITY.clear()
+
+    def _settle(self, url, value, times=5):
+        for _ in range(times):
+            app.record_link_quality(url, value)
+
+    def test_orders_smoothest_first(self):
+        self._settle("https://p/bursty", 19.5)
+        self._settle("https://p/smooth", 0.4)
+        assert app.links_by_quality(["https://p/bursty", "https://p/smooth"]) == [
+            "https://p/smooth",
+            "https://p/bursty",
+        ]
+
+    def test_an_unmeasured_link_outranks_a_known_bad_one(self):
+        # Untried beats known-bad: it might be good, and the bad one demonstrably
+        # freezes viewers.
+        self._settle("https://p/bursty", 19.5)
+        assert app.links_by_quality(["https://p/bursty", "https://p/unknown"]) == [
+            "https://p/unknown",
+            "https://p/bursty",
+        ]
+
+    def test_a_known_good_link_outranks_an_unmeasured_one(self):
+        self._settle("https://p/smooth", 0.4)
+        assert app.links_by_quality(["https://p/unknown", "https://p/smooth"]) == [
+            "https://p/smooth",
+            "https://p/unknown",
+        ]
+
+    def test_ordering_is_stable_for_ties(self):
+        links = ["https://p/a", "https://p/b", "https://p/c"]
+        assert app.links_by_quality(links) == links
+
+    def test_ordering_never_drops_or_duplicates_a_link(self):
+        self._settle("https://p/b", 19.5)
+        links = ["https://p/a", "https://p/b", "https://p/c"]
+        assert sorted(app.links_by_quality(links)) == sorted(links)
+
+    def test_one_bad_sample_does_not_condemn_a_good_feed(self):
+        self._settle("https://p/smooth", 0.4, times=10)
+        app.record_link_quality("https://p/smooth", 30.0)
+        # EMA: a single blip moves it, but nowhere near the bad threshold.
+        assert app.LINK_QUALITY["https://p/smooth"]["lag_per_min"] < app.LINK_LAG_BAD_PER_MIN
+
+    def test_a_feed_that_degrades_is_believed_before_the_card_ends(self):
+        self._settle("https://p/was_good", 0.4, times=5)
+        self._settle("https://p/was_good", 25.0, times=6)
+        assert app.LINK_QUALITY["https://p/was_good"]["lag_per_min"] > app.LINK_LAG_BAD_PER_MIN
+
+    def test_a_single_sample_is_not_yet_a_verdict(self):
+        app.record_link_quality("https://p/one", 0.1)
+        # One reading ranks as unmeasured; a lucky first minute is not evidence.
+        assert app.link_quality_rank("https://p/one") == app.LINK_LAG_BAD_PER_MIN / 2.0
+
+    def test_ignores_garbage_readings(self):
+        for bad in (None, "banana", float("nan"), float("inf"), -5.0):
+            app.record_link_quality("https://p/x", bad)
+        assert "https://p/x" not in app.LINK_QUALITY
+
+    def test_reads_quality_from_the_wrapper_progress_file(self, tmp_path):
+        (tmp_path / ".encode-progress.json").write_text(
+            json.dumps({
+                "speed": "1.00x", "at": time.time(),
+                "link_url": "https://p/live", "read_lag_per_min": 12.5,
+            }),
+            encoding="utf-8",
+        )
+        config = {"stream": {"output_dir": str(tmp_path)}}
+        assert app.active_encode_link(config) == "https://p/live"
+        assert app.LINK_QUALITY["https://p/live"]["lag_per_min"] == 12.5
+
+    def test_a_stale_progress_file_records_nothing(self):
+        app.record_link_quality("", 5.0)
+        assert app.LINK_QUALITY == {}
