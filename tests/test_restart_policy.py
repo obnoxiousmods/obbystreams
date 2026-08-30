@@ -20,11 +20,13 @@ Both were answered wrongly on 2026-08-22:
 
 import json
 import time
+from datetime import UTC, datetime
 from typing import ClassVar
 
 import pytest
 
 import app
+from obbyschedule import CardSegment, ScheduleSettings, UfcEvent
 
 
 def _write_progress(tmp_path, url, *, age_seconds=0.0):
@@ -442,3 +444,188 @@ class TestActiveViewers:
         self._session("s1", "dddddddddddddddd")
         payload = await app.viewer_highscores_snapshot()
         assert payload["active_viewers"][0]["codename"] == app.codename_for("dddddddddddddddd")
+
+
+_CARD_DAY = datetime(2026, 8, 29, tzinfo=UTC)
+_PRELIMS_MOMENT = _CARD_DAY.replace(hour=7, minute=14)
+_MAIN_CARD_MOMENT = _CARD_DAY.replace(hour=10, minute=5)
+
+
+def _nurmagomedov_event():
+    """The real card: prelims 07:00Z, main card 10:00Z (ESPN 600060620)."""
+    return UfcEvent(
+        event_id="600060620",
+        name="UFC Fight Night: Nurmagomedov vs. Song",
+        short_name="Nurmagomedov vs. Song",
+        venue="Shanghai Oriental Sports Center",
+        city="Shanghai, China",
+        cards=(
+            CardSegment(start=_CARD_DAY.replace(hour=7), label="Prelims", bout_count=7, completed_bouts=0),
+            CardSegment(start=_CARD_DAY.replace(hour=10), label="Main card", bout_count=6, completed_bouts=0),
+        ),
+        is_final=False,
+        main_event_bout="Song Yadong vs. Umar Nurmagomedov",
+        fighters=("Song Yadong", "Umar Nurmagomedov"),
+    )
+
+
+def _prelims_context():
+    return _nurmagomedov_event().context(_PRELIMS_MOMENT, ScheduleSettings.from_config({}))
+
+
+def _main_card_context():
+    return _nurmagomedov_event().context(_MAIN_CARD_MOMENT, ScheduleSettings.from_config({}))
+
+
+
+# --- restart_ingest_outlook --------------------------------------------------
+#
+# The 2026-08-29 failure. During UFC Fight Night: Nurmagomedov vs. Song the first
+# source refresh after the prelims opened tore down a 21-minute-old encode at
+# 1.00x with 0 dropped frames and restarted it on THE SAME URL -- the link only
+# moved from pool slot 3 to slot 0. Two viewers lost 64s and 71s of picture to
+# change nothing.
+#
+# The cause was that `segment_transition` is true by construction on that first
+# refresh: the scheduler discovers sources during its 10-minute pre-roll, which
+# is always earlier than the segment start `sources_predate_current_segment`
+# compares against. Nothing then asked whether a restart would land anywhere
+# different.
+
+PRELIMS_LINK = "https://provider/live/139093"
+MAIN_CARD_LINK = "https://provider/live/700020001"
+
+
+def _pool(tmp_path, active, sources):
+    config = _write_progress(tmp_path, active)
+    config["stream"]["sources"] = sources
+    app.sync_links_from_sources(config["stream"])
+    return config
+
+
+def _source(url, label, segment_label, *, event_id="600060620", confidence="dated", probe=95):
+    return {
+        "id": f"private-iptv-{label.lower().replace(' ', '-')}",
+        "label": label,
+        "url": url,
+        "enabled": True,
+        "event_id": event_id,
+        "segment_label": segment_label,
+        "match_confidence": confidence,
+        "probe_score": probe,
+        "selection_score": 138,
+    }
+
+
+class TestRestartIngestOutlook:
+    def test_a_surviving_link_on_the_live_segment_is_not_worth_a_restart(self, tmp_path, monkeypatch):
+        """The incident. The refresh re-accepted the same channels; the link on
+        air is still valid for the segment that is live, so a restart would pin
+        it right back to slot 0 and change nothing."""
+        monkeypatch.setattr(app, "LINK_QUALITY", {})
+        context = _prelims_context()
+        config = _pool(
+            tmp_path,
+            PRELIMS_LINK,
+            [
+                _source("https://provider/live/700019662", "US UFC INT 04", "Prelims", confidence="exact"),
+                _source(PRELIMS_LINK, "PPV EVENT 01", "Prelims"),
+            ],
+        )
+
+        outlook = app.restart_ingest_outlook(config, context=context, now=_PRELIMS_MOMENT)
+
+        assert outlook["changes"] is False
+        assert outlook["active_disqualified"] is False
+
+    def test_a_higher_ranked_peer_does_not_make_it_worth_a_restart(self, tmp_path, monkeypatch):
+        """Ranking is not the question. restart_managed_with_config pins the
+        active link first, so even with a better-graded peer in the pool the
+        restart provably re-enters on the same URL."""
+        monkeypatch.setattr(app, "LINK_QUALITY", {})
+        context = _prelims_context()
+        config = _pool(
+            tmp_path,
+            PRELIMS_LINK,
+            [
+                _source("https://provider/live/700019662", "US UFC INT 04", "Prelims", confidence="exact"),
+                _source(PRELIMS_LINK, "PPV EVENT 01", "Prelims"),
+            ],
+        )
+
+        assert app.restart_ingest_outlook(config, context=context, now=_PRELIMS_MOMENT)["changes"] is False
+
+    def test_the_main_card_transition_still_restarts(self, tmp_path, monkeypatch):
+        """The case the suppression must NOT swallow: the card moved to a segment
+        the live channel does not carry. It is disqualified, so it must also not
+        be pinned to the front of the restart order."""
+        monkeypatch.setattr(app, "LINK_QUALITY", {})
+        context = _main_card_context()
+        config = _pool(
+            tmp_path,
+            PRELIMS_LINK,
+            [
+                _source(PRELIMS_LINK, "PPV EVENT 01", "Prelims"),
+                _source(MAIN_CARD_LINK, "PPV EVENT 09", "Main card"),
+            ],
+        )
+
+        outlook = app.restart_ingest_outlook(config, context=context, now=_MAIN_CARD_MOMENT)
+
+        assert outlook["changes"] is True
+        assert outlook["active_disqualified"] is True
+        # Dropping the pin is not enough: the prelims row is still in the pool, so
+        # the restart order has to name the main-card link explicitly or the
+        # wrapper starts at position 0 and re-enters the channel we just rejected.
+        assert outlook["prefer"] == [MAIN_CARD_LINK]
+        assert app.links_with_preferred_first(
+            [PRELIMS_LINK, MAIN_CARD_LINK], outlook["prefer"]
+        ) == [MAIN_CARD_LINK, PRELIMS_LINK]
+
+    def test_a_dropped_link_is_worth_a_restart(self, tmp_path, monkeypatch):
+        """The provider rotated the channel out of the pool entirely."""
+        monkeypatch.setattr(app, "LINK_QUALITY", {})
+        context = _prelims_context()
+        config = _pool(
+            tmp_path,
+            PRELIMS_LINK,
+            [_source("https://provider/live/700019662", "US UFC INT 04", "Prelims", confidence="exact")],
+        )
+
+        assert app.restart_ingest_outlook(config, context=context, now=_PRELIMS_MOMENT)["changes"] is True
+
+    def test_an_unknown_live_link_never_suppresses(self, tmp_path):
+        """No progress file means nothing is publishing, or it went stale. Not
+        knowing must never be read as "no restart needed"."""
+        config = {"stream": {"output_dir": str(tmp_path), "sources": []}}
+
+        assert app.restart_ingest_outlook(config, context=_prelims_context())["changes"] is True
+
+    def test_no_tracked_card_falls_back_to_the_pin_question(self, tmp_path, monkeypatch):
+        """Outside an event window there is no segment to judge against, so the
+        only question left is whether the restart would move ffmpeg."""
+        monkeypatch.setattr(app, "LINK_QUALITY", {})
+        config = _pool(tmp_path, PRELIMS_LINK, [_source(PRELIMS_LINK, "PPV EVENT 01", "Prelims")])
+
+        assert app.restart_ingest_outlook(config, context=None)["changes"] is False
+
+
+def test_activating_a_source_must_not_be_overridden_by_the_active_link_pin(monkeypatch):
+    """"Put THIS source on air" is the one intent the pin must never win against.
+
+    For a week it did: `activate_source` called restart_managed_with_config with
+    the default pin, so `links_with_active_first` hoisted the link the operator
+    was trying to LEAVE back to position 0. Every switch while an encode was
+    running logged "restart will resume on the link that was already working" and
+    came back up on the original link. Caught 2026-08-29 after three consecutive
+    switches to 600010883 all landed on 600000618.
+    """
+    monkeypatch.setattr(app, "LINK_QUALITY", {})
+    pool = [PRELIMS_LINK, MAIN_CARD_LINK]
+
+    pinned = app.links_with_active_first(app.links_by_quality(pool), PRELIMS_LINK)
+    assert pinned[0] == PRELIMS_LINK, "sanity: the pin does hoist the active link"
+
+    # What activate_source must do instead.
+    chosen = app.links_with_preferred_first(app.links_by_quality(pool), [MAIN_CARD_LINK])
+    assert chosen[0] == MAIN_CARD_LINK

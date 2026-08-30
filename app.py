@@ -2900,8 +2900,27 @@ def process_metrics():
 
 
 def stream_health(config, proc, hls, force=False):
-    """Convenience wrapper delegating to the module-global StreamHealthScorer.assess."""
-    return STREAM_HEALTH_SCORER.assess(config, proc, hls, force=force)
+    """Assess the encode, then overrule a green verdict if the PICTURE is wrong.
+
+    The scorer only ever measured delivery -- fresh playlist, advancing sequence,
+    frames produced. A provider error card satisfies all of that perfectly, which
+    is how "CONNECTION LIMIT REACHED" held a green health badge for 24 minutes on
+    2026-08-29 while viewers watched a still image. Delivery health and content
+    health are different questions and the answer to the second one wins.
+    """
+    doc = STREAM_HEALTH_SCORER.assess(config, proc, hls, force=force)
+    content = content_state_snapshot()
+    doc["content"] = content
+    if content_fault_confirmed() and str(doc.get("decision") or "").lower() == "healthy":
+        doc["decision"] = "failed"
+        doc["state"] = "content-fault"
+        doc["level"] = "bad"
+        doc["message"] = (
+            "Delivery is healthy but the picture is a provider error card, not the broadcast."
+        )
+        doc.setdefault("evidence", {})["content_fault"] = content.get("ocr_text") or content.get("reason")
+        doc.setdefault("reasons", []).append("picture is a provider fault card")
+    return doc
 
 
 NVIDIA_GPU_QUERY_FIELDS = [
@@ -3938,12 +3957,66 @@ def live_stream_is_high_grade(config, context=None, now=None, actual_links=None)
     )
 
 
-def sources_predate_current_segment(config, context=None, now=None):
-    """True when the card moved to a new segment after these sources were picked.
+def high_grade_upgrade_available(config, context=None, now=None):
+    """Is there a strictly better source than the one ffmpeg is ingesting?
 
-    Each broadcast segment is a different provider channel, so a source list
-    chosen during the early prelims is stale the moment the main card opens even
-    though the encode is still perfectly healthy.
+    `live_stream_is_high_grade` answers "is the live link deeply probed and
+    matched", and it is tempting to treat its negation as "upgrade wanted". That
+    is wrong, and expensively so: when probing is unavailable -- e.g. the provider
+    connection limit is fully spent by the encode itself -- every source carries
+    `probe_score` 0, nothing is ever high grade, and the negation is stuck TRUE
+    forever. On 2026-08-29 that logged a re-evaluation every ~3 minutes for hours
+    (22 in one hour), each of which would have been a viewer-visible restart
+    before the no-op guard was added.
+
+    Wanting an upgrade requires somewhere better to GO.
+    """
+    context = active_event_context() if context is None else context
+    if context is None:
+        return False
+    active = active_encode_link(config)
+    # Nothing is being ingested, so there is nothing to upgrade FROM. Acquisition
+    # owns that case, not this one.
+    if not active:
+        return False
+    urls = set(event_source_links(config, context.event_id, context=context, now=now))
+
+    def high_grade(source):
+        return (
+            source.get("url") in urls
+            and source.get("match_confidence") in {"exact", "dated"}
+            and int(source.get("probe_score") or 0) >= 80
+        )
+
+    sources = list(ordered_stream_sources(config))
+    # Deliberately NOT live_stream_is_high_grade(): without an explicit
+    # actual_links it treats a high-grade source merely PRESENT IN THE POOL as
+    # evidence that the live feed is high grade, which silently answers a
+    # different question than the one asked here.
+    if any(source.get("url") == active and high_grade(source) for source in sources):
+        return False
+    return any(source.get("url") != active and high_grade(source) for source in sources)
+
+
+def sources_predate_current_segment(config, context=None, now=None):
+    """True when we hold no source for the broadcast segment that is ON AIR NOW.
+
+    Each segment (early prelims / prelims / main card) is a different provider
+    channel, so a source list chosen for the prelims is genuinely stale once the
+    main card opens even though the encode is perfectly healthy.
+
+    This used to ask a subtly different question -- "were these sources discovered
+    before the segment started?" -- which is TRUE BY CONSTRUCTION on the first
+    refresh of every card, because the scheduler discovers sources during its
+    10-minute pre-roll and the pre-roll is always earlier than the segment start
+    it was compared against. On 2026-08-29 that fired ~15 minutes into the prelims
+    and tore down a 21-minute-old encode running at 1.00x with 0 dropped frames,
+    costing the two viewers 64 and 71 seconds of frozen picture to restart on the
+    very same URL.
+
+    The right question is about LABELS, not timestamps: `merge_private_iptv_sources`
+    already stamps each source with the `segment_label` it was matched to, so we
+    can simply ask whether any of them names the segment that is live.
     """
     context = active_event_context() if context is None else context
     if context is None or not context.segments:
@@ -3952,14 +4025,68 @@ def sources_predate_current_segment(config, context=None, now=None):
     segment = context.current_segment(moment)
     if segment is None:
         return False
-    discovered = [
-        int(source.get("discovered_at") or 0)
+    labels = {
+        str(source.get("segment_label") or "").strip().lower()
         for source in config.get("stream", {}).get("sources", [])
         if source.get("enabled", True) and str(source.get("event_id") or "") == str(context.event_id)
-    ]
-    if not discovered:
+    }
+    labels.discard("")
+    # No source carries a label at all (untagged/manual entries, or a provider
+    # whose titles never named a segment). Nothing to conclude, and churning the
+    # encode on a guess is the failure this function exists to avoid.
+    if not labels:
         return False
-    return max(discovered) < int(segment[0].timestamp() * 1000)
+    return str(segment[1]).strip().lower() not in labels
+
+
+def restart_ingest_outlook(config, context=None, now=None):
+    """How a restart right now would change what ffmpeg actually ingests.
+
+    Returns ``{"changes": bool, "active_disqualified": bool, "prefer": list}``,
+    where ``prefer`` is the segment-correct link order a restart should use when
+    the live link has been disqualified (empty otherwise).
+
+    segment_transition and quality_upgrade are reasons to RE-EVALUATE the source
+    pool, not reasons on their own to interrupt viewers. On 2026-08-29 the first
+    refresh after the prelims opened tore down a 21 minute old encode at 1.00x
+    with 0 dropped frames and restarted it on *the very same URL* -- the link
+    only moved from pool slot 3 to slot 0. It cost the two viewers 64 and 71
+    seconds of frozen video to change nothing. `sources_predate_current_segment`
+    is true by construction on that first refresh, because the scheduler
+    discovers sources during its 10 minute pre-roll, which is always earlier than
+    the segment start it compares against.
+
+    Two questions, and they are different:
+
+    * ``active_disqualified`` -- is the live link still valid for the segment
+      that is ON AIR NOW? `event_source_links` filters by `segment_label`, so
+      once the main card opens a prelims link drops out of it. A disqualified
+      link must not be pinned to the front of the restart order, or the restart
+      resumes the very channel we just rejected.
+    * ``changes`` -- would the restart actually land somewhere else? This has to
+      mirror `restart_managed_with_config`, which pins the active link first via
+      `links_with_active_first`. If that pin survives, the restart is guaranteed
+      to re-enter on the same URL and is pure cost.
+
+    Both default to "yes, restart" whenever the answer is unknown, so this can
+    only ever suppress a provably pointless restart.
+    """
+    active = active_encode_link(config)
+    if not active:
+        return {"changes": True, "active_disqualified": False, "prefer": []}
+    preferred = []
+    disqualified = False
+    if context is not None:
+        preferred = event_source_links(config, context.event_id, context=context, now=now)
+        if preferred and active not in preferred:
+            disqualified = True
+    links = links_by_quality(effective_stream_links(config))
+    links = links_with_preferred_first(links, preferred) if disqualified else links_with_active_first(links, active)
+    return {
+        "changes": not links or links[0] != active,
+        "active_disqualified": disqualified,
+        "prefer": list(preferred) if disqualified else [],
+    }
 
 
 def private_probe_budget(config, proc=None, health_doc=None, force_probe=False, context=None):
@@ -4057,6 +4184,49 @@ ACTIVE_LINK_MAX_AGE_SECONDS = 15.0
 #: ~20s planned outage into ~60s. Waiting a moment first is strictly faster than
 #: being rate-limited and retried.
 PROVIDER_DRAIN_SECONDS = 3.0
+#: A SERVICE restart is not a stream restart. systemd SIGKILLs ffmpeg and the app
+#: is back in milliseconds, but the provider keeps counting that connection for a
+#: while -- so boot immediately probes and reconnects into an account that still
+#: looks full. On 2026-08-29 that produced a 429 at boot, then three encode starts
+#: in 32s, and finally a connection-limit SLATE that played to viewers for 24
+#: minutes. The provider's own slate named both slots: the live encode, and a
+#: ghost from the ffmpeg that had just been killed. Bigger than PROVIDER_DRAIN
+#: because a killed process releases far more slowly than a graceful stop.
+PROVIDER_BOOT_DRAIN_SECONDS = 25.0
+#: Two refreshes closer together than this are the same refresh. Guards the boot
+#: race between private_iptv_loop's first tick and the scheduler arming.
+REFRESH_COALESCE_MS = 30_000
+#: Set once the boot drain has elapsed. Everything that opens a provider
+#: connection (probe or encode start) waits on it.
+PROVIDER_READY = None
+
+
+async def _provider_boot_drain():
+    """Hold provider access until the previous process's slots can have expired.
+
+    Measured from the last .encode-progress.json write, which is when the dead
+    encode was last known to be holding a connection -- so a boot with no prior
+    encode waits not at all.
+    """
+    global PROVIDER_READY
+    try:
+        config = load_config()
+        path = Path(config.get("stream", {}).get("output_dir") or "") / ".encode-progress.json"
+        age = time.time() - path.stat().st_mtime
+    except (OSError, ValueError, TypeError):
+        age = PROVIDER_BOOT_DRAIN_SECONDS
+    wait = max(0.0, PROVIDER_BOOT_DRAIN_SECONDS - age)
+    if wait > 0:
+        event(f"boot: holding provider access {wait:.0f}s so the previous encode's connection can expire", "ok")
+        await asyncio.sleep(wait)
+    if PROVIDER_READY is not None:
+        PROVIDER_READY.set()
+
+
+async def await_provider_ready():
+    """Block until the boot drain is done. A no-op after the first ~25s of uptime."""
+    if PROVIDER_READY is not None and not PROVIDER_READY.is_set():
+        await PROVIDER_READY.wait()
 
 
 def active_encode_link(config):
@@ -4098,6 +4268,21 @@ def links_with_active_first(links, active_url):
     if not active_url or active_url not in links:
         return links
     return [active_url] + [link for link in links if link != active_url]
+
+
+def links_with_preferred_first(links, preferred):
+    """Hoist an explicitly preferred, already-ranked set of links to the front.
+
+    Used when the link on air has been DISQUALIFIED -- the card moved to a
+    segment this channel does not carry. Dropping the pin is not enough on its
+    own: the rejected channel is usually still in the pool (the provider keeps
+    publishing the prelims row through the main card), so without this the
+    wrapper simply starts at it again and the restart achieves nothing.
+    """
+    head = [link for link in preferred if link in links]
+    if not head:
+        return links
+    return head + [link for link in links if link not in head]
 
 
 #: Per-link upstream delivery quality, keyed by link URL:
@@ -5165,6 +5350,16 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
     Respects the probe budget and the persisted operator Stop; returns {ok, changed, runtime}.
     """
     global STREAM_DESIRED_STATE
+    # Probing opens provider connections, so it must not run while the previous
+    # process's slots are still counted against the account.
+    await await_provider_ready()
+    # Two independent callers refresh at boot -- private_iptv_loop's first tick and
+    # the scheduler arming -- which on 2026-08-29 ran 9 seconds apart and spent two
+    # rounds of connections on identical results. A refresh this recent has nothing
+    # new to say; reuse it unless the operator forced one.
+    last_checked = float(PRIVATE_IPTV_RUNTIME.get("last_checked_at") or 0)
+    if not force_probe and reason != "manual" and last_checked and now_ms() - last_checked < REFRESH_COALESCE_MS:
+        return {"ok": True, "changed": False, "coalesced": True, "runtime": private_iptv_public_runtime()}
     config = load_config(fresh=True)
     private_cfg = config.get("private_iptv", {})
     proc = process_metrics()
@@ -5176,11 +5371,7 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
     quality_upgrade = bool(
         context is not None
         and context.active
-        and not live_stream_is_high_grade(
-            config,
-            context,
-            actual_links=MANAGED_LINKS if proc.get("managed") else None,
-        )
+        and high_grade_upgrade_available(config, context=context)
     )
     budget = private_probe_budget(config, proc=proc, health_doc=health_doc, force_probe=force_probe, context=context)
     # A live encode whose sources are not tagged for the tracked card cannot be
@@ -5426,9 +5617,29 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
                     "reasons": probe_reasons[:8],
                 }
             )
+            # segment_transition/quality_upgrade were decided BEFORE the merge, off
+            # the pre-refresh grading. Ask the refreshed pool whether a restart
+            # would actually move ffmpeg to a different link before spending ~60s
+            # of every viewer's picture on one. mismatch_confirmed is exempt: a
+            # feed carrying the wrong card must be replaced even if the ranking
+            # cannot name a better link.
+            reevaluate = segment_transition or quality_upgrade
+            outlook = restart_ingest_outlook(config, context=context) if reevaluate else None
+            would_change = bool(outlook and outlook["changes"])
+            if reevaluate and not would_change and proc.get("managed"):
+                event(
+                    "private IPTV re-evaluation kept the live link; saving without a restart",
+                    "ok",
+                    {"reason": "segment transition" if segment_transition else "quality upgrade"},
+                )
             live_replacement = bool(
-                proc.get("managed") and (mismatch_confirmed or segment_transition or quality_upgrade)
+                proc.get("managed") and (mismatch_confirmed or (reevaluate and would_change))
             )
+            # A link the re-evaluation just disqualified must not be pinned to the
+            # front of the restart order -- that would resume the channel we are
+            # restarting to get away from.
+            pin_active = not bool(outlook and outlook["active_disqualified"])
+            prefer_links = list(outlook["prefer"]) if outlook else []
             if changed or live_replacement:
                 event("private IPTV sources refreshed", "ok", {"count": len(accepted), "reason": reason})
                 stream_live = bool(proc.get("managed"))
@@ -5439,12 +5650,14 @@ async def _refresh_private_iptv_sources(reason="manual", force_probe=False):
                 # always wins over "don't interrupt".
                 switch_ok, switch_block = source_switch_allowed(
                     config,
-                    force=mismatch_confirmed or segment_transition or quality_upgrade,
+                    force=mismatch_confirmed or (reevaluate and would_change),
                     stream_running=stream_live,
                 )
                 restarted = False
                 if can_restart_live and switch_ok:
-                    restarted = await restart_managed_with_config("private IPTV sources refreshed")
+                    restarted = await restart_managed_with_config(
+                        "private IPTV sources refreshed", pin_active=pin_active, prefer=prefer_links
+                    )
                     if restarted and stream_live:
                         record_source_switch()
                 elif not can_restart_live:
@@ -6316,7 +6529,15 @@ async def activate_source(request):
     save_config(config)
     event("source switched", "ok", {"id": match.get("id"), "label": match.get("label")})
     queue_arango_insert("links", {"ts": now_ms(), "action": "activate_source", "id": match.get("id"), "url": match.get("url")})
-    restarted = await restart_managed_with_config("source switched")
+    # NEVER pin the running link here. This endpoint means "put THIS source on
+    # air", which is the one intent the pin must not override -- and it did, for a
+    # week. Every activate while an encode was running logged "restart will resume
+    # on the link that was already working" and came straight back up on the link
+    # the operator was trying to leave. Caught 2026-08-29 when a content guard
+    # asked for 600010883 three times and got 600000618 three times.
+    restarted = await restart_managed_with_config(
+        "source switched", pin_active=False, prefer=[match.get("url")]
+    )
     if restarted:
         event("running stream switched to selected source", "ok")
     return JSONResponse({"ok": True, "links": config["stream"]["links"], "sources": source_statuses(config, process_metrics())})
@@ -6420,6 +6641,103 @@ async def probe_configured_source(source, config=None, budget=None):
         "message": message,
         "checked_at": now_ms(),
     }
+
+
+#: What the picture on air actually IS, refreshed by content_watch_loop.
+#:   {"state","reason","ocr_kind","motion_min","motion_mean","checked_at","stale"}
+CONTENT_STATE: dict = {"state": "unknown", "reason": "not sampled yet", "checked_at": 0}
+#: How often to look at the output. Each sample costs one short ffmpeg decode.
+CONTENT_CHECK_INTERVAL = 30.0
+#: Consecutive provider-fault samples before the health scorer believes it. One
+#: sample is a coincidence; two 30s apart is a slate.
+CONTENT_FAULT_CONFIRM = 2
+#: Ignore a verdict older than this -- a stalled sampler must not pin health.
+CONTENT_MAX_AGE_SECONDS = 180.0
+
+
+def content_guard_verdict(config):
+    """Sample the published output and classify what is on screen.
+
+    Runs in a worker thread: it shells out to ffmpeg and tesseract, which must
+    never touch the event loop.
+    """
+    playlist = Path(config.get("stream", {}).get("output_dir") or "") / "media_1.m3u8"
+    if not playlist.exists():
+        return {"state": "unknown", "reason": "no output playlist"}
+    script = Path(__file__).resolve().parent / "tools" / "content_guard.py"
+    try:
+        out = subprocess.run(
+            [sys.executable, str(script), "--source", str(playlist), "--json",
+             "--frames", "5", "--interval", "2"],
+            capture_output=True, text=True, timeout=90,
+        )
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+        return {"state": "unknown", "reason": f"content guard failed: {exc}"}
+
+
+def content_state_snapshot():
+    """CONTENT_STATE plus whether it is too old to be trusted."""
+    snap = dict(CONTENT_STATE)
+    checked = float(snap.get("checked_at") or 0)
+    snap["age_seconds"] = round(time.time() - checked, 1) if checked else None
+    snap["stale"] = not checked or (time.time() - checked) > CONTENT_MAX_AGE_SECONDS
+    return snap
+
+
+def content_fault_confirmed():
+    """Whether the picture is a CONFIRMED provider fault right now.
+
+    Deliberately narrow. A static picture is not a fault: Paramount+ shows a
+    still "Commercial in Progress" card through every ad break, and every link
+    carries the same broadcast, so acting on that interrupts viewers to achieve
+    exactly nothing. Only an OCR-confirmed provider message counts, and only
+    after CONTENT_FAULT_CONFIRM consecutive samples.
+    """
+    snap = content_state_snapshot()
+    if snap.get("stale"):
+        return False
+    return snap.get("state") == "slate" and int(snap.get("fault_streak") or 0) >= CONTENT_FAULT_CONFIRM
+
+
+async def content_watch_loop():
+    """Background loop: keep CONTENT_STATE describing what viewers actually see.
+
+    This exists because every other health signal answers "are bytes flowing"
+    and none of them answer "what are they". On 2026-08-29 a provider
+    "CONNECTION LIMIT REACHED" card was delivered flawlessly at 60 segments a
+    minute for 24 unbroken minutes -- 1.00x, 0 dropped frames, playlist fresh,
+    health "healthy" the entire time -- and nothing in the stack noticed.
+    """
+    while True:
+        try:
+            if PROCESS and PROCESS.poll() is None:
+                config = load_config()
+                verdict = await asyncio.to_thread(content_guard_verdict, config)
+                previous = CONTENT_STATE.get("state")
+                streak = int(CONTENT_STATE.get("fault_streak") or 0)
+                streak = streak + 1 if verdict.get("state") == "slate" else 0
+                verdict["fault_streak"] = streak
+                verdict["checked_at"] = time.time()
+                CONTENT_STATE.clear()
+                CONTENT_STATE.update(verdict)
+                if streak == CONTENT_FAULT_CONFIRM:
+                    event(
+                        f"content check: the picture on air is a provider fault, not the broadcast "
+                        f"({verdict.get('ocr_text', '')[:80]})",
+                        "bad",
+                        {"ocr_kind": verdict.get("ocr_kind"), "motion": verdict.get("motion_mean")},
+                    )
+                elif previous == "slate" and verdict.get("state") != "slate":
+                    event("content check: real programming is back on air", "ok")
+            else:
+                CONTENT_STATE.clear()
+                CONTENT_STATE.update({"state": "idle", "reason": "no managed encode", "checked_at": time.time()})
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("content watch loop error: %s", exc)
+        await asyncio.sleep(CONTENT_CHECK_INTERVAL)
 
 
 async def source_health_loop():
@@ -6712,8 +7030,19 @@ async def maybe_alert_slow_upstream(hls):
     })
 
 
-async def restart_managed_with_config(reason):
-    """If the managed encode is running, stop and restart it with freshly-loaded config/links (under PROCESS_LOCK); return whether it restarted."""
+async def restart_managed_with_config(reason, pin_active=True, prefer=None):
+    """If the managed encode is running, stop and restart it with freshly-loaded config/links (under PROCESS_LOCK); return whether it restarted.
+
+    `pin_active` is the caller's answer to "is the link currently on air still a
+    valid choice?". It is True for every restart whose cause is unrelated to the
+    link itself (watchdog, config edit, operator restart) -- there, resuming the
+    known-working feed saves viewers a walk through dead links. Pass False when
+    the restart exists precisely to get OFF the current link (the card moved to a
+    segment this channel does not carry), or the pin re-enters the feed we are
+    trying to leave. In that case also pass `prefer` -- the ranked links that DO
+    carry the live segment -- because the rejected channel usually remains in the
+    pool and would otherwise be picked up again at position 0.
+    """
     global PROCESS
     async with PROCESS_LOCK:
         if not PROCESS or PROCESS.poll() is not None:
@@ -6730,9 +7059,15 @@ async def restart_managed_with_config(reason):
         # matters: a link we KNOW is currently delivering beats a historical
         # score, but everything behind it should still be sorted by quality so a
         # failure walks toward good feeds instead of down the config order.
-        links = links_with_active_first(links_by_quality(effective_stream_links(config)), active_url)
-        if active_url and links and links[0] == active_url:
-            event("restart will resume on the link that was already working", "ok")
+        links = links_by_quality(effective_stream_links(config))
+        if pin_active:
+            links = links_with_active_first(links, active_url)
+            if active_url and links and links[0] == active_url:
+                event("restart will resume on the link that was already working", "ok")
+        else:
+            links = links_with_preferred_first(links, prefer or [])
+            if active_url:
+                event("restart will not resume the previous link; it no longer carries this segment", "ok")
         try:
             start_managed_process(config, links, kill_existing=True)
             RUNTIME["stream_restarts"] += 1
@@ -7226,6 +7561,10 @@ async def restart_stream(request):
 async def watchdog_loop():
     """Background supervisor: every ~2s, auto-restart the managed encode if it exited or the health scorer confirms failure, honoring operator Stop and a cooldown."""
     global WATCHDOG_LAST_ACTION, PROCESS, STARTED_AT
+    # The watchdog is the most eager thing in the process: it sees "no ffmpeg
+    # child, playlist stale" the instant the app boots and reconnects straight
+    # into an account whose previous slot has not expired yet.
+    await await_provider_ready()
     while True:
         try:
             await asyncio.sleep(2)
@@ -7485,7 +7824,7 @@ def static_asset(name, media_type=None):
 @asynccontextmanager
 async def lifespan(app):
     """ASGI lifespan: honor a persisted operator Stop, init the shared HTTP client and Arango queue, launch all background loops, and tear them down (stopping the encode) on shutdown."""
-    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK, STREAM_DESIRED_STATE, SCHEDULER, SCHEDULE_TASK
+    global WATCHDOG_TASK, ARANGO_QUEUE, ARANGO_WORKER_TASK, _AUTO_SCRAPE_TASK, _AUTO_SOURCES_LOCK, _HTTPX_CLIENT, SOURCE_HEALTH_TASK, PRIVATE_IPTV_TASK, STREAM_DESIRED_STATE, SCHEDULER, SCHEDULE_TASK, PROVIDER_READY
     # Auto-scheduled installations always boot into standby. The schedule's
     # first event-aware tick is the only path that may select links and start
     # ffmpeg, so the watchdog can never win startup with last week's feed.
@@ -7496,6 +7835,11 @@ async def lifespan(app):
     elif STREAM_DESIRED_STATE == "stopped":
         event("boot: auto-schedule standby; waiting for a verified UFC event source", "ok")
     _AUTO_SOURCES_LOCK = asyncio.Lock()
+    # Created before any loop that touches the provider, so nothing can slip past
+    # the drain by starting while this is still None.
+    PROVIDER_READY = asyncio.Event()
+    _BACKGROUND_TASKS.add(drain := asyncio.create_task(_provider_boot_drain()))
+    drain.add_done_callback(_BACKGROUND_TASKS.discard)
     ARANGO_QUEUE = asyncio.Queue(maxsize=ARANGO_QUEUE_MAX)
     _HTTPX_CLIENT = httpx.AsyncClient(
         timeout=httpx.Timeout(8.0, connect=3.0),
@@ -7511,6 +7855,8 @@ async def lifespan(app):
     pruned.add_done_callback(_BACKGROUND_TASKS.discard)
     WATCHDOG_TASK = asyncio.create_task(watchdog_loop())
     SOURCE_HEALTH_TASK = asyncio.create_task(source_health_loop())
+    _BACKGROUND_TASKS.add(content_task := asyncio.create_task(content_watch_loop()))
+    content_task.add_done_callback(_BACKGROUND_TASKS.discard)
     PRIVATE_IPTV_TASK = asyncio.create_task(private_iptv_loop())
 
     # UFC auto-schedule. It shares the httpx pool above and reaches back into the

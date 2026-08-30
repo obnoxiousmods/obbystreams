@@ -173,26 +173,61 @@ def test_slot_start_uses_espns_real_segment_times():
     assert main == CARD_DAY.replace(hour=17).astimezone(main.tzinfo)
 
 
-def test_sources_from_an_earlier_segment_are_stale_once_the_next_one_opens():
-    context = context_at(CARD_DAY.replace(hour=17, minute=5))
-    config = {
+def _seg_config(segment_label, discovered_hour, minute=50):
+    return {
         "stream": {
             "sources": [
                 {
-                    "id": "private-iptv-prelims",
+                    "id": "private-iptv-x",
                     "url": "https://soursignal.com/x/y/1",
                     "enabled": True,
                     "event_id": "600059339",
-                    "discovered_at": int(CARD_DAY.replace(hour=13, minute=50).timestamp() * 1000),
+                    "segment_label": segment_label,
+                    "discovered_at": int(CARD_DAY.replace(hour=discovered_hour, minute=minute).timestamp() * 1000),
                 }
             ]
         }
     }
 
-    assert app.sources_predate_current_segment(config, context, now=CARD_DAY.replace(hour=17, minute=5))
-    # Re-discovered after the main card opened: current again.
-    config["stream"]["sources"][0]["discovered_at"] = int(CARD_DAY.replace(hour=17, minute=2).timestamp() * 1000)
-    assert not app.sources_predate_current_segment(config, context, now=CARD_DAY.replace(hour=17, minute=5))
+
+def test_sources_from_an_earlier_segment_are_stale_once_the_next_one_opens():
+    """Prelims-labelled sources are stale once the main card opens at 17:00."""
+    main_card = CARD_DAY.replace(hour=17, minute=5)
+    context = context_at(main_card)
+
+    assert app.sources_predate_current_segment(_seg_config("Prelims", 13), context, now=main_card)
+    assert not app.sources_predate_current_segment(_seg_config("Main card", 17, 2), context, now=main_card)
+
+
+def test_pre_roll_discovery_is_not_a_segment_transition():
+    """THE 2026-08-29 BUG. The scheduler discovers sources during a 10-minute
+    pre-roll, so `discovered_at` is ALWAYS earlier than the segment start. The old
+    predicate compared exactly those two numbers and so returned True on the first
+    refresh of every card -- tearing down a 21-minute-old encode at 1.00x with 0
+    dropped frames to restart it on the very same URL, at a cost of 64s and 71s of
+    frozen picture to the two viewers watching.
+
+    Discovered at 13:50 for a Prelims segment that opens at 14:00: correct, and
+    emphatically not a transition.
+    """
+    just_after_prelims_open = CARD_DAY.replace(hour=14, minute=15)
+    context = context_at(just_after_prelims_open)
+    config = _seg_config("Prelims", 13, 50)
+
+    assert config["stream"]["sources"][0]["discovered_at"] < int(
+        CARD_DAY.replace(hour=14).timestamp() * 1000
+    ), "the sources really were discovered before the segment started"
+    assert not app.sources_predate_current_segment(config, context, now=just_after_prelims_open)
+
+
+def test_unlabelled_sources_are_never_called_stale():
+    """A provider whose titles never name a segment tells us nothing. Guessing
+    'stale' there churns the encode for no reason."""
+    main_card = CARD_DAY.replace(hour=17, minute=5)
+    config = _seg_config("Prelims", 13)
+    del config["stream"]["sources"][0]["segment_label"]
+
+    assert not app.sources_predate_current_segment(config, context_at(main_card), now=main_card)
 
 
 # --- protection, purge, and arming ------------------------------------------
@@ -523,3 +558,60 @@ def test_the_card_is_stood_down_when_espn_never_marks_it_final():
     assert not UfcScheduler.card_stalled(CARD_DAY.replace(hour=19), event, state, SETTINGS)
     # Seven hours in, and nothing has been decided for an hour: it is over.
     assert UfcScheduler.card_stalled(CARD_DAY + timedelta(hours=24), event, state, SETTINGS)
+
+
+# --- wanting an upgrade requires somewhere better to go ----------------------
+def _graded_config(active_url, sources):
+    return {
+        "stream": {
+            "output_dir": "/nonexistent",
+            "sources": [
+                {"id": f"s{i}", "enabled": True, "event_id": "600059339",
+                 "segment_label": "Main card", **src}
+                for i, src in enumerate(sources)
+            ],
+        },
+        "_active": active_url,
+    }
+
+
+def test_an_unverifiable_feed_alone_is_not_an_upgrade_opportunity(monkeypatch):
+    """THE 2026-08-29 LOG-SPAM BUG. With probing unavailable every source scores
+    0, so "the live link is not high grade" is permanently true. Treating that as
+    "upgrade wanted" fired a re-evaluation every ~3 minutes for hours -- 22 in a
+    single hour -- each of which was a viewer-visible restart before the no-op
+    guard landed. There has to be somewhere better to go."""
+    live = "https://soursignal.com/x/y/live"
+    config = _graded_config(live, [
+        {"url": live, "match_confidence": "dated", "probe_score": 0},
+        {"url": "https://soursignal.com/x/y/other", "match_confidence": "dated", "probe_score": 0},
+    ])
+    monkeypatch.setattr(app, "active_encode_link", lambda _c: live)
+    context = context_at(CARD_DAY.replace(hour=17, minute=5))
+
+    assert not app.high_grade_upgrade_available(config, context, now=CARD_DAY.replace(hour=17, minute=5))
+
+
+def test_a_genuinely_better_source_is_an_upgrade_opportunity(monkeypatch):
+    live = "https://soursignal.com/x/y/live"
+    config = _graded_config(live, [
+        {"url": live, "match_confidence": "dated", "probe_score": 0},
+        {"url": "https://soursignal.com/x/y/better", "match_confidence": "exact", "probe_score": 95},
+    ])
+    monkeypatch.setattr(app, "active_encode_link", lambda _c: live)
+    context = context_at(CARD_DAY.replace(hour=17, minute=5))
+
+    assert app.high_grade_upgrade_available(config, context, now=CARD_DAY.replace(hour=17, minute=5))
+
+
+def test_the_live_link_being_the_only_high_grade_one_is_not_an_upgrade(monkeypatch):
+    """Already on the best feed. Nothing to do."""
+    live = "https://soursignal.com/x/y/live"
+    config = _graded_config(live, [
+        {"url": live, "match_confidence": "exact", "probe_score": 95},
+        {"url": "https://soursignal.com/x/y/worse", "match_confidence": "dated", "probe_score": 0},
+    ])
+    monkeypatch.setattr(app, "active_encode_link", lambda _c: live)
+    context = context_at(CARD_DAY.replace(hour=17, minute=5))
+
+    assert not app.high_grade_upgrade_available(config, context, now=CARD_DAY.replace(hour=17, minute=5))
