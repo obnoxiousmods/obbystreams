@@ -978,7 +978,7 @@ def proc_stats(pid):
     return None, None
 
 
-def _write_encode_status(args, ff, link=None, lag_per_min=None):
+def _write_encode_status(args, ff, link=None, lag_per_min=None, slate_rate=0.0):
     out_dir = getattr(args, "output_dir", None)
     if not out_dir:
         return
@@ -1000,6 +1000,8 @@ def _write_encode_status(args, ff, link=None, lag_per_min=None):
             payload["link_index"] = link.get("index", 0)
         if lag_per_min is not None:
             payload["read_lag_per_min"] = lag_per_min
+        if slate_rate:
+            payload["slate_rate"] = round(slate_rate, 1)
         path = os.path.join(out_dir, ".encode-progress.json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -1022,6 +1024,7 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
     snapshot = None
     active_link = None
     run_started_at = None
+    slate_rate = 0.0
     should_log = False
     with with_lock(state):
         state["ffmpeg"][key] = value
@@ -1031,6 +1034,7 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
             snapshot = dict(state["ffmpeg"])
             active_link = dict(state.get("active_link") or {})
             run_started_at = state.get("run_started_at")
+            slate_rate = float(state.get("slate_rate") or 0.0)
             now_mono = time.monotonic()
             if now_mono - state.get("last_progress_log_at", 0.0) >= PROGRESS_LOG_INTERVAL:
                 state["last_progress_log_at"] = now_mono
@@ -1038,7 +1042,8 @@ def update_progress(state, line, args=None, process_log=None, process_log_lock=N
     if snapshot is not None and args is not None:
         elapsed = (time.monotonic() - run_started_at) if run_started_at else 0.0
         _write_encode_status(args, snapshot, link=active_link,
-                             lag_per_min=read_lag_per_minute(state, elapsed))
+                             lag_per_min=read_lag_per_minute(state, elapsed),
+                             slate_rate=slate_rate)
     if should_log and process_log is not None:
         # One line per interval, retaining exactly the fields needed to answer
         # "was the encoder keeping up, and was it dropping frames" after the fact.
@@ -1103,6 +1108,7 @@ def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=
                 write_process_log(process_log, process_log_lock, kind, line.rstrip())
                 remember_ffmpeg_log(state, line, args)
                 record_read_lag(state, line)
+                record_slate_signature(state, line)
     except Exception as exc:
         add_event(state, f"ffmpeg {kind} reader stopped: {exc}", "warn")
     finally:
@@ -1118,6 +1124,60 @@ def stream_reader(stream, state, args, kind, process_log=None, process_log_lock=
 #: A bursty feed publishes segments in clumps, which starves player buffers and is
 #: what viewers experience as the stream freezing for a second or two.
 _READ_LAG_RE = re.compile(r"after a lag of ([\d.]+)s")
+
+#: The provider's "CONNECTION LIMIT REACHED" slate is a short clip on a loop, and
+#: a loop replays the same PTS range forever. ffmpeg reacts by emitting one of
+#: these per packet, which is how a slate announces itself at ~350-6000 lines/sec
+#: while a real feed emits ~0. This matters because a slate is VIDEO: speed=1x, 0
+#: dropped frames, fresh playlist, every health check green. On 2026-08-29 it was
+#: served to viewers for 24 unbroken minutes at a flawless 60 segments/minute,
+#: and nothing anywhere in the stack noticed.
+_SLATE_JUNK_RE = re.compile(r"Non-monotonic DTS|pts has no value|Packet duration: .* out of range")
+#: Sustained junk lines per second that mean "this input is a loop, not a feed".
+#: A healthy run measures 0.0; the two observed slates measured 350 and 6069. Any
+#: threshold in between is safe, so this sits far above noise from an occasional
+#: corrupt packet on a real feed.
+SLATE_LINES_PER_SEC = 25.0
+#: Require this much continuous evidence before killing a live encode.
+SLATE_CONFIRM_SECONDS = 20.0
+
+
+def record_slate_signature(state, line):
+    """Spot a looping error slate on the input and end the run.
+
+    There is no mid-run monitor in the supervisor (it blocks in proc.wait()), so
+    detection acts by terminating ffmpeg. That drops us into the normal exit path,
+    where the injected capacity-limit reason makes the ladder cool the link down
+    instead of instantly reconnecting into the same slate.
+    """
+    if not _SLATE_JUNK_RE.search(line):
+        return
+    now = time.monotonic()
+    proc = None
+    with with_lock(state):
+        if state.get("slate_kill"):
+            return
+        start = state.get("slate_window_started_at") or 0.0
+        if not start:
+            state["slate_window_started_at"] = now
+            state["slate_window_lines"] = 1
+            return
+        state["slate_window_lines"] = state.get("slate_window_lines", 0) + 1
+        elapsed = now - start
+        if elapsed < SLATE_CONFIRM_SECONDS:
+            return
+        rate = state["slate_window_lines"] / elapsed
+        state["slate_rate"] = rate
+        state["slate_window_started_at"] = now
+        state["slate_window_lines"] = 0
+        if rate < SLATE_LINES_PER_SEC:
+            return
+        state["slate_kill"] = True
+        state["slate_kill_rate"] = rate
+        proc = state.get("proc_obj")
+    if proc is not None and proc.poll() is None:
+        with contextlib.suppress(Exception):
+            proc.terminate()
 
 
 def record_read_lag(state, line):
@@ -1606,6 +1666,7 @@ def is_capacity_limited_error(error_summary):
             "concurrent stream",
             "concurrent connection",
             "rate limit",
+            "connection limit",
         )
     )
 
@@ -1793,6 +1854,19 @@ def main():
             rc = proc.returncode
             msg = f"ffmpeg exited code {rc}, ran {fmt_duration(elapsed)}"
             error_summary = ffmpeg_error_summary(state)
+            slate_rate = state.pop("slate_kill_rate", 0.0) if state.pop("slate_kill", False) else 0.0
+            if slate_rate:
+                # Prepended so it survives ffmpeg_error_summary's truncation, and
+                # phrased to match is_capacity_limited_error: every link shares the
+                # one account, so rotating cannot help. Cooling the link down is
+                # what frees the slot the slate is complaining about.
+                error_summary = (
+                    f"upstream connection limit reached: input is a looping slate "
+                    f"({slate_rate:.0f} junk lines/sec), not the live feed"
+                    + (f" | {error_summary}" if error_summary else "")
+                )
+            state.pop("slate_window_started_at", None)
+            state.pop("slate_window_lines", None)
             if error_summary:
                 current.last_error = error_summary
                 msg += f" | ffmpeg: {error_summary}"
